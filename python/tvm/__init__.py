@@ -69,8 +69,8 @@ from . import arith
 # support infra
 from . import support
 
-# Side-effect imports: register CUDA/ROCm FFI callbacks at TVM startup
-from .support import rocm as _rocm, nvcc as _nvcc
+# Side-effect imports: register device compiler FFI callbacks at TVM startup
+from .support import rocm as _rocm, nvcc as _nvcc, vortex as _vortex
 
 # Relax contain modules that are only available in compiler package
 # Do not import them if TVM is built with runtime only
