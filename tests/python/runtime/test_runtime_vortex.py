@@ -42,6 +42,20 @@ def vecadd(
             c[bx * 128 + tx] = a[bx * 128 + tx] + b[bx * 128 + tx]
 
 
+@T.prim_func
+def copy_kernel(a: T.Buffer((256,), "int32"), b: T.Buffer((256,), "int32")):
+    T.func_attr(
+        {
+            "global_symbol": "copy_kernel",
+            "tirx.kernel_launch_params": ["blockIdx.x", "threadIdx.x"],
+            "tirx.noalias": True,
+        }
+    )
+    for bx in T.thread_binding(2, thread="blockIdx.x"):
+        for tx in T.thread_binding(128, thread="threadIdx.x"):
+            b[bx * 128 + tx] = a[bx * 128 + tx]
+
+
 @pytest.fixture
 def vortex_module():
     callback_name = "tvm_callback_vortex_compile"
@@ -57,6 +71,22 @@ def vortex_module():
         tvm.register_global_func(callback_name, previous, override=True)
 
 
+@pytest.fixture
+def multi_kernel_vortex_module():
+    callback_name = "tvm_callback_vortex_compile"
+    previous = tvm.get_global_func(callback_name)
+    tvm.register_global_func(
+        callback_name, lambda source, target: bytearray(range(32)), override=True
+    )
+    try:
+        yield tvm.get_global_func("target.build.vortex")(
+            tvm.IRModule({"vecadd": vecadd, "copy_kernel": copy_kernel}),
+            tvm.target.Target("vortex"),
+        )
+    finally:
+        tvm.register_global_func(callback_name, previous, override=True)
+
+
 def test_module_serialization_preserves_source_and_function_metadata(vortex_module, tmp_path):
     module_path = tmp_path / "vecadd.vortex"
     vortex_module.write_to_file(str(module_path))
@@ -66,6 +96,21 @@ def test_module_serialization_preserves_source_and_function_metadata(vortex_modu
     assert restored.inspect_source("vortex") == vortex_module.inspect_source("vortex")
 
     with pytest.raises(ValueError, match="expected 3 kernel arguments and 2 launch arguments"):
+        restored["vecadd"]()
+
+
+def test_module_serialization_preserves_multi_kernel_mapping(multi_kernel_vortex_module, tmp_path):
+    module_path = tmp_path / "multi.vortex"
+    multi_kernel_vortex_module.write_to_file(str(module_path))
+
+    restored = tvm.runtime.load_module(str(module_path))
+    assert restored.inspect_source("vortex") == multi_kernel_vortex_module.inspect_source("vortex")
+    assert "Vortex kernel 0: copy_kernel" in restored.inspect_source("vortex")
+    assert "Vortex kernel 1: vecadd" in restored.inspect_source("vortex")
+
+    with pytest.raises(ValueError, match="expected 2 kernel arguments"):
+        restored["copy_kernel"]()
+    with pytest.raises(ValueError, match="expected 3 kernel arguments"):
         restored["vecadd"]()
 
 

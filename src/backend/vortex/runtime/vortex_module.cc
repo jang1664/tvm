@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -46,16 +47,18 @@ namespace tvm {
 namespace runtime {
 namespace vortex {
 
-static constexpr uint32_t kVortexModuleSerializationVersion = 1;
+static constexpr uint32_t kVortexModuleSerializationVersion = 2;
 
 class VortexModuleNode final : public ffi::ModuleObj {
  public:
   VortexModuleNode(ffi::Bytes binary, ffi::String source, ffi::Map<ffi::String, FunctionInfo> fmap,
-                   uint32_t abi_version, uint32_t num_warps, uint32_t thread_warp_size,
-                   uint32_t max_threads_per_block, uint32_t xlen)
+                   ffi::Map<ffi::String, int64_t> kernel_ids, uint32_t abi_version,
+                   uint32_t num_warps, uint32_t thread_warp_size, uint32_t max_threads_per_block,
+                   uint32_t xlen)
       : binary_(std::move(binary)),
         source_(std::move(source)),
         fmap_(std::move(fmap)),
+        kernel_ids_(std::move(kernel_ids)),
         abi_version_(abi_version),
         num_warps_(num_warps),
         thread_warp_size_(thread_warp_size),
@@ -63,8 +66,23 @@ class VortexModuleNode final : public ffi::ModuleObj {
         xlen_(xlen) {
     TVM_FFI_CHECK_EQ(abi_version_, VX_TVM_ABI_VERSION, ValueError)
         << "Unsupported Vortex TVM ABI version " << abi_version_;
-    TVM_FFI_CHECK_EQ(fmap_.size(), 1, ValueError)
-        << "The Vortex single-kernel runtime requires exactly one function";
+    TVM_FFI_CHECK(!fmap_.empty(), ValueError)
+        << "The Vortex runtime requires at least one function";
+    TVM_FFI_CHECK_EQ(kernel_ids_.size(), fmap_.size(), ValueError)
+        << "Vortex kernel-ID mapping must contain exactly one entry per function";
+    std::set<int64_t> observed_ids;
+    for (const auto& entry : fmap_) {
+      const ffi::String& name = entry.first;
+      auto kernel_id = kernel_ids_.Get(name);
+      TVM_FFI_CHECK(kernel_id.has_value(), ValueError)
+          << "Vortex kernel-ID mapping is missing function " << name;
+      TVM_FFI_CHECK_GE(kernel_id.value(), 0, ValueError)
+          << "Vortex kernel ID for " << name << " must be non-negative";
+      TVM_FFI_CHECK_LT(static_cast<uint64_t>(kernel_id.value()), fmap_.size(), ValueError)
+          << "Vortex kernel ID for " << name << " is outside the dispatcher range";
+      TVM_FFI_CHECK(observed_ids.insert(kernel_id.value()).second, ValueError)
+          << "Vortex kernel-ID mapping contains duplicate ID " << kernel_id.value();
+    }
     TVM_FFI_CHECK_EQ(static_cast<uint64_t>(num_warps_) * thread_warp_size_, max_threads_per_block_,
                      ValueError)
         << "Vortex target capacity is inconsistent";
@@ -87,6 +105,7 @@ class VortexModuleNode final : public ffi::ModuleObj {
     stream.Write(binary_);
     stream.Write(source_);
     stream.Write(fmap_);
+    stream.Write(kernel_ids_);
     stream.Write(abi_version_);
     stream.Write(num_warps_);
     stream.Write(thread_warp_size_);
@@ -109,7 +128,10 @@ class VortexModuleNode final : public ffi::ModuleObj {
     SaveBinaryToFile(file_name, SaveToBytes());
   }
 
-  void Launch(const FunctionInfo& info, ffi::PackedArgs args, void** void_args) {
+  void Launch(const FunctionInfo& info, uint32_t kernel_id, ffi::PackedArgs args,
+              void** void_args) {
+    TVM_FFI_CHECK_LT(kernel_id, kernel_ids_.size(), ValueError)
+        << "Vortex kernel ID " << kernel_id << " is outside the dispatcher range";
     const size_t num_kernel_args = info->arg_types.size();
     TVM_FFI_CHECK_EQ(args.size(), num_kernel_args + info->launch_param_tags.size(), ValueError)
         << "Vortex function " << info->name << " expected " << num_kernel_args
@@ -185,7 +207,7 @@ class VortexModuleNode final : public ffi::ModuleObj {
     auto* header = reinterpret_cast<vx_tvm_launch_header_t*>(packet.data());
     header->abi_version = abi_version_;
     header->num_args = static_cast<uint32_t>(slots.size());
-    header->kernel_id = 0;
+    header->kernel_id = kernel_id;
     header->reserved = 0;
     for (size_t i = 0; i < 3; ++i) {
       header->grid[i] = static_cast<uint32_t>(workload.grid_dim(i));
@@ -210,6 +232,7 @@ class VortexModuleNode final : public ffi::ModuleObj {
   ffi::Bytes binary_;
   ffi::String source_;
   ffi::Map<ffi::String, FunctionInfo> fmap_;
+  ffi::Map<ffi::String, int64_t> kernel_ids_;
   uint32_t abi_version_;
   uint32_t num_warps_;
   uint32_t thread_warp_size_;
@@ -220,23 +243,30 @@ class VortexModuleNode final : public ffi::ModuleObj {
 ffi::Optional<ffi::Function> VortexModuleNode::GetFunction(const ffi::String& name) {
   auto info = fmap_.Get(name);
   if (!info.has_value()) return std::nullopt;
+  auto mapped_id = kernel_ids_.Get(name);
+  TVM_FFI_CHECK(mapped_id.has_value(), ValueError)
+      << "Vortex kernel-ID mapping is missing function " << name;
+  TVM_FFI_CHECK_GE(mapped_id.value(), 0, ValueError)
+      << "Vortex kernel ID for " << name << " must be non-negative";
+  uint32_t kernel_id = static_cast<uint32_t>(mapped_id.value());
   ffi::ObjectPtr<ffi::Object> self = ffi::GetObjectPtr<ffi::Object>(this);
   FunctionInfo function_info = info.value();
-  auto launch = [self, this, function_info](ffi::PackedArgs args, ffi::Any* rv,
-                                            void** void_args) {
-    this->Launch(function_info, args, void_args);
+  auto launch = [self, this, function_info, kernel_id](ffi::PackedArgs args, ffi::Any* rv,
+                                                       void** void_args) {
+    this->Launch(function_info, kernel_id, args, void_args);
   };
   return PackFuncVoidAddr(launch, function_info->arg_types, function_info->arg_extra_tags);
 }
 
 static ffi::Module VortexModuleCreate(ffi::Bytes binary, ffi::String source,
                                       ffi::Map<ffi::String, FunctionInfo> fmap,
+                                      ffi::Map<ffi::String, int64_t> kernel_ids,
                                       uint32_t abi_version, uint32_t num_warps,
                                       uint32_t thread_warp_size, uint32_t max_threads_per_block,
                                       uint32_t xlen) {
-  auto node = ffi::make_object<VortexModuleNode>(std::move(binary), std::move(source),
-                                                 std::move(fmap), abi_version, num_warps,
-                                                 thread_warp_size, max_threads_per_block, xlen);
+  auto node = ffi::make_object<VortexModuleNode>(
+      std::move(binary), std::move(source), std::move(fmap), std::move(kernel_ids), abi_version,
+      num_warps, thread_warp_size, max_threads_per_block, xlen);
   return ffi::Module(node);
 }
 
@@ -246,6 +276,7 @@ static ffi::Module VortexModuleLoadFromBytes(const ffi::Bytes& bytes) {
   ffi::Bytes binary;
   ffi::String source;
   ffi::Map<ffi::String, FunctionInfo> fmap;
+  ffi::Map<ffi::String, int64_t> kernel_ids;
   uint32_t abi_version = 0;
   uint32_t num_warps = 0;
   uint32_t thread_warp_size = 0;
@@ -256,13 +287,14 @@ static ffi::Module VortexModuleLoadFromBytes(const ffi::Bytes& bytes) {
   TVM_FFI_CHECK_EQ(serialization_version, kVortexModuleSerializationVersion, ValueError)
       << "Unsupported Vortex module serialization version " << serialization_version;
   TVM_FFI_CHECK(stream.Read(&binary) && stream.Read(&source) && stream.Read(&fmap) &&
-                    stream.Read(&abi_version) && stream.Read(&num_warps) &&
-                    stream.Read(&thread_warp_size) && stream.Read(&max_threads_per_block) &&
-                    stream.Read(&xlen),
+                    stream.Read(&kernel_ids) && stream.Read(&abi_version) &&
+                    stream.Read(&num_warps) && stream.Read(&thread_warp_size) &&
+                    stream.Read(&max_threads_per_block) && stream.Read(&xlen),
                 ValueError)
       << "Truncated Vortex module serialization";
-  return VortexModuleCreate(std::move(binary), std::move(source), std::move(fmap), abi_version,
-                            num_warps, thread_warp_size, max_threads_per_block, xlen);
+  return VortexModuleCreate(std::move(binary), std::move(source), std::move(fmap),
+                            std::move(kernel_ids), abi_version, num_warps, thread_warp_size,
+                            max_threads_per_block, xlen);
 }
 
 static ffi::Module VortexModuleLoadFromFile(const ffi::String& file_name,

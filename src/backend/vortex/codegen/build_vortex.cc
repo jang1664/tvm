@@ -26,9 +26,12 @@
 #include <tvm/ir/module.h>
 #include <tvm/tirx/function.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <set>
 #include <string>
+#include <vector>
 
 #include "../../../target/build_common.h"
 #include "codegen_vortex.h"
@@ -37,18 +40,42 @@ namespace tvm {
 namespace codegen {
 
 ffi::Module BuildVortex(IRModule mod, Target target) {
-  TVM_FFI_CHECK_EQ(mod->functions.size(), 1, ValueError)
-      << "CodeGenVortex: the single-kernel MVP requires exactly one PrimFunc, but got "
-      << mod->functions.size();
-
-  auto [gvar, base_func] = *mod->functions.begin();
-  TVM_FFI_CHECK(base_func->IsInstance<PrimFuncNode>(), TypeError)
-      << "CodeGenVortex: only PrimFunc is supported";
-  PrimFunc func = base_func.as_or_throw<PrimFunc>();
+  struct KernelDefinition {
+    std::string global_symbol;
+    GlobalVar gvar;
+    PrimFunc func;
+  };
+  std::vector<KernelDefinition> kernels;
+  kernels.reserve(mod->functions.size());
+  std::set<std::string> global_symbols;
+  for (const auto& [gvar, base_func] : mod->functions) {
+    TVM_FFI_CHECK(base_func->IsInstance<PrimFuncNode>(), TypeError)
+        << "CodeGenVortex: only PrimFunc is supported";
+    PrimFunc func = base_func.as_or_throw<PrimFunc>();
+    auto symbol = func->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
+    TVM_FFI_CHECK(symbol.has_value() && !symbol.value().empty(), ValueError)
+        << "CodeGenVortex: every PrimFunc must have a non-empty global symbol";
+    std::string global_symbol = symbol.value();
+    TVM_FFI_CHECK(global_symbols.insert(global_symbol).second, ValueError)
+        << "CodeGenVortex: duplicate global symbol " << global_symbol;
+    kernels.push_back({std::move(global_symbol), gvar, std::move(func)});
+  }
+  TVM_FFI_CHECK(!kernels.empty(), ValueError) << "CodeGenVortex: at least one PrimFunc is required";
+  std::sort(kernels.begin(), kernels.end(),
+            [](const auto& lhs, const auto& rhs) { return lhs.global_symbol < rhs.global_symbol; });
 
   CodeGenVortex cg(target);
   cg.Init(/*output_ssa=*/false);
-  cg.AddKernel(gvar, func);
+  ffi::Map<ffi::String, int64_t> kernel_ids;
+  for (size_t index = 0; index < kernels.size(); ++index) {
+    TVM_FFI_CHECK_LE(index, std::numeric_limits<uint32_t>::max(), ValueError)
+        << "CodeGenVortex: too many kernels for the launch ABI";
+    uint32_t kernel_id = static_cast<uint32_t>(index);
+    const KernelDefinition& kernel = kernels[index];
+    cg.AddKernel(kernel.gvar, kernel.func, kernel_id, kernel.global_symbol);
+    kernel_ids.Set(ffi::String(kernel.global_symbol), static_cast<int64_t>(kernel_id));
+  }
+  cg.FinishDispatcher();
   std::string code = cg.Finish();
 
   auto compile = ffi::Function::GetGlobal("tvm_callback_vortex_compile");
@@ -69,7 +96,7 @@ ffi::Module BuildVortex(IRModule mod, Target target) {
   TVM_FFI_CHECK(create.has_value(), RuntimeError)
       << "Vortex runtime module is not loaded. Rebuild with USE_VORTEX set to the explicit "
          "Vortex repository path.";
-  return (*create)(binary, ffi::String(code), ExtractFuncInfo(mod), uint32_t{1},
+  return (*create)(binary, ffi::String(code), ExtractFuncInfo(mod), kernel_ids, uint32_t{1},
                    get_u32_attr("num_warps"), get_u32_attr("thread_warp_size"),
                    get_u32_attr("max_threads_per_block"), get_u32_attr("xlen"))
       .cast<ffi::Module>();

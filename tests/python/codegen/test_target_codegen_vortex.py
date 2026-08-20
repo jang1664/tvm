@@ -63,7 +63,7 @@ def test_vecadd_source_and_compile_callback():
 
     assert captured == [(source, "vortex")]
     assert "#include <vx_tvm_abi.h>" in source
-    assert "static void __tvm_vortex_kernel(" in source
+    assert "static void __tvm_vortex_kernel_0(" in source
     assert "threadIdx.x" in source
     assert "blockIdx.x" in source
     assert "((float)" in source
@@ -71,7 +71,8 @@ def test_vecadd_source_and_compile_callback():
     assert "reinterpret_cast<float*>(static_cast<uintptr_t>(args[2]))" in source
     assert "launch->abi_version != VX_TVM_ABI_VERSION" in source
     assert "launch->num_args != 3u" in source
-    assert "launch->kernel_id != 0u" in source
+    assert "switch (launch->kernel_id)" in source
+    assert "case 0u:" in source
     assert "csr_read(VX_CSR_MSCRATCH)" in source
     assert "vx_spawn_threads(1, launch->grid, launch->block" in source
 
@@ -135,11 +136,21 @@ def test_rejects_unsupported_local_allocation():
         _build_source(bad)
 
 
-def test_rejects_multiple_kernels():
+def test_supports_multiple_kernels():
     mod = tvm.IRModule({"first": vecadd, "second": vecadd.with_attr("global_symbol", "second")})
     build = tvm.get_global_func("target.build.vortex")
-    with pytest.raises(ValueError, match="requires exactly one PrimFunc"):
-        build(mod, tvm.target.Target("vortex"))
+    callback_name = "tvm_callback_vortex_compile"
+    previous = tvm.get_global_func(callback_name)
+    tvm.register_global_func(callback_name, lambda source, target: bytearray(), override=True)
+    try:
+        source = build(mod, tvm.target.Target("vortex")).inspect_source("vortex")
+    finally:
+        tvm.register_global_func(callback_name, previous, override=True)
+
+    assert "// Vortex kernel 0: second" in source
+    assert "// Vortex kernel 1: vecadd" in source
+    assert "case 0u:" in source
+    assert "case 1u:" in source
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@
 #include <tvm/target/target.h>
 
 #include <string>
+#include <vector>
 
 #include "../../../target/source/codegen_c.h"
 
@@ -37,7 +38,9 @@ class CodeGenVortex final : public CodeGenC {
  public:
   explicit CodeGenVortex(Target target);
 
-  void AddKernel(const GlobalVar& gvar, const PrimFunc& func);
+  void AddKernel(const GlobalVar& gvar, const PrimFunc& func, uint32_t kernel_id,
+                 const std::string& global_symbol);
+  void FinishDispatcher();
   void InitFuncState(const PrimFunc& func) final;
   void PrintFuncPrefix(std::ostream& os) final;  // NOLINT(*)
   using CodeGenC::PrintType;
@@ -50,10 +53,15 @@ class CodeGenVortex final : public CodeGenC {
  private:
   void ValidateThreadExtent(const IterVar& iv, const PrimExpr& extent);
   std::string PrintTypeString(const Type& type);
-  void EmitLaunchWrapper(const PrimFunc& func);
+  void EmitLaunchWrapper(const PrimFunc& func, uint32_t kernel_id);
+
+  struct KernelDispatchInfo {
+    uint32_t kernel_id;
+    size_t num_args;
+  };
 
   Target target_;
-  bool has_kernel_{false};
+  std::vector<KernelDispatchInfo> kernels_;
 };
 
 }  // namespace codegen

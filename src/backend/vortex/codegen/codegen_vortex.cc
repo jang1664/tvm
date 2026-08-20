@@ -88,8 +88,8 @@ void CodeGenVortex::ValidateThreadExtent(const IterVar& iv, const PrimExpr& exte
   TVM_FFI_CHECK_GT(extent->value, 0, ValueError)
       << "CodeGenVortex: threadIdx.x extent must be positive";
   TVM_FFI_CHECK_LE(extent->value, max_threads, ValueError)
-      << "CodeGenVortex: threadIdx.x extent " << extent->value
-      << " exceeds max_threads_per_block " << max_threads;
+      << "CodeGenVortex: threadIdx.x extent " << extent->value << " exceeds max_threads_per_block "
+      << max_threads;
 }
 
 void CodeGenVortex::VisitStmt_(const AttrStmtNode* op) {
@@ -130,12 +130,13 @@ std::string CodeGenVortex::PrintTypeString(const Type& type) {
   return os.str();
 }
 
-void CodeGenVortex::EmitLaunchWrapper(const PrimFunc& func) {
-  stream << "static void __tvm_vortex_kernel_entry(void* opaque) {\n"
+void CodeGenVortex::EmitLaunchWrapper(const PrimFunc& func, uint32_t kernel_id) {
+  stream << "static void __tvm_vortex_kernel_entry_" << kernel_id
+         << "(void* opaque) {\n"
             "  const vx_tvm_launch_header_t* launch =\n"
             "      static_cast<const vx_tvm_launch_header_t*>(opaque);\n"
             "  const uint64_t* args = vx_tvm_launch_args(launch);\n"
-            "  __tvm_vortex_kernel(";
+         << "  __tvm_vortex_kernel_" << kernel_id << "(";
   for (size_t i = 0; i < func->params.size(); ++i) {
     if (i != 0) stream << ", ";
     const Type& type = func->params[i]->ty;
@@ -148,28 +149,42 @@ void CodeGenVortex::EmitLaunchWrapper(const PrimFunc& func) {
       stream << "__tvm_vortex_decode_scalar<" << type_name << ">(args[" << i << "])";
     }
   }
-  stream << ");\n}\n\n"
-            "int main() {\n"
+  stream << ");\n}\n\n";
+}
+
+void CodeGenVortex::FinishDispatcher() {
+  TVM_FFI_CHECK(!kernels_.empty(), ValueError)
+      << "CodeGenVortex: at least one launchable PrimFunc is required";
+  stream << "int main() {\n"
             "  const vx_tvm_launch_header_t* launch =\n"
             "      reinterpret_cast<const vx_tvm_launch_header_t*>(csr_read(VX_CSR_MSCRATCH));\n"
-            "  if (launch == nullptr || launch->abi_version != VX_TVM_ABI_VERSION ||\n"
-         << "      launch->num_args != " << func->params.size()
-         << "u || launch->kernel_id != 0u) {\n"
+            "  if (launch == nullptr || launch->abi_version != VX_TVM_ABI_VERSION) {\n"
             "    return -1;\n"
             "  }\n"
-            "  return vx_spawn_threads(1, launch->grid, launch->block,\n"
-            "                          (vx_kernel_func_cb)__tvm_vortex_kernel_entry, launch);\n"
+            "  switch (launch->kernel_id) {\n";
+  for (const KernelDispatchInfo& kernel : kernels_) {
+    stream << "    case " << kernel.kernel_id << "u:\n"
+           << "      if (launch->num_args != " << kernel.num_args << "u) return -1;\n"
+           << "      return vx_spawn_threads(1, launch->grid, launch->block,\n"
+           << "                              (vx_kernel_func_cb)__tvm_vortex_kernel_entry_"
+           << kernel.kernel_id << ", launch);\n";
+  }
+  stream << "    default:\n"
+            "      return -1;\n"
+            "  }\n"
             "}\n";
 }
 
-void CodeGenVortex::AddKernel(const GlobalVar& gvar, const PrimFunc& func) {
-  TVM_FFI_CHECK(!has_kernel_, ValueError)
-      << "CodeGenVortex: the single-kernel MVP accepts exactly one PrimFunc";
-  has_kernel_ = true;
-
-  PrimFunc kernel = WithAttr(func, tvm::attr::kGlobalSymbol, ffi::String("__tvm_vortex_kernel"));
+void CodeGenVortex::AddKernel(const GlobalVar& gvar, const PrimFunc& func, uint32_t kernel_id,
+                              const std::string& global_symbol) {
+  TVM_FFI_CHECK_EQ(kernel_id, kernels_.size(), ValueError)
+      << "CodeGenVortex: kernel IDs must be dense and emitted in order";
+  stream << "// Vortex kernel " << kernel_id << ": " << global_symbol << "\n";
+  PrimFunc kernel = WithAttr(func, tvm::attr::kGlobalSymbol,
+                             ffi::String("__tvm_vortex_kernel_" + std::to_string(kernel_id)));
   CodeGenC::AddFunction(gvar, kernel);
-  EmitLaunchWrapper(kernel);
+  EmitLaunchWrapper(kernel, kernel_id);
+  kernels_.push_back({kernel_id, func->params.size()});
 }
 
 }  // namespace codegen
