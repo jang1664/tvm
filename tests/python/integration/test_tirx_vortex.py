@@ -235,9 +235,7 @@ def test_multi_kernel_build_rejects_duplicate_global_symbols():
         (257, 64),
     ],
 )
-def test_vecadd_hardware(size, block_size):
-    assert os.environ.get("VORTEX_DRIVER") == "xrt"
-    assert os.environ.get("XRT_XCLBIN_PATH")
+def test_vecadd_hardware(size, block_size, vortex_hardware_environment):
 
     executable = _build_vecadd(size, block_size)
     device = tvm.vortex(0)
@@ -264,9 +262,7 @@ def test_vecadd_hardware(size, block_size):
         (3, 5, 7, 128),
     ],
 )
-def test_matmul_hardware(m, n, k, block_size):
-    assert os.environ.get("VORTEX_DRIVER") == "xrt"
-    assert os.environ.get("XRT_XCLBIN_PATH")
+def test_matmul_hardware(m, n, k, block_size, vortex_hardware_environment):
 
     executable = _build_matmul(m, n, k, block_size)
     device = tvm.vortex(0)
@@ -286,9 +282,9 @@ def test_matmul_hardware(m, n, k, block_size):
     os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
     reason="set TVM_VORTEX_RUN_HARDWARE=1 inside an allocated XRT hardware environment",
 )
-def test_multi_kernel_hardware_dispatches_both_functions_independently():
-    assert os.environ.get("VORTEX_DRIVER") == "xrt"
-    assert os.environ.get("XRT_XCLBIN_PATH")
+def test_multi_kernel_hardware_dispatches_both_functions_independently(
+    vortex_hardware_environment,
+):
 
     size = 129
     executable = _build_two_kernel_module(size, 64)

@@ -57,7 +57,6 @@ class CodeGenVortex final : public CodeGenC {
   void EmitLaunchWrapper(const PrimFunc& func, uint32_t kernel_id);
 
   struct KernelDispatchInfo {
-    uint32_t kernel_id;
     size_t num_args;
   };
 

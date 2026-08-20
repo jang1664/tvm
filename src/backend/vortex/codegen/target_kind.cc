@@ -45,8 +45,8 @@ ffi::Map<ffi::String, ffi::Any> CanonicalizeVortexTarget(ffi::Map<ffi::String, f
 
   TVM_FFI_CHECK_GT(num_warps, 0, ValueError) << "Vortex num_warps must be positive";
   TVM_FFI_CHECK_GT(thread_warp_size, 0, ValueError) << "Vortex thread_warp_size must be positive";
-  TVM_FFI_CHECK_GE(max_shared_memory_per_block, 0, ValueError)
-      << "Vortex max_shared_memory_per_block must be non-negative";
+  TVM_FFI_CHECK_EQ(max_shared_memory_per_block, 0, ValueError)
+      << "Vortex does not support shared memory; max_shared_memory_per_block must be zero";
   TVM_FFI_CHECK(xlen == 32 || xlen == 64, ValueError)
       << "Vortex xlen must be either 32 or 64, but got " << xlen;
   TVM_FFI_CHECK_LE(num_warps, std::numeric_limits<int64_t>::max() / thread_warp_size, ValueError)

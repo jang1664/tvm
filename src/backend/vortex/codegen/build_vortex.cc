@@ -96,7 +96,7 @@ ffi::Module BuildVortex(IRModule mod, Target target) {
   TVM_FFI_CHECK(create.has_value(), RuntimeError)
       << "Vortex runtime module is not loaded. Rebuild with USE_VORTEX set to the explicit "
          "Vortex repository path.";
-  return (*create)(binary, ffi::String(code), ExtractFuncInfo(mod), kernel_ids, uint32_t{1},
+  return (*create)(binary, ffi::String(code), ExtractFuncInfo(mod), kernel_ids,
                    get_u32_attr("num_warps"), get_u32_attr("thread_warp_size"),
                    get_u32_attr("max_threads_per_block"), get_u32_attr("xlen"))
       .cast<ffi::Module>();

@@ -80,6 +80,11 @@ def test_vortex_target_rejects_inconsistent_thread_limit(attribute):
         Target({"kind": "vortex", attribute: 64})
 
 
+def test_vortex_target_rejects_shared_memory_until_codegen_supports_it():
+    with pytest.raises(ValueError, match="does not support shared memory"):
+        Target({"kind": "vortex", "max_shared_memory_per_block": 1})
+
+
 def _oversized_thread_block():
     thread_var = tvm.tirx.Var("threadIdx.x", "int32")
     thread_iter = tvm.tirx.IterVar(

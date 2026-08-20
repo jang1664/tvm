@@ -159,9 +159,9 @@ def test_relax_build_imports_vortex_device_module():
     os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
     reason="set TVM_VORTEX_RUN_HARDWARE=1 inside an allocated XRT hardware environment",
 )
-def test_relax_vm_bytecode_hardware_and_serialization(tmp_path):
-    assert os.environ.get("VORTEX_DRIVER") == "xrt"
-    assert os.environ.get("XRT_XCLBIN_PATH")
+def test_relax_vm_bytecode_hardware_and_serialization(
+    tmp_path, vortex_hardware_environment
+):
 
     executable = relax.build(TwoStageRelaxModule, _target(), exec_mode="bytecode")
     _run_and_check(executable)
@@ -180,9 +180,7 @@ def test_relax_vm_bytecode_hardware_and_serialization(tmp_path):
     os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
     reason="set TVM_VORTEX_RUN_HARDWARE=1 inside an allocated XRT hardware environment",
 )
-def test_relax_vm_compiled_hardware_compatibility():
-    assert os.environ.get("VORTEX_DRIVER") == "xrt"
-    assert os.environ.get("XRT_XCLBIN_PATH")
+def test_relax_vm_compiled_hardware_compatibility(vortex_hardware_environment):
 
     executable = relax.build(TwoStageRelaxModule, _target(), exec_mode="compiled")
     # Compiled VM mode executes the generated host function directly, so VM

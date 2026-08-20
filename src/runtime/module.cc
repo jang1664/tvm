@@ -50,6 +50,8 @@ bool RuntimeEnabled(const ffi::String& target_str) {
     f_name = "target.runtime.tflite";
   } else if (target == "vulkan") {
     f_name = "device_api.vulkan";
+  } else if (target == "vortex") {
+    f_name = "device_api.vortex";
   } else if (target == "rpc") {
     f_name = "device_api.rpc";
   } else if (target == "hexagon") {

@@ -31,7 +31,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
-#include <unordered_map>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace tvm {
@@ -42,7 +43,6 @@ struct VortexAllocation {
   vx_buffer_h buffer{nullptr};
   uint64_t address{0};
   uint64_t size{0};
-  int device_id{0};
 };
 
 class VortexDeviceAPI final : public DeviceAPI {
@@ -55,11 +55,10 @@ class VortexDeviceAPI final : public DeviceAPI {
   void FreeDataSpace(Device dev, void* ptr) final;
   void StreamSync(Device dev, TVMStreamHandle stream) final;
 
-  uint64_t ResolveAddress(void* ptr, uint64_t required_size = 1) const;
+  uint64_t ResolveAddress(void* ptr) const;
   uint64_t ActualThreadCapacity();
-  vx_buffer_h UploadPacket(const void* data, size_t size);
-  void ReleaseRuntimeBuffer(vx_buffer_h buffer);
-  void Launch(const void* kernel_data, size_t kernel_size, vx_buffer_h packet);
+  void Launch(const void* kernel_data, size_t kernel_size, const void* packet_data,
+              size_t packet_size);
 
   static VortexDeviceAPI* Global();
 
@@ -70,15 +69,20 @@ class VortexDeviceAPI final : public DeviceAPI {
 
  private:
   static void ValidateDevice(Device dev);
+  void ValidateEnvironmentLocked() const;
   void EnsureOpenLocked();
   VortexAllocation* LookupAllocationLocked(const void* ptr) const;
 
   mutable std::mutex mutex_;
   vx_device_h device_{nullptr};
-  std::unordered_map<const void*, VortexAllocation*> allocations_;
-  std::vector<vx_buffer_h> runtime_buffers_;
+  std::unordered_set<VortexAllocation*> allocations_;
+  vx_buffer_h packet_buffer_{nullptr};
+  size_t packet_capacity_{0};
   vx_buffer_h kernel_buffer_{nullptr};
   std::vector<uint8_t> kernel_binary_;
+  std::string driver_name_;
+  std::string xclbin_path_;
+  bool poisoned_{false};
 };
 
 }  // namespace vortex

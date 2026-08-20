@@ -261,8 +261,6 @@ def register_pipeline(name: str):
 
 def library_dispatch_passes(target: tvm.target.Target):
     """Get the default library dispatch passes for the given target."""
-    if target.kind.name == "vortex":
-        return backend.vortex.library_dispatch_passes(target)
     if target.kind.name == "cuda":
         return backend.cuda.library_dispatch_passes(target)
     if target.kind.name == "rocm":
@@ -299,8 +297,6 @@ def legalize_passes(target: tvm.target.Target):
 
 def dataflow_lower_passes(target: tvm.target.Target):
     """Get the default legalization passes for the given target."""
-    if target.kind.name == "vortex":
-        return backend.vortex.dataflow_lower_passes(target)
     if target.kind.name == "cuda":
         return backend.cuda.dataflow_lower_passes(target)
     if target.kind.name == "rocm":
@@ -318,8 +314,6 @@ def dataflow_lower_passes(target: tvm.target.Target):
 
 def finalize_passes(target: tvm.target.Target):
     """Get the default legalization passes for the given target."""
-    if target.kind.name == "vortex":
-        return backend.vortex.finalize_passes(target)
     if target.kind.name == "cuda":
         return backend.cuda.finalize_passes(target)
     if target.kind.name == "rocm":

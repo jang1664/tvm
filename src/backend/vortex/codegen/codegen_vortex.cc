@@ -174,12 +174,13 @@ void CodeGenVortex::FinishDispatcher() {
             "    return -1;\n"
             "  }\n"
             "  switch (launch->kernel_id) {\n";
-  for (const KernelDispatchInfo& kernel : kernels_) {
-    stream << "    case " << kernel.kernel_id << "u:\n"
+  for (size_t kernel_id = 0; kernel_id < kernels_.size(); ++kernel_id) {
+    const KernelDispatchInfo& kernel = kernels_[kernel_id];
+    stream << "    case " << kernel_id << "u:\n"
            << "      if (launch->num_args != " << kernel.num_args << "u) return -1;\n"
            << "      return vx_spawn_threads(1, launch->grid, launch->block,\n"
            << "                              (vx_kernel_func_cb)__tvm_vortex_kernel_entry_"
-           << kernel.kernel_id << ", launch);\n";
+           << kernel_id << ", launch);\n";
   }
   stream << "    default:\n"
             "      return -1;\n"
@@ -196,7 +197,7 @@ void CodeGenVortex::AddKernel(const GlobalVar& gvar, const PrimFunc& func, uint3
                              ffi::String("__tvm_vortex_kernel_" + std::to_string(kernel_id)));
   CodeGenC::AddFunction(gvar, kernel);
   EmitLaunchWrapper(kernel, kernel_id);
-  kernels_.push_back({kernel_id, func->params.size()});
+  kernels_.push_back({func->params.size()});
 }
 
 }  // namespace codegen

@@ -16,6 +16,7 @@
 # under the License.
 
 import struct
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -106,6 +107,44 @@ def test_rv32_configuration_is_xlen_aware(tmp_path):
     assert config.toolchain_root == profile_root / "riscv32-gnu-toolchain"
 
 
+def test_target_cpu_and_features_reach_compiler_argv(tmp_path):
+    target = tvm.target.Target(
+        {"kind": "vortex", "mcpu": "generic-rv64", "mattr": ["+m", "-d"]}
+    )
+    config = vortex.resolve_vortex_compile_config(
+        target,
+        vortex_home=VORTEX_HOME,
+        profile_root=PROFILE_ROOT,
+    )
+    command = vortex._compile_command(config, tmp_path / "kernel.cpp", tmp_path / "kernel.elf")
+
+    assert "-mcpu=generic-rv64" in command
+    assert command.count("-target-feature") == 4
+    assert "+m" in command
+    assert "-d" in command
+
+
+def test_compile_timeout_preserves_stage_and_output(monkeypatch, tmp_path):
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            args[0], kwargs["timeout"], output="partial-out", stderr="partial-err"
+        )
+
+    monkeypatch.setattr(vortex.subprocess, "run", timeout)
+    monkeypatch.setenv("TVM_VORTEX_COMPILE_TIMEOUT_SECONDS", "2")
+
+    with pytest.raises(vortex.VortexCompileError, match="timed out after 2 seconds") as error:
+        vortex._run_command(
+            ["fake-compiler", "kernel.cpp"],
+            stage="kernel compilation",
+            environment={},
+            cwd=tmp_path,
+        )
+
+    assert "partial-out" in str(error.value)
+    assert "partial-err" in str(error.value)
+
+
 @pytest.mark.skipif(
     not _have_pinned_toolchain(), reason="pinned Vortex fpint toolchain unavailable"
 )
@@ -132,14 +171,14 @@ def test_generated_vecadd_compiles_to_vxbin(monkeypatch):
 def test_compile_failure_preserves_command_and_stderr():
     with pytest.raises(vortex.VortexCompileError) as error:
         vortex.compile_vortex(
-            "#error phase3-preserved-stderr\n",
+            "#error intentional-vortex-compile-error\n",
             tvm.target.Target("vortex"),
             **_pinned_compile_kwargs(),
         )
 
     message = str(error.value)
     assert str(LLVM_ROOT / "bin/clang++") in message
-    assert "phase3-preserved-stderr" in message
+    assert "intentional-vortex-compile-error" in message
     assert "Command:" in message
     assert "stderr:" in message
 

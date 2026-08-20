@@ -205,7 +205,7 @@ class VortexModuleNode final : public ffi::ModuleObj {
 
     std::vector<uint8_t> packet(sizeof(vx_tvm_launch_header_t) + slots.size() * sizeof(uint64_t));
     auto* header = reinterpret_cast<vx_tvm_launch_header_t*>(packet.data());
-    header->abi_version = abi_version_;
+    header->abi_version = VX_TVM_ABI_VERSION;
     header->num_args = static_cast<uint32_t>(slots.size());
     header->kernel_id = kernel_id;
     header->reserved = 0;
@@ -218,14 +218,7 @@ class VortexModuleNode final : public ffi::ModuleObj {
 
     TVM_FFI_CHECK_GT(binary_.size(), 16, ValueError)
         << "Vortex vxbin is too small to contain its address header";
-    vx_buffer_h packet_buffer = device_api->UploadPacket(packet.data(), packet.size());
-    try {
-      device_api->Launch(binary_.data(), binary_.size(), packet_buffer);
-    } catch (...) {
-      device_api->ReleaseRuntimeBuffer(packet_buffer);
-      throw;
-    }
-    device_api->ReleaseRuntimeBuffer(packet_buffer);
+    device_api->Launch(binary_.data(), binary_.size(), packet.data(), packet.size());
   }
 
  private:
@@ -260,10 +253,21 @@ ffi::Optional<ffi::Function> VortexModuleNode::GetFunction(const ffi::String& na
 
 static ffi::Module VortexModuleCreate(ffi::Bytes binary, ffi::String source,
                                       ffi::Map<ffi::String, FunctionInfo> fmap,
-                                      ffi::Map<ffi::String, int64_t> kernel_ids,
-                                      uint32_t abi_version, uint32_t num_warps,
+                                      ffi::Map<ffi::String, int64_t> kernel_ids, uint32_t num_warps,
                                       uint32_t thread_warp_size, uint32_t max_threads_per_block,
                                       uint32_t xlen) {
+  auto node = ffi::make_object<VortexModuleNode>(
+      std::move(binary), std::move(source), std::move(fmap), std::move(kernel_ids),
+      VX_TVM_ABI_VERSION, num_warps, thread_warp_size, max_threads_per_block, xlen);
+  return ffi::Module(node);
+}
+
+static ffi::Module VortexModuleCreateFromSerialized(ffi::Bytes binary, ffi::String source,
+                                                    ffi::Map<ffi::String, FunctionInfo> fmap,
+                                                    ffi::Map<ffi::String, int64_t> kernel_ids,
+                                                    uint32_t abi_version, uint32_t num_warps,
+                                                    uint32_t thread_warp_size,
+                                                    uint32_t max_threads_per_block, uint32_t xlen) {
   auto node = ffi::make_object<VortexModuleNode>(
       std::move(binary), std::move(source), std::move(fmap), std::move(kernel_ids), abi_version,
       num_warps, thread_warp_size, max_threads_per_block, xlen);
@@ -292,9 +296,9 @@ static ffi::Module VortexModuleLoadFromBytes(const ffi::Bytes& bytes) {
                     stream.Read(&max_threads_per_block) && stream.Read(&xlen),
                 ValueError)
       << "Truncated Vortex module serialization";
-  return VortexModuleCreate(std::move(binary), std::move(source), std::move(fmap),
-                            std::move(kernel_ids), abi_version, num_warps, thread_warp_size,
-                            max_threads_per_block, xlen);
+  return VortexModuleCreateFromSerialized(std::move(binary), std::move(source), std::move(fmap),
+                                          std::move(kernel_ids), abi_version, num_warps,
+                                          thread_warp_size, max_threads_per_block, xlen);
 }
 
 static ffi::Module VortexModuleLoadFromFile(const ffi::String& file_name,

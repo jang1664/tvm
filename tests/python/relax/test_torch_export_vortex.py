@@ -170,13 +170,10 @@ def _run_and_compare(executable, model, host_input):
     os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
     reason="set TVM_VORTEX_RUN_HARDWARE=1 inside an allocated XRT hardware environment",
 )
-def test_torch_export_mlp_hardware_bytecode_and_compiled(tmp_path):
-    assert os.environ.get("VORTEX_DRIVER") == "xrt"
-    assert os.environ.get("XRT_XCLBIN_PATH")
-    xclbin = Path(os.environ["XRT_XCLBIN_PATH"])
-    assert xclbin == PINNED_XCLBIN
-    assert xclbin.is_file()
-
+def test_torch_export_mlp_hardware_bytecode_and_compiled(
+    tmp_path, vortex_hardware_environment
+):
+    assert vortex_hardware_environment == PINNED_XCLBIN
     model = _make_model()
     mod = _import(_export(model, dynamic_batch=True))
     build_ms = {}

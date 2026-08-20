@@ -21,7 +21,9 @@ Vortex repository.  Compiler and sysroot paths are resolved explicitly; the
 host shell's compiler selection and startup files are never consulted.
 """
 
+import math
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -53,6 +55,8 @@ class VortexCompileConfig:
     libcrt_root: Path
     xlen: int
     mtriple: str
+    mcpu: str | None
+    mattr: tuple[str, ...]
     march: str
     mabi: str
     startup_addr: int
@@ -73,13 +77,6 @@ def _as_path(value, description):
     if value is None:
         raise ValueError(description)
     return Path(value).expanduser().resolve()
-
-
-def _target_attr(target, name, default):
-    if target is None:
-        return default
-    value = target.attrs.get(name)
-    return default if value is None else value
 
 
 def resolve_vortex_compile_config(
@@ -108,7 +105,7 @@ def resolve_vortex_compile_config(
     accepted, but no executable is ever resolved from the ambient ``PATH``.
     """
 
-    xlen = int(_target_attr(target, "xlen", 64))
+    xlen = int(getattr(target, "xlen", 64))
     if xlen not in (32, 64):
         raise ValueError(f"Vortex xlen must be 32 or 64, but got {xlen}")
 
@@ -168,7 +165,7 @@ def resolve_vortex_compile_config(
         "Vortex compiler-rt root is required",
     )
 
-    mtriple = str(_target_attr(target, "mtriple", prefix))
+    mtriple = str(getattr(target, "mtriple", prefix))
     if not mtriple.startswith(f"riscv{xlen}"):
         raise ValueError(f"Vortex mtriple {mtriple!r} does not match xlen={xlen}")
 
@@ -189,11 +186,13 @@ def resolve_vortex_compile_config(
         libcrt_root=libcrt_root,
         xlen=xlen,
         mtriple=mtriple,
+        mcpu=None if getattr(target, "mcpu", None) is None else str(target.mcpu),
+        mattr=tuple(str(value) for value in (getattr(target, "mattr", None) or ())),
         march=str(march),
         mabi=str(mabi),
         startup_addr=int(startup_addr),
-        num_warps=int(_target_attr(target, "num_warps", 4)),
-        thread_warp_size=int(_target_attr(target, "thread_warp_size", 32)),
+        num_warps=int(getattr(target, "num_warps", 4)),
+        thread_warp_size=int(getattr(target, "thread_warp_size", 32)),
     )
 
 
@@ -213,6 +212,22 @@ def _validate_config(config):
     _require_directory(config.toolchain_root, "Vortex RISC-V toolchain root")
     _require_directory(config.sysroot, "Vortex RISC-V sysroot")
     _require_file(config.vortex_home / "kernel/libvortex.a", "Vortex kernel runtime library")
+    abi_header = config.vortex_home / "kernel/include/vx_tvm_abi.h"
+    _require_file(abi_header, "Vortex TVM ABI header")
+    match = re.search(
+        r"^#define\s+VX_TVM_ABI_VERSION\s+(\d+)[uU]?\s*$",
+        abi_header.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if match is None:
+        raise ValueError(f"Vortex TVM ABI version is missing from {abi_header}")
+    runtime_abi = tvm_ffi.get_global_func("runtime.vortex_abi_version", allow_missing=True)
+    if runtime_abi is None:
+        raise ValueError("Vortex runtime sidecar is not loaded; cannot validate the device ABI")
+    if int(match.group(1)) != int(runtime_abi()):
+        raise ValueError(
+            f"Vortex compiler ABI {match.group(1)} does not match runtime ABI {runtime_abi()}"
+        )
     _require_file(
         config.vortex_home / f"kernel/scripts/link{config.xlen}.ld",
         "Vortex kernel linker script",
@@ -245,16 +260,30 @@ def _command_environment(config):
 
 
 def _run_command(command, *, stage, environment, cwd):
+    timeout_text = os.environ.get("TVM_VORTEX_COMPILE_TIMEOUT_SECONDS", "300")
+    try:
+        timeout = float(timeout_text)
+    except ValueError as error:
+        raise ValueError("TVM_VORTEX_COMPILE_TIMEOUT_SECONDS must be positive") from error
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("TVM_VORTEX_COMPILE_TIMEOUT_SECONDS must be positive")
     try:
         result = subprocess.run(
             command,
             cwd=cwd,
             env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             check=False,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as error:
+        raise VortexCompileError(
+            f"Vortex {stage} timed out after {timeout:g} seconds\n"
+            f"Command: {shlex.join(command)}\n"
+            f"stdout:\n{error.stdout or ''}\n"
+            f"stderr:\n{error.stderr or ''}"
+        ) from error
     except OSError as error:
         raise VortexCompileError(
             f"Vortex {stage} could not start\nCommand: {shlex.join(command)}\nError: {error}"
@@ -309,6 +338,10 @@ def _compile_command(config, source_path, elf_path):
         f"-DNUM_THREADS={config.thread_warp_size}",
         "-DNDEBUG",
     ]
+    if config.mcpu:
+        command.append(f"-mcpu={config.mcpu}")
+    for feature in config.mattr:
+        command.extend(["-Xclang", "-target-feature", "-Xclang", feature])
     if config.mabi.endswith("f"):
         command.append("-DEXT_D_DISABLE")
     if "zfh" in config.march:

@@ -19,6 +19,25 @@
 import os
 from pathlib import Path
 
+import pytest
+
+
+PINNED_VORTEX_XCLBIN = Path(
+    "/opt/vortex_fpga_bins/fpint/xrt_hw_u55c_c_f100_fpint_64300e5119/bin/vortex_afu.xclbin"
+)
+
+
+@pytest.fixture
+def vortex_hardware_environment():
+    """Validate that a hardware-marked test uses the authoritative U55C image."""
+
+    assert os.environ.get("VORTEX_DRIVER") == "xrt"
+    assert "XCL_EMULATION_MODE" not in os.environ
+    configured = Path(os.environ["XRT_XCLBIN_PATH"]).resolve()
+    assert configured == PINNED_VORTEX_XCLBIN.resolve()
+    assert configured.is_file()
+    return configured
+
 
 def pytest_sessionstart():
     if os.getenv("CI", "") == "true":

@@ -16,6 +16,7 @@
 # under the License.
 
 import os
+import struct
 
 import numpy as np
 import pytest
@@ -54,6 +55,38 @@ def copy_kernel(a: T.Buffer((256,), "int32"), b: T.Buffer((256,), "int32")):
     for bx in T.thread_binding(2, thread="blockIdx.x"):
         for tx in T.thread_binding(128, thread="threadIdx.x"):
             b[bx * 128 + tx] = a[bx * 128 + tx]
+
+
+@T.prim_func
+def scalar_kernel(
+    output: T.Buffer((1,), "int64"),
+    i8: T.int8,
+    i16: T.int16,
+    i32: T.int32,
+    i64: T.int64,
+    u8: T.uint8,
+    u16: T.uint16,
+    u32: T.uint32,
+    u64: T.uint64,
+):
+    T.func_attr(
+        {
+            "global_symbol": "scalar_kernel",
+            "tirx.kernel_launch_params": ["blockIdx.x", "threadIdx.x"],
+        }
+    )
+    for bx in T.thread_binding(1, thread="blockIdx.x"):
+        for tx in T.thread_binding(1, thread="threadIdx.x"):
+            output[bx + tx] = (
+                T.Cast("int64", i8)
+                + T.Cast("int64", i16)
+                + T.Cast("int64", i32)
+                + i64
+                + T.Cast("int64", u8)
+                + T.Cast("int64", u16)
+                + T.Cast("int64", u32)
+                + T.Cast("int64", u64)
+            )
 
 
 @pytest.fixture
@@ -97,6 +130,40 @@ def test_module_serialization_preserves_source_and_function_metadata(vortex_modu
 
     with pytest.raises(ValueError, match="expected 3 kernel arguments and 2 launch arguments"):
         restored["vecadd"]()
+
+
+def test_module_serialization_rejects_wrong_version_and_truncation(vortex_module, tmp_path):
+    module_path = tmp_path / "vecadd.vortex"
+    vortex_module.write_to_file(str(module_path))
+    serialized = bytearray(module_path.read_bytes())
+
+    wrong_version = tmp_path / "wrong-version.vortex"
+    struct.pack_into("=I", serialized, 0, 0xFFFFFFFF)
+    wrong_version.write_bytes(serialized)
+    with pytest.raises(ValueError, match="Unsupported Vortex module serialization version"):
+        tvm.runtime.load_module(str(wrong_version))
+
+    truncated = tmp_path / "truncated.vortex"
+    truncated.write_bytes(module_path.read_bytes()[:8])
+    with pytest.raises(ValueError, match="Truncated Vortex module serialization"):
+        tvm.runtime.load_module(str(truncated))
+
+
+def test_all_integer_scalar_widths_are_packable(monkeypatch):
+    monkeypatch.delenv("VORTEX_DRIVER", raising=False)
+    callback_name = "tvm_callback_vortex_compile"
+    previous = tvm.get_global_func(callback_name)
+    tvm.register_global_func(
+        callback_name, lambda source, target: bytearray(range(32)), override=True
+    )
+    try:
+        module = tvm.get_global_func("target.build.vortex")(
+            tvm.IRModule({"scalar_kernel": scalar_kernel}), tvm.target.Target("vortex")
+        )
+    finally:
+        tvm.register_global_func(callback_name, previous, override=True)
+
+    assert module["scalar_kernel"] is not None
 
 
 def test_module_serialization_preserves_multi_kernel_mapping(multi_kernel_vortex_module, tmp_path):
@@ -147,17 +214,22 @@ def test_vortex_device_constructor_requires_an_explicit_driver(monkeypatch):
     assert not device.exist
 
 
+def test_runtime_enabled_reports_vortex_sidecar():
+    assert tvm.runtime.enabled("vortex")
+
+
 @pytest.mark.skipif(
     os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
     reason="set TVM_VORTEX_RUN_HARDWARE=1 inside an allocated XRT hardware environment",
 )
-def test_hardware_allocation_and_copy_round_trip():
-    assert os.environ.get("VORTEX_DRIVER") == "xrt"
-    assert os.environ.get("XRT_XCLBIN_PATH")
-
+def test_hardware_allocation_and_copy_round_trip(vortex_hardware_environment):
     host = np.arange(64, dtype="int32")
     device_array = tvm.runtime.tensor(host, device=tvm.vortex(0))
     np.testing.assert_array_equal(device_array.numpy(), host)
+    second_device_array = device_array.copyto(tvm.vortex(0))
+    np.testing.assert_array_equal(second_device_array.numpy(), host)
+    assert device_array.device.max_shared_memory_per_block == 0
+    assert device_array.device.max_thread_dimensions == [128, 1, 1]
 
 
 if __name__ == "__main__":
