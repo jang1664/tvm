@@ -28,6 +28,7 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ir/module.h>
 #include <tvm/target/codegen.h>
+#include <tvm/tirx/buffer.h>
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/function.h>
 #include <tvm/tirx/op.h>
@@ -54,7 +55,7 @@ inline ffi::Map<ffi::String, runtime::FunctionInfo> ExtractFuncInfo(const IRModu
       Type param_type = f->params[i]->ty;
       if (auto prim_type = param_type.as<PrimType>()) {
         arg_types.push_back(prim_type.value()->dtype);
-      } else if (param_type.as<PointerTypeNode>()) {
+      } else if (param_type.as<PointerTypeNode>() || param_type.as<tirx::BufferTypeNode>()) {
         arg_types.push_back(DLDataType{kDLOpaqueHandle, 64, 1});
       } else {
         TVM_FFI_THROW(InternalError) << "Unsupported PrimFunc parameter type " << param_type;

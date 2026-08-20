@@ -38,6 +38,7 @@ _BUILTIN_BACKENDS = (
     "webgpu",
     "hexagon",
     "adreno",
+    "vortex",
 )
 
 _AUTO_LOAD_DONE = False

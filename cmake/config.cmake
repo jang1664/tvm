@@ -98,6 +98,14 @@ set(USE_METAL OFF)
 # - /path/to/vulkan-sdk: use specific path to vulkan-sdk
 set(USE_VULKAN OFF)
 
+# Whether to enable the Vortex external-device runtime.
+#
+# Possible values:
+# - OFF: disable Vortex runtime support
+# - /path/to/vortex: use an explicit Vortex repository containing
+#                    runtime/include/vortex.h and runtime/libvortex.so
+set(USE_VORTEX OFF)
+
 # Whether to use spirv-tools and SPIRV-Headers from Khronos GitHub or GitLab.
 #
 # Possible values:

@@ -515,6 +515,22 @@ def ext_dev(dev_id=0):
     return device(DLDeviceType.kDLExtDev, dev_id)
 
 
+def vortex(dev_id=0):
+    """Construct a Vortex external device.
+
+    Parameters
+    ----------
+    dev_id : int, optional
+        The integer device id.  The current Vortex runtime accepts only zero.
+
+    Returns
+    -------
+    dev : Device
+        The created device.
+    """
+    return ext_dev(dev_id)
+
+
 def hexagon(dev_id=0):
     """Construct a Hexagon device
 

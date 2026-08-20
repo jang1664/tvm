@@ -114,6 +114,7 @@ tvm_option(SUMMARIZE "Print CMake option summary after configuring" OFF)
 tvm_option(USE_CLML "Build with CLML Codegen support" OFF)
 tvm_option(USE_CLML_GRAPH_EXECUTOR "Build with CLML graph runtime" OFF)
 tvm_option(USE_NVSHMEM "Build with NVSHMEM support" OFF)
+tvm_option(USE_VORTEX "Build with Vortex runtime support" OFF)
 
 # Python package options
 tvm_option(TVM_BUILD_PYTHON_MODULE "Build Python module with scikit-build-core" OFF)
@@ -453,6 +454,7 @@ include(cmake/modules/contrib/CLML.cmake) # Must be before OpenCL.cmake
 include(cmake/modules/OpenCL.cmake)
 include(cmake/modules/OpenMP.cmake)
 include(cmake/modules/Vulkan.cmake)
+include(cmake/modules/Vortex.cmake)
 include(cmake/modules/Metal.cmake)
 include(cmake/modules/ROCM.cmake)
 include(cmake/modules/LLVM.cmake)

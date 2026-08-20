@@ -32,7 +32,7 @@ from .base import _RUNTIME_ONLY
 # tvm.runtime
 from .runtime import Object
 from .runtime._tensor import device, device_from_target, cpu, cuda, opencl, vulkan, metal
-from .runtime._tensor import vpi, rocm, ext_dev, hexagon
+from .runtime._tensor import vpi, rocm, ext_dev, vortex, hexagon
 from .runtime import DataType, DataTypeCode
 
 # tvm.error

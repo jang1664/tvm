@@ -26,9 +26,11 @@
 #include <tvm/ir/module.h>
 #include <tvm/tirx/function.h>
 
+#include <cstdint>
+#include <limits>
 #include <string>
 
-#include "../../../target/source/codegen_source_base.h"
+#include "../../../target/build_common.h"
 #include "codegen_vortex.h"
 
 namespace tvm {
@@ -49,18 +51,28 @@ ffi::Module BuildVortex(IRModule mod, Target target) {
   cg.AddKernel(gvar, func);
   std::string code = cg.Finish();
 
-  // Phase 2 exposes generated source through a CSourceModule.  The optional
-  // callback is intentionally invoked now so tests and future compiler support
-  // share the stable tvm_callback_vortex_compile contract.  Phase 3 will retain
-  // its returned binary in a Vortex runtime module.
-  if (auto compile = ffi::Function::GetGlobal("tvm_callback_vortex_compile")) {
-    (*compile)(ffi::String(code), target);
-  }
+  auto compile = ffi::Function::GetGlobal("tvm_callback_vortex_compile");
+  TVM_FFI_CHECK(compile.has_value(), RuntimeError)
+      << "target.build.vortex requires tvm_callback_vortex_compile; import tvm.support.vortex";
+  ffi::Bytes binary = (*compile)(ffi::String(code), target).cast<ffi::Bytes>();
 
-  // Do not advertise a runnable TVM function from this inspection-only seam.
-  // The emitted translation unit exports the Vortex-native main entry point;
-  // Phase 3 will replace this with a Vortex module that owns TVM function metadata.
-  return CSourceModuleCreate(ffi::String(code), ffi::String("cpp"), {});
+  auto get_u32_attr = [&target](const char* name) {
+    int64_t value = target->GetAttr<int64_t>(name).value();
+    TVM_FFI_CHECK_GE(value, 0, ValueError)
+        << "Vortex target attribute " << name << " must be non-negative";
+    TVM_FFI_CHECK_LE(static_cast<uint64_t>(value), std::numeric_limits<uint32_t>::max(), ValueError)
+        << "Vortex target attribute " << name << " does not fit uint32";
+    return static_cast<uint32_t>(value);
+  };
+
+  auto create = ffi::Function::GetGlobal("ffi.Module.create.vortex");
+  TVM_FFI_CHECK(create.has_value(), RuntimeError)
+      << "Vortex runtime module is not loaded. Rebuild with USE_VORTEX set to the explicit "
+         "Vortex repository path.";
+  return (*create)(binary, ffi::String(code), ExtractFuncInfo(mod), uint32_t{1},
+                   get_u32_attr("num_warps"), get_u32_attr("thread_warp_size"),
+                   get_u32_attr("max_threads_per_block"), get_u32_attr("xlen"))
+      .cast<ffi::Module>();
 }
 
 void RegisterVortexCodegen() {

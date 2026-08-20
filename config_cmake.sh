@@ -65,6 +65,7 @@ fi
   echo 'set(USE_CUDA OFF)'
   echo 'set(USE_METAL OFF)'
   echo 'set(USE_VULKAN OFF)'
+  printf 'set(USE_VORTEX "%s")\n' "/home/jaeyongjang/project.local/vortex_base"
   echo 'set(USE_OPENCL OFF)'
   echo 'set(USE_CUBLAS OFF)'
   echo 'set(USE_CUDNN OFF)'
