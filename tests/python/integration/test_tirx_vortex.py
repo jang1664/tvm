@@ -49,6 +49,41 @@ def _build_vecadd(size, block_size):
     return tvm.tirx.build(_make_vecadd(size, block_size), target=target)
 
 
+def _make_matmul(m, n, k, block_size):
+    @T.prim_func
+    def matmul(
+        a: T.Buffer((m, k), "float32"),
+        b: T.Buffer((k, n), "float32"),
+        c: T.Buffer((m, n), "float32"),
+    ):
+        T.func_attr({"global_symbol": "matmul", "tirx.noalias": True})
+        for bx in T.thread_binding(
+            (m * n + block_size - 1) // block_size, thread="blockIdx.x"
+        ):
+            for tx in T.thread_binding(block_size, thread="threadIdx.x"):
+                if bx * block_size + tx < m * n:
+                    c[(bx * block_size + tx) // n, (bx * block_size + tx) % n] = T.float32(0)
+                    for reduction_index in range(k):
+                        c[
+                            (bx * block_size + tx) // n,
+                            (bx * block_size + tx) % n,
+                        ] = (
+                            c[
+                                (bx * block_size + tx) // n,
+                                (bx * block_size + tx) % n,
+                            ]
+                            + a[(bx * block_size + tx) // n, reduction_index]
+                            * b[reduction_index, (bx * block_size + tx) % n]
+                        )
+
+    return matmul
+
+
+def _build_matmul(m, n, k, block_size):
+    target = tvm.target.Target("vortex", host="llvm")
+    return tvm.tirx.build(_make_matmul(m, n, k, block_size), target=target)
+
+
 def test_vecadd_build_traverses_normal_tirx_pipeline():
     callback_name = "tvm_callback_vortex_compile"
     previous = tvm.get_global_func(callback_name)
@@ -76,6 +111,36 @@ def test_vecadd_rejects_oversized_thread_block(monkeypatch):
     monkeypatch.delenv("VORTEX_DRIVER", raising=False)
     with pytest.raises(ValueError, match=r"threadIdx\.x.*128|128.*threadIdx\.x"):
         _build_vecadd(129, 129)
+
+
+def test_matmul_build_traverses_normal_tirx_pipeline():
+    callback_name = "tvm_callback_vortex_compile"
+    previous = tvm.get_global_func(callback_name)
+    captured = []
+
+    def capture(source, target):
+        captured.append((source, target))
+        return bytearray(range(32))
+
+    tvm.register_global_func(callback_name, capture, override=True)
+    try:
+        executable = _build_matmul(3, 5, 7, 32)
+    finally:
+        tvm.register_global_func(callback_name, previous, override=True)
+
+    assert executable.kind == "llvm"
+    assert len(executable.imports) == 1
+    assert executable.imports[0].kind == "vortex"
+    assert len(captured) == 1
+    assert captured[0][1].kind.name == "vortex"
+    assert "for (int32_t reduction_index = 0; reduction_index < 7" in captured[0][0]
+    assert "vx_spawn_threads" in captured[0][0]
+
+
+def test_matmul_rejects_oversized_thread_block(monkeypatch):
+    monkeypatch.delenv("VORTEX_DRIVER", raising=False)
+    with pytest.raises(ValueError, match=r"threadIdx\.x.*128|128.*threadIdx\.x"):
+        _build_matmul(3, 5, 7, 129)
 
 
 @pytest.mark.skipif(
@@ -107,6 +172,36 @@ def test_vecadd_hardware(size, block_size):
     executable["vecadd"](lhs, rhs, output)
 
     np.testing.assert_array_equal(output.numpy(), lhs_host + rhs_host)
+
+
+@pytest.mark.skipif(
+    os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
+    reason="set TVM_VORTEX_RUN_HARDWARE=1 inside an allocated XRT hardware environment",
+)
+@pytest.mark.parametrize(
+    ("m", "n", "k", "block_size"),
+    [
+        (1, 1, 1, 32),
+        (2, 3, 4, 64),
+        (3, 5, 7, 128),
+    ],
+)
+def test_matmul_hardware(m, n, k, block_size):
+    assert os.environ.get("VORTEX_DRIVER") == "xrt"
+    assert os.environ.get("XRT_XCLBIN_PATH")
+
+    executable = _build_matmul(m, n, k, block_size)
+    device = tvm.vortex(0)
+    rng = np.random.default_rng(0)
+    lhs_host = rng.uniform(-1.0, 1.0, size=(m, k)).astype("float32")
+    rhs_host = rng.uniform(-1.0, 1.0, size=(k, n)).astype("float32")
+    lhs = tvm.runtime.tensor(lhs_host, device=device)
+    rhs = tvm.runtime.tensor(rhs_host, device=device)
+    output = tvm.runtime.empty((m, n), "float32", device=device)
+
+    executable["matmul"](lhs, rhs, output)
+
+    np.testing.assert_allclose(output.numpy(), lhs_host @ rhs_host, rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":

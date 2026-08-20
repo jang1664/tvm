@@ -100,8 +100,12 @@ void CodeGenVortex::VisitStmt_(const AttrStmtNode* op) {
 }
 
 void CodeGenVortex::VisitStmt_(const ForNode* op) {
-  TVM_FFI_CHECK(op->thread_binding.has_value(), ValueError)
-      << "CodeGenVortex: serial loops are not supported by the vector-add MVP";
+  if (!op->thread_binding.has_value()) {
+    TVM_FFI_CHECK(op->kind == ForKind::kSerial, ValueError)
+        << "CodeGenVortex: only serial and thread-bound loops are supported";
+    CodeGenC::VisitStmt_(op);
+    return;
+  }
   TVM_FFI_CHECK(is_zero(op->min), ValueError)
       << "CodeGenVortex: thread-bound loops must have a zero minimum";
   const IterVar& binding = op->thread_binding.value();
@@ -116,7 +120,7 @@ void CodeGenVortex::VisitStmt_(const ForNode* op) {
 
 void CodeGenVortex::VisitStmt_(const AllocBufferNode* op) {
   TVM_FFI_THROW(ValueError)
-      << "CodeGenVortex: local or shared allocation is not supported by the vector-add MVP (buffer "
+      << "CodeGenVortex: local or shared allocation is not supported by the Vortex MVP (buffer "
       << op->buffer.name() << ")";
 }
 

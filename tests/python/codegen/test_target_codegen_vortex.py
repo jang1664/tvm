@@ -87,14 +87,39 @@ def test_rejects_non_x_thread_dimension():
         _build_source(bad)
 
 
-def test_rejects_unsupported_serial_loop():
+def test_supports_serial_loop():
     @T.prim_func
-    def bad(a: T.Buffer((4,), "float32")):
-        T.func_attr({"global_symbol": "bad"})
+    def serial(a: T.Buffer((4,), "float32")):
+        T.func_attr({"global_symbol": "serial"})
         for i in range(4):
             a[i] = 0.0
 
-    with pytest.raises(ValueError, match="serial loops are not supported"):
+    captured = []
+    callback_name = "tvm_callback_vortex_compile"
+    previous = tvm.get_global_func(callback_name)
+
+    def capture(source, target):
+        captured.append(source)
+        return bytearray()
+
+    tvm.register_global_func(callback_name, capture, override=True)
+    try:
+        source = _build_source(serial)
+    finally:
+        tvm.register_global_func(callback_name, previous, override=True)
+
+    assert captured == [source]
+    assert "for (int32_t i = 0; i < 4; ++i)" in source
+
+
+def test_rejects_non_serial_cpu_loop():
+    @T.prim_func
+    def bad(a: T.Buffer((4,), "float32")):
+        T.func_attr({"global_symbol": "bad"})
+        for i in T.vectorized(4):
+            a[i] = 0.0
+
+    with pytest.raises(ValueError, match="only serial and thread-bound loops"):
         _build_source(bad)
 
 
