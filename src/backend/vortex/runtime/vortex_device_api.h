@@ -57,10 +57,9 @@ class VortexDeviceAPI final : public DeviceAPI {
 
   uint64_t ResolveAddress(void* ptr, uint64_t required_size = 1) const;
   uint64_t ActualThreadCapacity();
-  vx_buffer_h UploadKernel(const void* data, size_t size);
   vx_buffer_h UploadPacket(const void* data, size_t size);
   void ReleaseRuntimeBuffer(vx_buffer_h buffer);
-  void Launch(vx_buffer_h kernel, vx_buffer_h packet);
+  void Launch(const void* kernel_data, size_t kernel_size, vx_buffer_h packet);
 
   static VortexDeviceAPI* Global();
 
@@ -78,6 +77,8 @@ class VortexDeviceAPI final : public DeviceAPI {
   vx_device_h device_{nullptr};
   std::unordered_map<const void*, VortexAllocation*> allocations_;
   std::vector<vx_buffer_h> runtime_buffers_;
+  vx_buffer_h kernel_buffer_{nullptr};
+  std::vector<uint8_t> kernel_binary_;
 };
 
 }  // namespace vortex

@@ -70,6 +70,11 @@ VortexDeviceAPI::~VortexDeviceAPI() {
     vx_mem_free(buffer);
   }
   runtime_buffers_.clear();
+  if (kernel_buffer_ != nullptr) {
+    vx_mem_free(kernel_buffer_);
+    kernel_buffer_ = nullptr;
+  }
+  kernel_binary_.clear();
   if (device_ != nullptr) {
     vx_dev_close(device_);
     device_ = nullptr;
@@ -254,15 +259,6 @@ uint64_t VortexDeviceAPI::ActualThreadCapacity() {
   return threads * warps;
 }
 
-vx_buffer_h VortexDeviceAPI::UploadKernel(const void* data, size_t size) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  EnsureOpenLocked();
-  vx_buffer_h buffer = nullptr;
-  TVM_VORTEX_CALL(vx_upload_kernel_bytes(device_, data, size, &buffer));
-  runtime_buffers_.push_back(buffer);
-  return buffer;
-}
-
 vx_buffer_h VortexDeviceAPI::UploadPacket(const void* data, size_t size) {
   std::lock_guard<std::mutex> lock(mutex_);
   EnsureOpenLocked();
@@ -280,10 +276,25 @@ void VortexDeviceAPI::ReleaseRuntimeBuffer(vx_buffer_h buffer) {
   runtime_buffers_.erase(it);
 }
 
-void VortexDeviceAPI::Launch(vx_buffer_h kernel, vx_buffer_h packet) {
+void VortexDeviceAPI::Launch(const void* kernel_data, size_t kernel_size, vx_buffer_h packet) {
   std::lock_guard<std::mutex> lock(mutex_);
   EnsureOpenLocked();
-  TVM_VORTEX_CALL(vx_start(device_, kernel, packet));
+  const auto* bytes = static_cast<const uint8_t*>(kernel_data);
+  bool kernel_matches =
+      kernel_buffer_ != nullptr && kernel_binary_.size() == kernel_size &&
+      std::equal(kernel_binary_.begin(), kernel_binary_.end(), bytes);
+  if (!kernel_matches) {
+    if (kernel_buffer_ != nullptr) {
+      TVM_VORTEX_CALL(vx_mem_free(kernel_buffer_));
+      kernel_buffer_ = nullptr;
+      kernel_binary_.clear();
+    }
+    vx_buffer_h new_kernel = nullptr;
+    TVM_VORTEX_CALL(vx_upload_kernel_bytes(device_, kernel_data, kernel_size, &new_kernel));
+    kernel_buffer_ = new_kernel;
+    kernel_binary_.assign(bytes, bytes + kernel_size);
+  }
+  TVM_VORTEX_CALL(vx_start(device_, kernel_buffer_, packet));
   TVM_VORTEX_CALL(vx_ready_wait(device_, VX_MAX_TIMEOUT));
 }
 

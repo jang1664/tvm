@@ -79,12 +79,33 @@ void CodeGenVortex::BindThreadIndex(const IterVar& iv) {
       CastFromTo(std::string(iv->thread_tag), PrimType::UInt(32), iv->var.ty());
 }
 
+void CodeGenVortex::ValidateThreadExtent(const IterVar& iv, const PrimExpr& extent_expr) {
+  if (iv->thread_tag != "threadIdx.x") return;
+  const auto* extent = extent_expr.as<IntImmNode>();
+  TVM_FFI_CHECK(extent != nullptr, ValueError)
+      << "CodeGenVortex: threadIdx.x extent must be a compile-time constant";
+  int64_t max_threads = target_->GetAttr<int64_t>("max_threads_per_block").value();
+  TVM_FFI_CHECK_GT(extent->value, 0, ValueError)
+      << "CodeGenVortex: threadIdx.x extent must be positive";
+  TVM_FFI_CHECK_LE(extent->value, max_threads, ValueError)
+      << "CodeGenVortex: threadIdx.x extent " << extent->value
+      << " exceeds max_threads_per_block " << max_threads;
+}
+
+void CodeGenVortex::VisitStmt_(const AttrStmtNode* op) {
+  if (op->attr_key == tirx::attr::thread_extent) {
+    ValidateThreadExtent(op->node.as_or_throw<IterVar>(), op->value);
+  }
+  CodeGenC::VisitStmt_(op);
+}
+
 void CodeGenVortex::VisitStmt_(const ForNode* op) {
   TVM_FFI_CHECK(op->thread_binding.has_value(), ValueError)
       << "CodeGenVortex: serial loops are not supported by the vector-add MVP";
   TVM_FFI_CHECK(is_zero(op->min), ValueError)
       << "CodeGenVortex: thread-bound loops must have a zero minimum";
   const IterVar& binding = op->thread_binding.value();
+  ValidateThreadExtent(binding, op->extent);
   BindThreadIndex(binding);
   if (!binding->var.same_as(op->loop_var)) {
     var_idmap_[op->loop_var.get()] =

@@ -31,7 +31,6 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
-#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -195,19 +194,11 @@ class VortexModuleNode final : public ffi::ModuleObj {
     std::memcpy(packet.data() + sizeof(vx_tvm_launch_header_t), slots.data(),
                 slots.size() * sizeof(uint64_t));
 
-    vx_buffer_h kernel = nullptr;
-    {
-      std::lock_guard<std::mutex> lock(kernel_mutex_);
-      if (kernel_ == nullptr) {
-        TVM_FFI_CHECK_GT(binary_.size(), 16, ValueError)
-            << "Vortex vxbin is too small to contain its address header";
-        kernel_ = device_api->UploadKernel(binary_.data(), binary_.size());
-      }
-      kernel = kernel_;
-    }
+    TVM_FFI_CHECK_GT(binary_.size(), 16, ValueError)
+        << "Vortex vxbin is too small to contain its address header";
     vx_buffer_h packet_buffer = device_api->UploadPacket(packet.data(), packet.size());
     try {
-      device_api->Launch(kernel, packet_buffer);
+      device_api->Launch(binary_.data(), binary_.size(), packet_buffer);
     } catch (...) {
       device_api->ReleaseRuntimeBuffer(packet_buffer);
       throw;
@@ -224,8 +215,6 @@ class VortexModuleNode final : public ffi::ModuleObj {
   uint32_t thread_warp_size_;
   uint32_t max_threads_per_block_;
   uint32_t xlen_;
-  std::mutex kernel_mutex_;
-  vx_buffer_h kernel_{nullptr};
 };
 
 ffi::Optional<ffi::Function> VortexModuleNode::GetFunction(const ffi::String& name) {

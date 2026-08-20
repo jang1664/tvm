@@ -43,10 +43,12 @@ class CodeGenVortex final : public CodeGenC {
   using CodeGenC::PrintType;
   void PrintType(const Type& type, std::ostream& os) final;  // NOLINT(*)
   void BindThreadIndex(const IterVar& iv) final;
+  void VisitStmt_(const AttrStmtNode* op) final;
   void VisitStmt_(const ForNode* op) final;
   void VisitStmt_(const AllocBufferNode* op) final;
 
  private:
+  void ValidateThreadExtent(const IterVar& iv, const PrimExpr& extent);
   std::string PrintTypeString(const Type& type);
   void EmitLaunchWrapper(const PrimFunc& func);
 
