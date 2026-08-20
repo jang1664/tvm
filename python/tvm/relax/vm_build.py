@@ -99,7 +99,7 @@ def _auto_attach_system_lib_prefix(
 
 
 def _is_device_module(mod: tvm.runtime.Module) -> bool:
-    return mod.kind in ["cuda", "opencl", "metal", "hip", "vulkan", "webgpu"]
+    return mod.kind in ["cuda", "opencl", "metal", "hip", "vulkan", "webgpu", "vortex"]
 
 
 def _vmlink(
