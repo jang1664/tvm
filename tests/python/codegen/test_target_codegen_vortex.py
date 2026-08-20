@@ -113,6 +113,31 @@ def test_supports_serial_loop():
     assert "for (int32_t i = 0; i < 4; ++i)" in source
 
 
+def test_supports_max_expression():
+    @T.prim_func
+    def maximum(a: T.Buffer((1,), "float32"), out: T.Buffer((1,), "float32")):
+        T.func_attr({"global_symbol": "maximum"})
+        for tx in T.thread_binding(1, thread="threadIdx.x"):
+            out[tx] = T.max(a[tx], T.float32(0))
+
+    captured = []
+    callback_name = "tvm_callback_vortex_compile"
+    previous = tvm.get_global_func(callback_name)
+    tvm.register_global_func(
+        callback_name,
+        lambda source, unused_target: captured.append(source) or bytearray(),
+        override=True,
+    )
+    try:
+        source = _build_source(maximum)
+    finally:
+        tvm.register_global_func(callback_name, previous, override=True)
+
+    assert captured == [source]
+    assert "static inline T __tvm_vortex_max(T a, T b)" in source
+    assert "__tvm_vortex_max(a[((int32_t)threadIdx.x)], 0.000000e+00f)" in source
+
+
 def test_rejects_non_serial_cpu_loop():
     @T.prim_func
     def bad(a: T.Buffer((4,), "float32")):

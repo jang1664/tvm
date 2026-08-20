@@ -15,9 +15,12 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Relax backends"""
+"""The Relax Vortex backend."""
 
-from . import contrib, cpu_generic, cuda, gpu_generic, metal, rocm, adreno, vortex
-from .dispatch_sampling import DispatchSampling
-from .dispatch_sort_scan import DispatchSortScan
-from .pattern_registry import get_pattern, get_patterns_with_prefix
+from .pipeline import (
+    dataflow_lower_passes,
+    finalize_passes,
+    get_default_pipeline,
+    legalize_passes,
+    library_dispatch_passes,
+)

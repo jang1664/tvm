@@ -43,6 +43,10 @@ CodeGenVortex::CodeGenVortex(Target target) : target_(std::move(target)) {
          "  T value = {};\n"
          "  __builtin_memcpy(&value, &bits, sizeof(T));\n"
          "  return value;\n"
+         "}\n\n"
+         "template <typename T>\n"
+         "static inline T __tvm_vortex_max(T a, T b) {\n"
+         "  return a > b ? a : b;\n"
          "}\n\n";
 }
 
@@ -122,6 +126,14 @@ void CodeGenVortex::VisitStmt_(const AllocBufferNode* op) {
   TVM_FFI_THROW(ValueError)
       << "CodeGenVortex: local or shared allocation is not supported by the Vortex MVP (buffer "
       << op->buffer.name() << ")";
+}
+
+void CodeGenVortex::VisitExpr_(const MaxNode* op, std::ostream& os) {  // NOLINT(*)
+  os << "__tvm_vortex_max(";
+  PrintExpr(op->a, os);
+  os << ", ";
+  PrintExpr(op->b, os);
+  os << ")";
 }
 
 std::string CodeGenVortex::PrintTypeString(const Type& type) {

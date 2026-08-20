@@ -49,6 +49,7 @@ class CodeGenVortex final : public CodeGenC {
   void VisitStmt_(const AttrStmtNode* op) final;
   void VisitStmt_(const ForNode* op) final;
   void VisitStmt_(const AllocBufferNode* op) final;
+  void VisitExpr_(const MaxNode* op, std::ostream& os) final;  // NOLINT(*)
 
  private:
   void ValidateThreadExtent(const IterVar& iv, const PrimExpr& extent);
