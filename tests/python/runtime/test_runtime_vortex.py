@@ -223,7 +223,7 @@ def test_runtime_enabled_reports_vortex_sidecar():
     reason="set TVM_VORTEX_RUN_HARDWARE=1 inside an allocated XRT hardware environment",
 )
 def test_hardware_allocation_and_copy_round_trip(vortex_hardware_environment):
-    host = np.arange(64, dtype="int32")
+    host = np.arange((1 << 20) // np.dtype("int32").itemsize + 17, dtype="int32")
     device_array = tvm.runtime.tensor(host, device=tvm.vortex(0))
     np.testing.assert_array_equal(device_array.numpy(), host)
     second_device_array = device_array.copyto(tvm.vortex(0))

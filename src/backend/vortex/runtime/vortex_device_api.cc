@@ -340,8 +340,9 @@ void VortexDeviceAPI::Launch(const void* kernel_data, size_t kernel_size, const 
     kernel_buffer_ = new_kernel;
     kernel_binary_.assign(bytes, bytes + kernel_size);
   }
+  uint64_t timeout_ms = KernelTimeoutMs();
   TVM_VORTEX_CALL(vx_start(device_, kernel_buffer_, packet_buffer_));
-  int error = vx_ready_wait(device_, KernelTimeoutMs());
+  int error = vx_ready_wait(device_, timeout_ms);
   if (error != 0) {
     poisoned_ = true;
     TVM_FFI_THROW(RuntimeError) << "Vortex kernel wait failed with error " << error
