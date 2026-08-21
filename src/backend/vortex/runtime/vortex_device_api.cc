@@ -177,7 +177,8 @@ void VortexDeviceAPI::GetAttr(Device dev, DeviceAttrKind kind, ffi::Any* rv) {
       *rv = static_cast<int64_t>(value);
       return;
     case kMaxSharedMemoryPerBlock:
-      *rv = int64_t{0};
+      TVM_VORTEX_CALL(vx_dev_caps(device_, VX_CAPS_LOCAL_MEM_SIZE, &value));
+      *rv = static_cast<int64_t>(value);
       return;
     case kDeviceName:
       *rv = ffi::String("Vortex");
@@ -186,7 +187,8 @@ void VortexDeviceAPI::GetAttr(Device dev, DeviceAttrKind kind, ffi::Any* rv) {
       uint64_t warps = 0;
       TVM_VORTEX_CALL(vx_dev_caps(device_, VX_CAPS_NUM_THREADS, &value));
       TVM_VORTEX_CALL(vx_dev_caps(device_, VX_CAPS_NUM_WARPS, &warps));
-      *rv = ffi::String("[" + std::to_string(value * warps) + ", 1, 1]");
+      std::string capacity = std::to_string(value * warps);
+      *rv = ffi::String("[" + capacity + ", " + capacity + ", " + capacity + "]");
     }
       return;
     case kTotalGlobalMemory:
@@ -303,14 +305,18 @@ void VortexDeviceAPI::StreamSync(Device dev, TVMStreamHandle stream) {
   // perform here.
 }
 
-uint64_t VortexDeviceAPI::ActualThreadCapacity() {
+VortexActualResourceProfile VortexDeviceAPI::ActualResourceProfile() {
   std::lock_guard<std::mutex> lock(mutex_);
   EnsureOpenLocked();
   uint64_t threads = 0;
   uint64_t warps = 0;
+  uint64_t local_mem_size = 0;
+  uint64_t num_barriers = 0;
   TVM_VORTEX_CALL(vx_dev_caps(device_, VX_CAPS_NUM_THREADS, &threads));
   TVM_VORTEX_CALL(vx_dev_caps(device_, VX_CAPS_NUM_WARPS, &warps));
-  return threads * warps;
+  TVM_VORTEX_CALL(vx_dev_caps(device_, VX_CAPS_LOCAL_MEM_SIZE, &local_mem_size));
+  TVM_VORTEX_CALL(vx_dev_caps(device_, VX_CAPS_NUM_BARRIERS, &num_barriers));
+  return {warps, threads, local_mem_size, num_barriers, driver_name_, xclbin_path_};
 }
 
 void VortexDeviceAPI::Launch(const void* kernel_data, size_t kernel_size, const void* packet_data,

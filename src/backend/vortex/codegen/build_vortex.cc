@@ -33,7 +33,9 @@
 #include <string>
 #include <vector>
 
+#include "../../../runtime/metadata.h"
 #include "../../../target/build_common.h"
+#include "../vortex_common.h"
 #include "codegen_vortex.h"
 
 namespace tvm {
@@ -52,10 +54,29 @@ ffi::Module BuildVortex(IRModule mod, Target target) {
     TVM_FFI_CHECK(base_func->IsInstance<PrimFuncNode>(), TypeError)
         << "CodeGenVortex: only PrimFunc is supported";
     PrimFunc func = base_func.as_or_throw<PrimFunc>();
+    for (const Var& param : func->params) {
+      if (const auto* buffer_type = param->ty.as<BufferTypeNode>()) {
+        TVM_FFI_CHECK_NE(buffer_type->storage_scope, "shared.dyn", ValueError)
+            << "CodeGenVortex: dynamic shared memory is not supported";
+      } else if (const auto* pointer_type = param->ty.as<PointerTypeNode>()) {
+        TVM_FFI_CHECK_NE(pointer_type->storage_scope, "shared.dyn", ValueError)
+            << "CodeGenVortex: dynamic shared memory is not supported";
+      }
+    }
+    if (auto launch_params =
+            func->GetAttr<ffi::Array<ffi::String>>(tirx::attr::kKernelLaunchParams)) {
+      for (const ffi::String& tag : launch_params.value()) {
+        TVM_FFI_CHECK_NE(tag, runtime::launch_param::kUseDynamicSharedMemoryTag, ValueError)
+            << "CodeGenVortex: dynamic shared memory is not supported";
+      }
+    }
     auto symbol = func->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol);
     TVM_FFI_CHECK(symbol.has_value() && !symbol.value().empty(), ValueError)
         << "CodeGenVortex: every PrimFunc must have a non-empty global symbol";
     std::string global_symbol = symbol.value();
+    TVM_FFI_CHECK_NE(global_symbol, runtime::vortex::kKernelResourceMetadataFunction, ValueError)
+        << "CodeGenVortex: global symbol " << global_symbol
+        << " is reserved for Vortex runtime metadata inspection";
     TVM_FFI_CHECK(global_symbols.insert(global_symbol).second, ValueError)
         << "CodeGenVortex: duplicate global symbol " << global_symbol;
     kernels.push_back({std::move(global_symbol), gvar, std::move(func)});
@@ -78,6 +99,31 @@ ffi::Module BuildVortex(IRModule mod, Target target) {
   cg.FinishDispatcher();
   std::string code = cg.Finish();
 
+  const std::vector<VortexKernelResourceMetadata>& resources = cg.kernel_resources();
+  TVM_FFI_ICHECK_EQ(resources.size(), kernels.size());
+  ffi::Map<ffi::String, ffi::Array<int64_t>> kernel_resources;
+  for (size_t index = 0; index < kernels.size(); ++index) {
+    const VortexKernelResourceMetadata& resource = resources[index];
+    auto checked_i64 = [&kernels, index](uint64_t value, const char* field) {
+      TVM_FFI_CHECK_LE(value, static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+                       ValueError)
+          << "CodeGenVortex: " << field << " for kernel " << kernels[index].global_symbol
+          << " does not fit int64 module metadata";
+      return static_cast<int64_t>(value);
+    };
+    kernel_resources.Set(
+        ffi::String(kernels[index].global_symbol),
+        ffi::Array<int64_t>{
+            static_cast<int64_t>(resource.launch_rank),
+            checked_i64(resource.static_shared_bytes, "static_shared_bytes"),
+            checked_i64(resource.compile_time_resident_groups, "compile_time_resident_groups"),
+            checked_i64(resource.private_local_bytes_per_thread, "private_local_bytes_per_thread"),
+            checked_i64(resource.thread_block_dimensions[0], "thread_block_dim_x"),
+            checked_i64(resource.thread_block_dimensions[1], "thread_block_dim_y"),
+            checked_i64(resource.thread_block_dimensions[2], "thread_block_dim_z"),
+            static_cast<int64_t>(resource.uses_shared_barrier)});
+  }
+
   auto compile = ffi::Function::GetGlobal("tvm_callback_vortex_compile");
   TVM_FFI_CHECK(compile.has_value(), RuntimeError)
       << "target.build.vortex requires tvm_callback_vortex_compile; import tvm.support.vortex";
@@ -96,9 +142,10 @@ ffi::Module BuildVortex(IRModule mod, Target target) {
   TVM_FFI_CHECK(create.has_value(), RuntimeError)
       << "Vortex runtime module is not loaded. Rebuild with USE_VORTEX set to the explicit "
          "Vortex repository path.";
-  return (*create)(binary, ffi::String(code), ExtractFuncInfo(mod), kernel_ids,
+  return (*create)(binary, ffi::String(code), ExtractFuncInfo(mod), kernel_ids, kernel_resources,
                    get_u32_attr("num_warps"), get_u32_attr("thread_warp_size"),
-                   get_u32_attr("max_threads_per_block"), get_u32_attr("xlen"))
+                   get_u32_attr("max_threads_per_block"), get_u32_attr("local_mem_size"),
+                   get_u32_attr("xlen"))
       .cast<ffi::Module>();
 }
 

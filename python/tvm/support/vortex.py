@@ -47,6 +47,7 @@ class VortexCompileConfig:
     """Fully resolved paths and target settings for Vortex compilation."""
 
     vortex_home: Path
+    build_dir: Path
     llvm_root: Path
     profile_root: Path
     toolchain_root: Path
@@ -83,6 +84,7 @@ def resolve_vortex_compile_config(
     target=None,
     *,
     vortex_home=None,
+    build_dir=None,
     llvm_root=None,
     profile_root=None,
     toolchain_root=None,
@@ -96,7 +98,9 @@ def resolve_vortex_compile_config(
     """Resolve the complete Vortex compiler configuration.
 
     ``vortex_home`` is deliberately required through either the argument,
-    ``TVM_VORTEX_HOME``, or ``VORTEX_HOME``.  The installed LLVM-Vortex and
+    ``TVM_VORTEX_HOME``, or ``VORTEX_HOME``.  Generated Vortex artifacts are
+    resolved from ``build_dir``, ``TVM_VORTEX_BUILD_DIR``,
+    ``VORTEX_BUILD_DIR``, or ``<vortex_home>/build`` in that order.  The installed LLVM-Vortex and
     pinned fpint LP64F profile use their deterministic machine locations by
     default.  They can be overridden with ``TVM_VORTEX_LLVM_ROOT``,
     ``TVM_VORTEX_PROFILE_ROOT``, ``TVM_VORTEX_TOOLCHAIN_ROOT``,
@@ -112,6 +116,14 @@ def resolve_vortex_compile_config(
     vortex_home = _as_path(
         _first_setting(vortex_home, ("TVM_VORTEX_HOME", "VORTEX_HOME")),
         "Vortex repository root is required; set TVM_VORTEX_HOME or pass vortex_home",
+    )
+    build_dir = _as_path(
+        _first_setting(
+            build_dir,
+            ("TVM_VORTEX_BUILD_DIR", "VORTEX_BUILD_DIR"),
+            vortex_home / "build",
+        ),
+        "Vortex build directory is required",
     )
     llvm_root = _as_path(
         _first_setting(
@@ -178,6 +190,7 @@ def resolve_vortex_compile_config(
 
     return VortexCompileConfig(
         vortex_home=vortex_home,
+        build_dir=build_dir,
         llvm_root=llvm_root,
         profile_root=profile_root,
         toolchain_root=toolchain_root,
@@ -211,7 +224,10 @@ def _validate_config(config):
     _require_file(config.llvm_root / "bin/llvm-objcopy", "LLVM-Vortex llvm-objcopy")
     _require_directory(config.toolchain_root, "Vortex RISC-V toolchain root")
     _require_directory(config.sysroot, "Vortex RISC-V sysroot")
-    _require_file(config.vortex_home / "kernel/libvortex.a", "Vortex kernel runtime library")
+    _require_file(
+        config.build_dir / "kernel/libvortex.a", "Vortex kernel runtime library"
+    )
+    _require_directory(config.build_dir / "hw", "Vortex generated hardware headers")
     abi_header = config.vortex_home / "kernel/include/vx_tvm_abi.h"
     _require_file(abi_header, "Vortex TVM ABI header")
     match = re.search(
@@ -221,9 +237,13 @@ def _validate_config(config):
     )
     if match is None:
         raise ValueError(f"Vortex TVM ABI version is missing from {abi_header}")
-    runtime_abi = tvm_ffi.get_global_func("runtime.vortex_abi_version", allow_missing=True)
+    runtime_abi = tvm_ffi.get_global_func(
+        "runtime.vortex_abi_version", allow_missing=True
+    )
     if runtime_abi is None:
-        raise ValueError("Vortex runtime sidecar is not loaded; cannot validate the device ABI")
+        raise ValueError(
+            "Vortex runtime sidecar is not loaded; cannot validate the device ABI"
+        )
     if int(match.group(1)) != int(runtime_abi()):
         raise ValueError(
             f"Vortex compiler ABI {match.group(1)} does not match runtime ABI {runtime_abi()}"
@@ -232,12 +252,13 @@ def _validate_config(config):
         config.vortex_home / f"kernel/scripts/link{config.xlen}.ld",
         "Vortex kernel linker script",
     )
-    _require_file(config.vortex_home / "kernel/scripts/vxbin.py", "Vortex vxbin packager")
+    _require_file(
+        config.vortex_home / "kernel/scripts/vxbin.py", "Vortex vxbin packager"
+    )
     _require_file(config.libc_root / "lib/libc.a", "Vortex profile libc")
     _require_file(config.libc_root / "lib/libm.a", "Vortex profile libm")
     _require_file(
-        config.libcrt_root
-        / f"lib/baremetal/libclang_rt.builtins-riscv{config.xlen}.a",
+        config.libcrt_root / f"lib/baremetal/libclang_rt.builtins-riscv{config.xlen}.a",
         "Vortex profile compiler-rt builtins",
     )
     _require_file(Path("/usr/bin/readelf"), "host ELF reader used by vxbin.py")
@@ -264,7 +285,9 @@ def _run_command(command, *, stage, environment, cwd):
     try:
         timeout = float(timeout_text)
     except ValueError as error:
-        raise ValueError("TVM_VORTEX_COMPILE_TIMEOUT_SECONDS must be positive") from error
+        raise ValueError(
+            "TVM_VORTEX_COMPILE_TIMEOUT_SECONDS must be positive"
+        ) from error
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("TVM_VORTEX_COMPILE_TIMEOUT_SECONDS must be positive")
     try:
@@ -300,10 +323,9 @@ def _run_command(command, *, stage, environment, cwd):
 
 def _compile_command(config, source_path, elf_path):
     linker_script = config.vortex_home / f"kernel/scripts/link{config.xlen}.ld"
-    libvortex = config.vortex_home / "kernel/libvortex.a"
+    libvortex = config.build_dir / "kernel/libvortex.a"
     builtins = (
-        config.libcrt_root
-        / f"lib/baremetal/libclang_rt.builtins-riscv{config.xlen}.a"
+        config.libcrt_root / f"lib/baremetal/libclang_rt.builtins-riscv{config.xlen}.a"
     )
     command = [
         str(config.llvm_root / "bin/clang++"),
@@ -331,6 +353,7 @@ def _compile_command(config, source_path, elf_path):
         "-fdata-sections",
         "-ffunction-sections",
         f"-I{config.vortex_home / 'kernel/include'}",
+        f"-I{config.build_dir / 'hw'}",
         f"-I{config.vortex_home / 'hw'}",
         f"-I{config.vortex_home / 'sim/common'}",
         f"-DXLEN_{config.xlen}",

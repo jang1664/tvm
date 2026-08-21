@@ -28,7 +28,7 @@ def library_dispatch_passes(target: tvm.target.Target):
 
 
 def legalize_passes(target: tvm.target.Target):  # pylint: disable=unused-argument
-    """Legalize Relax and schedule kernels for the one-dimensional Vortex MVP."""
+    """Legalize Relax and schedule kernels for Vortex."""
     from tvm.s_tir import dlight as dl  # pylint: disable=import-outside-toplevel
 
     return [
@@ -37,11 +37,11 @@ def legalize_passes(target: tvm.target.Target):  # pylint: disable=unused-argume
         relax.transform.FoldConstant(),
         relax.transform.FuseOps(),
         relax.transform.FuseTIR(),
-        # The optimized generic-GPU Matmul rule uses two-dimensional thread
-        # blocks and shared/local memory.  Until those features are available,
-        # the fallback rule maps each output element to one Vortex thread and
-        # keeps reductions serial.
-        dl.ApplyDefaultSchedule(dl.gpu.Fallback()),
+        # The generic Matmul rule's conservative 8x8 configuration fits the
+        # Vortex target contract (64 threads and a small static shared arena).
+        # Rules are tried in order, so unsupported matmul-like shapes and all
+        # other operators retain the safe one-dimensional fallback schedule.
+        dl.ApplyDefaultSchedule(dl.gpu.Matmul(), dl.gpu.Fallback()),
     ]
 
 

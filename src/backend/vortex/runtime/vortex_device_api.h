@@ -45,6 +45,15 @@ struct VortexAllocation {
   uint64_t size{0};
 };
 
+struct VortexActualResourceProfile {
+  uint64_t num_warps;
+  uint64_t thread_warp_size;
+  uint64_t local_mem_size;
+  uint64_t num_barriers;
+  std::string driver_name;
+  std::string xclbin_path;
+};
+
 class VortexDeviceAPI final : public DeviceAPI {
  public:
   ~VortexDeviceAPI() final;
@@ -56,7 +65,7 @@ class VortexDeviceAPI final : public DeviceAPI {
   void StreamSync(Device dev, TVMStreamHandle stream) final;
 
   uint64_t ResolveAddress(void* ptr) const;
-  uint64_t ActualThreadCapacity();
+  VortexActualResourceProfile ActualResourceProfile();
   void Launch(const void* kernel_data, size_t kernel_size, const void* packet_data,
               size_t packet_size);
 

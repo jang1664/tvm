@@ -138,12 +138,27 @@ class HostDeviceSplitter : public StmtMutator {
  public:
   explicit HostDeviceSplitter(IRModule* device_mod, std::function<GlobalVar()> var_supply,
                               PrimFunc cur_func)
-      : device_mod_(device_mod), var_supply_(var_supply), cur_func_(cur_func) {}
+      : device_mod_(device_mod),
+        var_supply_(var_supply),
+        cur_func_(cur_func),
+        is_vortex_(
+            cur_func_->GetAttr<Target>(tvm::attr::kTarget).value().WithoutHost()->kind->name ==
+            "vortex") {}
 
   Stmt VisitStmt_(const AttrStmtNode* op) final {
     if (op->attr_key == tvm::attr::kTarget) {
       auto device_target = op->node.as<Target>().value().WithoutHost();
       return SplitDeviceFunc(op->body, device_target);
+    }
+    return StmtMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const AllocBufferNode* op) final {
+    if (is_vortex_ && op->buffer.scope() == "shared") {
+      // Static block-shared storage belongs to each Vortex device kernel.  It is
+      // reconstructed inside SplitDeviceFunc instead of becoming a host
+      // allocation and an ABI pointer argument.
+      return Evaluate(0);
     }
     return StmtMutator::VisitStmt_(op);
   }
@@ -188,10 +203,16 @@ class HostDeviceSplitter : public StmtMutator {
     ffi::Array<Expr> call_args;
     ffi::Map<Var, Var> buffer_data_params;
     ffi::Map<Var, Expr> kernel_buffer_remap;
+    std::unordered_set<const VarNode*> internal_static_shared;
     for (const Var& param : params) {
       if (param->ty.as<BufferTypeNode>()) {
         BufferVar buffer(param);
         BufferVar kernel_buffer(buffer.name(), buffer.type(), buffer.span());
+        if (device_target->kind->name == "vortex" && buffer.scope() == "shared") {
+          kernel_buffer_remap.Set(param, kernel_buffer.var());
+          internal_static_shared.insert(param.get());
+          continue;
+        }
         Var data_param(buffer.name() + "_ptr", buffer.DataPointerType());
         kernel_params.push_back(data_param);
         call_args.push_back(buffer.data());
@@ -222,14 +243,17 @@ class HostDeviceSplitter : public StmtMutator {
     }
 
     for (BufferVar buf : buffers_to_declare) {
-      auto data_param = buffer_data_params.Get(buf.var());
       auto kernel_buffer = kernel_buffer_remap.Get(buf.var());
-      TVM_FFI_ICHECK(data_param.has_value())
-          << "Undefined buffer " << buf.name() << " was not captured as a kernel parameter";
       TVM_FFI_ICHECK(kernel_buffer.has_value());
-      body = SeqStmt::Flatten(
-          DeclBuffer(BufferVar(kernel_buffer.value().as_or_throw<Var>()), data_param.value()),
-          std::move(body));
+      BufferVar remapped_buffer(kernel_buffer.value().as_or_throw<Var>());
+      if (internal_static_shared.count(buf.get())) {
+        body = SeqStmt::Flatten(AllocBuffer(remapped_buffer), std::move(body));
+      } else {
+        auto data_param = buffer_data_params.Get(buf.var());
+        TVM_FFI_ICHECK(data_param.has_value())
+            << "Undefined buffer " << buf.name() << " was not captured as a kernel parameter";
+        body = SeqStmt::Flatten(DeclBuffer(remapped_buffer, data_param.value()), std::move(body));
+      }
     }
     LaunchBoundsAttrExtractor launch_bounds_attr;
     body = launch_bounds_attr.Extract(std::move(body));
@@ -283,6 +307,8 @@ class HostDeviceSplitter : public StmtMutator {
   std::function<GlobalVar()> var_supply_;
   // Current function being split
   PrimFunc cur_func_;
+  // Whether static shared allocations belong to a Vortex device kernel.
+  bool is_vortex_;
 };
 
 PrimFunc SplitHostDevice(PrimFunc func, IRModule* device_mod,
