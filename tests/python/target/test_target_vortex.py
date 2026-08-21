@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import json
+
 import pytest
 import tvm_ffi
 
@@ -33,7 +35,12 @@ def test_vortex_target_defaults():
     assert target.attrs["thread_warp_size"] == 32
     assert target.attrs["max_threads_per_block"] == 128
     assert target.attrs["max_num_threads"] == 128
-    assert target.attrs["max_shared_memory_per_block"] == 0
+    assert target.attrs["max_block_size_x"] == 128
+    assert target.attrs["max_block_size_y"] == 128
+    assert target.attrs["max_block_size_z"] == 128
+    assert target.attrs["local_mem_size"] == 1 << 20
+    assert target.attrs["max_shared_memory_per_block"] == 1 << 20
+    assert target.attrs["max_local_memory_per_thread"] == 4 << 10
     assert target.attrs["xlen"] == 64
     assert target.attrs["mtriple"] == "riscv64-unknown-elf"
 
@@ -52,6 +59,12 @@ def test_vortex_target_derives_hardware_limits():
 
     assert target.attrs["max_threads_per_block"] == 128
     assert target.attrs["max_num_threads"] == 128
+    assert target.attrs["max_block_size_x"] == 128
+    assert target.attrs["max_block_size_y"] == 128
+    assert target.attrs["max_block_size_z"] == 128
+    assert target.attrs["local_mem_size"] == 1 << 20
+    assert target.attrs["max_shared_memory_per_block"] == 1 << 20
+    assert target.attrs["max_local_memory_per_thread"] == 4 << 10
     assert target.attrs["mtriple"] == "riscv32-unknown-elf"
 
     round_tripped = Target(str(target))
@@ -65,6 +78,8 @@ def test_vortex_target_derives_hardware_limits():
     [
         ("num_warps", 0),
         ("thread_warp_size", 0),
+        ("local_mem_size", 0),
+        ("max_local_memory_per_thread", 0),
         ("max_shared_memory_per_block", -1),
         ("xlen", 128),
     ],
@@ -74,15 +89,127 @@ def test_vortex_target_rejects_invalid_hardware_attributes(attribute, value):
         Target({"kind": "vortex", attribute: value})
 
 
-@pytest.mark.parametrize("attribute", ["max_threads_per_block", "max_num_threads"])
+@pytest.mark.parametrize(
+    "attribute",
+    [
+        "max_threads_per_block",
+        "max_num_threads",
+        "max_block_size_x",
+        "max_block_size_y",
+        "max_block_size_z",
+    ],
+)
 def test_vortex_target_rejects_inconsistent_thread_limit(attribute):
     with pytest.raises(ValueError, match=attribute):
         Target({"kind": "vortex", attribute: 64})
 
 
-def test_vortex_target_rejects_shared_memory_until_codegen_supports_it():
-    with pytest.raises(ValueError, match="does not support shared memory"):
-        Target({"kind": "vortex", "max_shared_memory_per_block": 1})
+def test_vortex_target_rejects_inconsistent_local_memory_limit():
+    with pytest.raises(ValueError, match="max_shared_memory_per_block"):
+        Target(
+            {
+                "kind": "vortex",
+                "local_mem_size": 1024,
+                "max_shared_memory_per_block": 512,
+            }
+        )
+
+
+def test_vortex_target_derives_shared_limit_from_custom_local_memory():
+    target = Target({"kind": "vortex", "local_mem_size": 512 << 10})
+
+    assert target.attrs["local_mem_size"] == 512 << 10
+    assert target.attrs["max_shared_memory_per_block"] == 512 << 10
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {
+            "kind": "vortex",
+            "local_mem_size": 512 << 10,
+            "max_shared_memory_per_block": 0,
+        },
+        json.dumps(
+            {
+                "kind": "vortex",
+                "local_mem_size": 512 << 10,
+                "max_shared_memory_per_block": 0,
+            }
+        ),
+    ],
+    ids=["config-map", "json-string"],
+)
+def test_vortex_target_normalizes_legacy_zero_shared_limit(config):
+    target = Target(config)
+
+    assert target.attrs["local_mem_size"] == 512 << 10
+    assert target.attrs["max_shared_memory_per_block"] == 512 << 10
+    assert Target(str(target)).attrs["max_shared_memory_per_block"] == 512 << 10
+
+
+def test_vortex_target_preserves_custom_per_thread_local_limit():
+    target = Target({"kind": "vortex", "max_local_memory_per_thread": 2 << 10})
+
+    assert target.attrs["max_local_memory_per_thread"] == 2 << 10
+    assert Target(str(target)).attrs["max_local_memory_per_thread"] == 2 << 10
+
+
+def test_vortex_target_rejects_thread_capacity_overflow():
+    with pytest.raises(ValueError, match="overflows int64"):
+        Target({"kind": "vortex", "num_warps": 1 << 62, "thread_warp_size": 4})
+
+
+def test_vortex_target_does_not_expose_nondefault_barrier_count():
+    with pytest.raises(ValueError, match="num_barriers"):
+        Target({"kind": "vortex", "num_barriers": 2})
+
+
+@pytest.mark.parametrize(
+    ("block_threads", "warps_per_group", "resident_groups", "shared_limit"),
+    [
+        (32, 1, 4, 256 << 10),
+        (48, 2, 2, 512 << 10),
+        (64, 2, 2, 512 << 10),
+        (96, 3, 1, 1 << 20),
+        (128, 4, 1, 1 << 20),
+    ],
+)
+def test_vortex_block_resource_usage(
+    block_threads, warps_per_group, resident_groups, shared_limit
+):
+    calculate = tvm.get_global_func("target.vortex.get_block_resource_usage")
+    resources = calculate(Target("vortex"), block_threads)
+
+    assert resources["block_threads"] == block_threads
+    assert resources["warps_per_group"] == warps_per_group
+    assert resources["resident_groups"] == resident_groups
+    assert resources["effective_max_shared_memory_per_block"] == shared_limit
+
+
+@pytest.mark.parametrize("block_threads", [0, 129])
+def test_vortex_block_resource_usage_rejects_invalid_block_size(block_threads):
+    calculate = tvm.get_global_func("target.vortex.get_block_resource_usage")
+    with pytest.raises(ValueError, match="block_threads"):
+        calculate(Target("vortex"), block_threads)
+
+
+def test_vortex_block_resource_usage_rejects_non_vortex_target():
+    calculate = tvm.get_global_func("target.vortex.get_block_resource_usage")
+    with pytest.raises(ValueError, match="requires a vortex target"):
+        calculate(Target("llvm"), 1)
+
+
+def test_vortex_block_resource_usage_checks_all_resident_lmem_slots():
+    validate = tvm.get_global_func("target.vortex.validate_shared_memory_usage")
+    target = Target("vortex")
+
+    validate(target, 32, 256 << 10)
+    with pytest.raises(ValueError, match="requires 1048580 bytes"):
+        validate(target, 32, (256 << 10) + 1)
+
+    with pytest.raises(ValueError, match="overflows int64"):
+        validate(target, 32, 1 << 62)
 
 
 def _oversized_thread_block():
@@ -103,7 +230,9 @@ def test_vortex_target_limit_is_consumed_by_gpu_verifier():
         "max_threads_per_block": target.attrs["max_threads_per_block"],
     }
 
-    assert not tvm.s_tir.analysis.verify_gpu_code(_oversized_thread_block(), constraints)
+    assert not tvm.s_tir.analysis.verify_gpu_code(
+        _oversized_thread_block(), constraints
+    )
 
 
 if __name__ == "__main__":

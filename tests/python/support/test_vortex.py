@@ -26,6 +26,7 @@ from tvm.support import vortex
 
 
 VORTEX_HOME = Path("/home/jaeyongjang/project.local/vortex_base")
+VORTEX_BUILD_DIR = VORTEX_HOME / "build"
 LLVM_ROOT = Path("/opt/vortex/llvm-vortex")
 PROFILE_ROOT = Path("/opt/vortex_profiles/rv64imaf_zfh_lp64f")
 
@@ -47,7 +48,7 @@ def _have_pinned_toolchain():
     return all(
         path.exists()
         for path in [
-            VORTEX_HOME / "kernel/libvortex.a",
+            VORTEX_BUILD_DIR / "kernel/libvortex.a",
             VORTEX_HOME / "kernel/scripts/link64.ld",
             VORTEX_HOME / "kernel/scripts/vxbin.py",
             LLVM_ROOT / "bin/clang++",
@@ -105,6 +106,23 @@ def test_rv32_configuration_is_xlen_aware(tmp_path):
     assert config.mabi == "ilp32f"
     assert config.startup_addr == 0x80000000
     assert config.toolchain_root == profile_root / "riscv32-gnu-toolchain"
+    assert config.build_dir == VORTEX_HOME / "build"
+
+
+def test_build_directory_override_is_independent_from_source_root(
+    monkeypatch, tmp_path
+):
+    build_dir = tmp_path / "vortex-out"
+    monkeypatch.setenv("TVM_VORTEX_BUILD_DIR", str(build_dir))
+
+    config = vortex.resolve_vortex_compile_config(
+        tvm.target.Target("vortex"),
+        vortex_home=VORTEX_HOME,
+        profile_root=PROFILE_ROOT,
+    )
+
+    assert config.vortex_home == VORTEX_HOME
+    assert config.build_dir == build_dir.resolve()
 
 
 def test_target_cpu_and_features_reach_compiler_argv(tmp_path):
@@ -116,12 +134,16 @@ def test_target_cpu_and_features_reach_compiler_argv(tmp_path):
         vortex_home=VORTEX_HOME,
         profile_root=PROFILE_ROOT,
     )
-    command = vortex._compile_command(config, tmp_path / "kernel.cpp", tmp_path / "kernel.elf")
+    command = vortex._compile_command(
+        config, tmp_path / "kernel.cpp", tmp_path / "kernel.elf"
+    )
 
     assert "-mcpu=generic-rv64" in command
     assert command.count("-target-feature") == 4
     assert "+m" in command
     assert "-d" in command
+    assert str(VORTEX_BUILD_DIR / "kernel/libvortex.a") in command
+    assert f"-I{VORTEX_BUILD_DIR / 'hw'}" in command
 
 
 def test_compile_timeout_preserves_stage_and_output(monkeypatch, tmp_path):
@@ -133,7 +155,9 @@ def test_compile_timeout_preserves_stage_and_output(monkeypatch, tmp_path):
     monkeypatch.setattr(vortex.subprocess, "run", timeout)
     monkeypatch.setenv("TVM_VORTEX_COMPILE_TIMEOUT_SECONDS", "2")
 
-    with pytest.raises(vortex.VortexCompileError, match="timed out after 2 seconds") as error:
+    with pytest.raises(
+        vortex.VortexCompileError, match="timed out after 2 seconds"
+    ) as error:
         vortex._run_command(
             ["fake-compiler", "kernel.cpp"],
             stage="kernel compilation",
