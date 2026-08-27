@@ -52,7 +52,7 @@ namespace tvm {
 namespace runtime {
 namespace vortex {
 
-static constexpr uint32_t kVortexModuleSerializationVersion = 5;
+static constexpr uint32_t kVortexModuleSerializationVersion = 6;
 static constexpr size_t kVortexKernelResourceFieldCount = 8;
 static constexpr const char* kAcceleratorProfileMetadataFunction =
     "vortex.get_accelerator_profile_metadata";
@@ -274,7 +274,10 @@ class VortexModuleNode final : public ffi::ModuleObj {
     for (const char* field :
          {"profile_version", "fingerprint", "configs", "tcu_mode", "tcu_fp_formats", "gemm_mode",
           "platform", "gemm_abi_version", "layout_abi_version", "mxu_row", "mxu_col",
-          "mxu_col_tile", "tmem_bank_size", "num_dma_channels", "gemm_acc_mem_depth"}) {
+          "mxu_col_tile", "tmem_bank_size", "num_dma_channels", "gemm_acc_mem_depth",
+          "dma_mt", "dma_nt", "dma_kt", "qparam_slot_alignment", "tmem_alignment",
+          "dimension_bits", "device_address_bits", "tile_counter_bits", "job_entries",
+          "num_cores"}) {
       TVM_FFI_CHECK(accelerator_profile_.count(ffi::String(field)), ValueError)
           << "Vortex accelerator profile metadata is missing " << field;
     }
@@ -535,7 +538,10 @@ static ffi::Module VortexModuleCreate(
     ffi::String tcu_mode, ffi::String tcu_fp_formats, ffi::String gemm_mode, ffi::String platform,
     uint32_t gemm_abi_version, uint32_t layout_abi_version, uint32_t mxu_row, uint32_t mxu_col,
     uint32_t mxu_col_tile, uint32_t tmem_bank_size, uint32_t num_dma_channels,
-    uint32_t gemm_acc_mem_depth) {
+    uint32_t gemm_acc_mem_depth, uint32_t dma_mt, uint32_t dma_nt, uint32_t dma_kt,
+    uint32_t qparam_slot_alignment, uint32_t tmem_alignment, uint32_t dimension_bits,
+    uint32_t device_address_bits, uint32_t tile_counter_bits, uint32_t job_entries,
+    uint32_t num_cores) {
   SerializedAcceleratorProfile accelerator_profile{
       {"profile_version", ffi::String(std::to_string(accelerator_profile_version))},
       {"fingerprint", std::move(accelerator_profile_fingerprint)},
@@ -551,7 +557,17 @@ static ffi::Module VortexModuleCreate(
       {"mxu_col_tile", ffi::String(std::to_string(mxu_col_tile))},
       {"tmem_bank_size", ffi::String(std::to_string(tmem_bank_size))},
       {"num_dma_channels", ffi::String(std::to_string(num_dma_channels))},
-      {"gemm_acc_mem_depth", ffi::String(std::to_string(gemm_acc_mem_depth))}};
+      {"gemm_acc_mem_depth", ffi::String(std::to_string(gemm_acc_mem_depth))},
+      {"dma_mt", ffi::String(std::to_string(dma_mt))},
+      {"dma_nt", ffi::String(std::to_string(dma_nt))},
+      {"dma_kt", ffi::String(std::to_string(dma_kt))},
+      {"qparam_slot_alignment", ffi::String(std::to_string(qparam_slot_alignment))},
+      {"tmem_alignment", ffi::String(std::to_string(tmem_alignment))},
+      {"dimension_bits", ffi::String(std::to_string(dimension_bits))},
+      {"device_address_bits", ffi::String(std::to_string(device_address_bits))},
+      {"tile_counter_bits", ffi::String(std::to_string(tile_counter_bits))},
+      {"job_entries", ffi::String(std::to_string(job_entries))},
+      {"num_cores", ffi::String(std::to_string(num_cores))}};
   auto node = ffi::make_object<VortexModuleNode>(
       std::move(binary), std::move(source), std::move(fmap), std::move(kernel_ids),
       std::move(kernel_resources), VX_TVM_ABI_VERSION, num_warps, thread_warp_size,

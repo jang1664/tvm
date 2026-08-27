@@ -54,9 +54,19 @@ def test_vortex_target_defaults():
     assert target.attrs["vortex_tmem_bank_size"] == 64 << 10
     assert target.attrs["vortex_num_dma_channels"] == 8
     assert target.attrs["vortex_gemm_acc_mem_depth"] == 1024
+    assert target.attrs["vortex_gemm_dma_mt"] == 128
+    assert target.attrs["vortex_gemm_dma_nt"] == 128
+    assert target.attrs["vortex_gemm_dma_kt"] == 128
+    assert target.attrs["vortex_gemm_qparam_slot_alignment"] == 512
+    assert target.attrs["vortex_gemm_tmem_alignment"] == 64
+    assert target.attrs["vortex_gemm_dimension_bits"] == 32
+    assert target.attrs["vortex_device_address_bits"] == 64
+    assert target.attrs["vortex_gemm_tile_counter_bits"] == 32
+    assert target.attrs["vortex_gemm_job_entries"] == 4
+    assert target.attrs["vortex_num_cores"] == 1
     assert target.attrs["vortex_platform"] == "generic"
-    assert target.attrs["vortex_gemm_abi_version"] == 1
-    assert target.attrs["vortex_layout_abi_version"] == 1
+    assert target.attrs["vortex_gemm_abi_version"] == 2
+    assert target.attrs["vortex_layout_abi_version"] == 2
 
 
 @pytest.mark.parametrize("mode", ["invalid", "FP", "fp-int"])

@@ -220,6 +220,16 @@ def test_module_serialization_preserves_accelerator_profile(vortex_module, tmp_p
     assert metadata["tmem_bank_size"] == str(64 << 10)
     assert metadata["num_dma_channels"] == "8"
     assert metadata["gemm_acc_mem_depth"] == "1024"
+    assert metadata["dma_mt"] == "128"
+    assert metadata["dma_nt"] == "128"
+    assert metadata["dma_kt"] == "128"
+    assert metadata["qparam_slot_alignment"] == "512"
+    assert metadata["tmem_alignment"] == "64"
+    assert metadata["dimension_bits"] == "32"
+    assert metadata["device_address_bits"] == "64"
+    assert metadata["tile_counter_bits"] == "32"
+    assert metadata["job_entries"] == "4"
+    assert metadata["num_cores"] == "1"
 
 
 def test_accelerator_profile_validation_uses_exact_sibling_manifest(tmp_path):

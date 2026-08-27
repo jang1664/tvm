@@ -202,6 +202,16 @@ def _normalize_accelerator_profile(macros):
         "vortex_tmem_bank_size": _macro_int(macros, "TMEM_BANK_SIZE", 64 << 10),
         "vortex_num_dma_channels": _macro_int(macros, "NUM_DMA_CHANNELS", 8),
         "vortex_gemm_acc_mem_depth": _macro_int(macros, "GEMM_ACC_MEM_DEPTH", 1024),
+        "vortex_gemm_dma_mt": 128,
+        "vortex_gemm_dma_nt": 128,
+        "vortex_gemm_dma_kt": 128,
+        "vortex_gemm_qparam_slot_alignment": 512,
+        "vortex_gemm_tmem_alignment": 64,
+        "vortex_gemm_dimension_bits": 32,
+        "vortex_device_address_bits": 64,
+        "vortex_gemm_tile_counter_bits": 32,
+        "vortex_gemm_job_entries": 4,
+        "vortex_num_cores": _macro_int(macros, "NUM_CORES", 1),
         "vortex_platform": "vivado" if "VIVADO" in macros else "generic",
         "vortex_march": "rv64imafd" if double_enabled else "rv64imaf_zfh",
         "vortex_mabi": "lp64d" if double_enabled else "lp64f",
@@ -240,8 +250,8 @@ def load_vortex_accelerator_profile(manifest_path):
         # replace this with capability registers, but legacy XRT launches must
         # prove that the loaded sibling manifest describes the same image.
         "vortex_accelerator_profile_configs": configs,
-        "vortex_gemm_abi_version": 1,
-        "vortex_layout_abi_version": 1,
+        "vortex_gemm_abi_version": 2,
+        "vortex_layout_abi_version": 2,
     }
     target = Target(target_config)
     return VortexAcceleratorProfile(

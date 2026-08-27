@@ -30,9 +30,11 @@
 #include <tvm/target/target_kind.h>
 
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <set>
 #include <string>
+#include <utility>
 
 #include "vortex_resource.h"
 
@@ -121,11 +123,37 @@ ffi::Map<ffi::String, ffi::Any> CanonicalizeVortexTarget(ffi::Map<ffi::String, f
   require_positive("vortex_tmem_bank_size");
   require_positive("vortex_num_dma_channels");
   require_positive("vortex_gemm_acc_mem_depth");
+  int64_t dma_mt = require_positive("vortex_gemm_dma_mt");
+  int64_t dma_nt = require_positive("vortex_gemm_dma_nt");
+  int64_t dma_kt = require_positive("vortex_gemm_dma_kt");
+  int64_t qparam_alignment = require_positive("vortex_gemm_qparam_slot_alignment");
+  int64_t tmem_alignment = require_positive("vortex_gemm_tmem_alignment");
+  require_positive("vortex_gemm_dimension_bits");
+  require_positive("vortex_device_address_bits");
+  require_positive("vortex_gemm_tile_counter_bits");
+  int64_t job_entries = require_positive("vortex_gemm_job_entries");
+  int64_t num_cores = require_positive("vortex_num_cores");
   require_positive("vortex_gemm_abi_version");
   require_positive("vortex_layout_abi_version");
   TVM_FFI_CHECK_EQ(mxu_col % mxu_col_tile, 0, ValueError)
       << "Vortex vortex_mxu_col must be divisible by vortex_mxu_col_tile";
   TVM_FFI_CHECK_GT(mxu_row, 0, ValueError);
+  auto is_power_of_two = [](int64_t value) { return (value & (value - 1)) == 0; };
+  for (const auto& [name, value] :
+       std::initializer_list<std::pair<const char*, int64_t>>{{"vortex_gemm_dma_mt", dma_mt},
+                                                              {"vortex_gemm_dma_nt", dma_nt},
+                                                              {"vortex_gemm_dma_kt", dma_kt},
+                                                              {"vortex_gemm_qparam_slot_alignment", qparam_alignment},
+                                                              {"vortex_gemm_tmem_alignment", tmem_alignment}}) {
+    TVM_FFI_CHECK(is_power_of_two(value), ValueError)
+        << "Vortex " << name << " must be a power of two";
+  }
+  TVM_FFI_CHECK_EQ(dma_kt % mxu_row, 0, ValueError)
+      << "Vortex vortex_gemm_dma_kt must be divisible by vortex_mxu_row";
+  TVM_FFI_CHECK_EQ(dma_nt % mxu_col, 0, ValueError)
+      << "Vortex vortex_gemm_dma_nt must be divisible by vortex_mxu_col";
+  TVM_FFI_CHECK_LE(num_cores, job_entries, ValueError)
+      << "Vortex vortex_num_cores cannot exceed vortex_gemm_job_entries";
 
   std::string fingerprint = target.at("vortex_accelerator_profile_fingerprint").cast<std::string>();
   std::string profile_configs = target.at("vortex_accelerator_profile_configs").cast<std::string>();
@@ -210,8 +238,18 @@ void RegisterTargetKind() {
       .add_attr_option<int64_t>("vortex_num_dma_channels", refl::DefaultValue(8))
       .add_attr_option<int64_t>("vortex_gemm_acc_mem_depth", refl::DefaultValue(1024))
       .add_attr_option<ffi::String>("vortex_platform", refl::DefaultValue(ffi::String("generic")))
-      .add_attr_option<int64_t>("vortex_gemm_abi_version", refl::DefaultValue(1))
-      .add_attr_option<int64_t>("vortex_layout_abi_version", refl::DefaultValue(1))
+      .add_attr_option<int64_t>("vortex_gemm_dma_mt", refl::DefaultValue(128))
+      .add_attr_option<int64_t>("vortex_gemm_dma_nt", refl::DefaultValue(128))
+      .add_attr_option<int64_t>("vortex_gemm_dma_kt", refl::DefaultValue(128))
+      .add_attr_option<int64_t>("vortex_gemm_qparam_slot_alignment", refl::DefaultValue(512))
+      .add_attr_option<int64_t>("vortex_gemm_tmem_alignment", refl::DefaultValue(64))
+      .add_attr_option<int64_t>("vortex_gemm_dimension_bits", refl::DefaultValue(32))
+      .add_attr_option<int64_t>("vortex_device_address_bits", refl::DefaultValue(64))
+      .add_attr_option<int64_t>("vortex_gemm_tile_counter_bits", refl::DefaultValue(32))
+      .add_attr_option<int64_t>("vortex_gemm_job_entries", refl::DefaultValue(4))
+      .add_attr_option<int64_t>("vortex_num_cores", refl::DefaultValue(1))
+      .add_attr_option<int64_t>("vortex_gemm_abi_version", refl::DefaultValue(2))
+      .add_attr_option<int64_t>("vortex_layout_abi_version", refl::DefaultValue(2))
       .set_default_keys({"vortex", "gpu"})
       .set_target_canonicalizer(CanonicalizeVortexTarget);
 }

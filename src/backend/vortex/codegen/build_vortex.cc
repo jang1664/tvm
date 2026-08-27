@@ -157,7 +157,15 @@ ffi::Module BuildVortex(IRModule mod, Target target) {
                    get_u32_attr("vortex_layout_abi_version"), get_u32_attr("vortex_mxu_row"),
                    get_u32_attr("vortex_mxu_col"), get_u32_attr("vortex_mxu_col_tile"),
                    get_u32_attr("vortex_tmem_bank_size"), get_u32_attr("vortex_num_dma_channels"),
-                   get_u32_attr("vortex_gemm_acc_mem_depth"))
+                   get_u32_attr("vortex_gemm_acc_mem_depth"),
+                   get_u32_attr("vortex_gemm_dma_mt"), get_u32_attr("vortex_gemm_dma_nt"),
+                   get_u32_attr("vortex_gemm_dma_kt"),
+                   get_u32_attr("vortex_gemm_qparam_slot_alignment"),
+                   get_u32_attr("vortex_gemm_tmem_alignment"),
+                   get_u32_attr("vortex_gemm_dimension_bits"),
+                   get_u32_attr("vortex_device_address_bits"),
+                   get_u32_attr("vortex_gemm_tile_counter_bits"),
+                   get_u32_attr("vortex_gemm_job_entries"), get_u32_attr("vortex_num_cores"))
       .cast<ffi::Module>();
 }
 
