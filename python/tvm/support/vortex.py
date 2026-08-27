@@ -21,6 +21,8 @@ Vortex repository.  Compiler and sysroot paths are resolved explicitly; the
 host shell's compiler selection and startup files are never consulted.
 """
 
+import hashlib
+import json
 import math
 import os
 import re
@@ -32,7 +34,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import tvm_ffi
-
 
 _DEFAULT_LLVM_ROOT = Path("/opt/vortex/llvm-vortex")
 _DEFAULT_LP64F_PROFILE = Path("/opt/vortex_profiles/rv64imaf_zfh_lp64f")
@@ -63,6 +64,194 @@ class VortexCompileConfig:
     startup_addr: int
     num_warps: int
     thread_warp_size: int
+    tcu_mode: str
+    tcu_fp_formats: tuple[str, ...]
+    gemm_mode: str
+    mxu_row: int
+    mxu_col: int
+    mxu_col_tile: int
+    tmem_bank_size: int
+    num_dma_channels: int
+    gemm_acc_mem_depth: int
+    platform: str
+
+
+@dataclass(frozen=True)
+class VortexAcceleratorProfile:
+    """Normalized accelerator contract derived from one manifest CONFIGS value."""
+
+    name: str
+    manifest_path: Path
+    configs: str
+    macros: dict[str, str | None]
+    fingerprint: str
+    target: object
+
+
+_MACRO_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def parse_vortex_configs(configs):
+    """Parse a shell-quoted Vortex CONFIGS string into unique ``-D`` definitions."""
+
+    tokens = shlex.split(str(configs), posix=True)
+    macros = {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-D":
+            index += 1
+            if index == len(tokens):
+                raise ValueError("Vortex CONFIGS ends with an incomplete -D option")
+            definition = tokens[index]
+        elif token.startswith("-D"):
+            definition = token[2:]
+        else:
+            raise ValueError(
+                f"Vortex CONFIGS accepts only preprocessor definitions, got {token!r}"
+            )
+        if not definition:
+            raise ValueError("Vortex CONFIGS contains an empty -D definition")
+        name, separator, value = definition.partition("=")
+        if not _MACRO_NAME_RE.fullmatch(name):
+            raise ValueError(f"invalid Vortex macro name {name!r}")
+        normalized_value = value if separator else None
+        if name in macros and macros[name] != normalized_value:
+            raise ValueError(
+                f"conflicting definitions for Vortex macro {name}: "
+                f"{macros[name]!r} versus {normalized_value!r}"
+            )
+        macros[name] = normalized_value
+        index += 1
+    return macros
+
+
+def _macro_int(macros, name, default):
+    value = macros.get(name)
+    if value is None:
+        if name in macros:
+            raise ValueError(f"Vortex macro {name} requires an integer value")
+        return default
+    try:
+        parsed = int(value, 0)
+    except ValueError as error:
+        raise ValueError(
+            f"Vortex macro {name} must be an integer, got {value!r}"
+        ) from error
+    if parsed <= 0:
+        raise ValueError(f"Vortex macro {name} must be positive, got {parsed}")
+    return parsed
+
+
+def _normalize_accelerator_profile(macros):
+    has_tcu = "EXT_TCU_ENABLE" in macros
+    disable_tcu_fp = "DISABLE_TCU_FP" in macros
+    disable_tcu_int = "DISABLE_TCU_INT" in macros
+    disable_fp16 = "DISABLE_FP16" in macros
+    disable_bf16 = "DISABLE_BF16" in macros
+    if disable_tcu_fp and disable_tcu_int:
+        raise ValueError("Vortex profile disables both TCU paths")
+    if disable_fp16 and disable_bf16:
+        raise ValueError("Vortex profile disables both floating TCU formats")
+    if not has_tcu and (
+        disable_tcu_fp or disable_tcu_int or disable_fp16 or disable_bf16
+    ):
+        raise ValueError("TCU disable macros require EXT_TCU_ENABLE")
+
+    if not has_tcu:
+        tcu_mode = "none"
+        fp_formats = []
+    elif disable_tcu_fp:
+        tcu_mode = "int"
+        fp_formats = []
+    else:
+        tcu_mode = "fp" if disable_tcu_int else "fp_int"
+        fp_formats = [
+            name
+            for name, disabled in (("fp16", disable_fp16), ("bf16", disable_bf16))
+            if not disabled
+        ]
+
+    has_gemm = "ENABLE_GEMM_ACCEL" in macros
+    gemm_naive = "GEMM_NAIVE" in macros
+    gemm_improve = "GEMM_IMPROVE" in macros
+    if (gemm_naive or gemm_improve) and not has_gemm:
+        raise ValueError("GEMM_NAIVE/GEMM_IMPROVE requires ENABLE_GEMM_ACCEL")
+    if gemm_naive and gemm_improve:
+        raise ValueError("Vortex profile defines both GEMM_NAIVE and GEMM_IMPROVE")
+    if not has_gemm:
+        gemm_mode = "none"
+    elif gemm_naive:
+        gemm_mode = "naive"
+    elif gemm_improve:
+        gemm_mode = "improve"
+    else:
+        gemm_mode = "non_naive"
+
+    double_enabled = "EXT_D_DISABLE" not in macros
+    return {
+        "thread_warp_size": _macro_int(macros, "NUM_THREADS", 4),
+        "num_warps": _macro_int(macros, "NUM_WARPS", 4),
+        "local_mem_size": 1 << _macro_int(macros, "LMEM_LOG_SIZE", 16),
+        "vortex_tcu_mode": tcu_mode,
+        "vortex_tcu_fp_formats": ",".join(fp_formats),
+        "vortex_gemm_mode": gemm_mode,
+        "vortex_mxu_row": _macro_int(macros, "MXU_ROW", 32),
+        "vortex_mxu_col": _macro_int(macros, "MXU_COL", 32),
+        "vortex_mxu_col_tile": _macro_int(macros, "MXU_COL_TILE", 1),
+        "vortex_tmem_bank_size": _macro_int(macros, "TMEM_BANK_SIZE", 64 << 10),
+        "vortex_num_dma_channels": _macro_int(macros, "NUM_DMA_CHANNELS", 8),
+        "vortex_gemm_acc_mem_depth": _macro_int(macros, "GEMM_ACC_MEM_DEPTH", 1024),
+        "vortex_platform": "vivado" if "VIVADO" in macros else "generic",
+        "vortex_march": "rv64imafd" if double_enabled else "rv64imaf_zfh",
+        "vortex_mabi": "lp64d" if double_enabled else "lp64f",
+    }
+
+
+def load_vortex_accelerator_profile(manifest_path):
+    """Load one exact xclbin manifest and return its canonical Vortex target."""
+
+    from tvm.target import Target  # pylint: disable=import-outside-toplevel
+
+    manifest_path = Path(manifest_path).expanduser().resolve()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        configs = manifest["params"]["CONFIGS"]
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            f"Vortex manifest has no params.CONFIGS: {manifest_path}"
+        ) from error
+    if not isinstance(configs, str):
+        raise ValueError(
+            f"Vortex manifest params.CONFIGS must be a string: {manifest_path}"
+        )
+    macros = parse_vortex_configs(configs)
+    canonical_macros = json.dumps(
+        sorted(macros.items()), ensure_ascii=True, separators=(",", ":")
+    )
+    fingerprint = hashlib.sha256(canonical_macros.encode("utf-8")).hexdigest()
+    target_config = {
+        "kind": "vortex",
+        **_normalize_accelerator_profile(macros),
+        "vortex_accelerator_profile_version": 1,
+        "vortex_accelerator_profile_fingerprint": fingerprint,
+        # Keep the authoritative legacy capability contract in the target so
+        # it can be serialized into the runtime module.  Newer images may
+        # replace this with capability registers, but legacy XRT launches must
+        # prove that the loaded sibling manifest describes the same image.
+        "vortex_accelerator_profile_configs": configs,
+        "vortex_gemm_abi_version": 1,
+        "vortex_layout_abi_version": 1,
+    }
+    target = Target(target_config)
+    return VortexAcceleratorProfile(
+        name=str(manifest.get("name", manifest_path.parent.name)),
+        manifest_path=manifest_path,
+        configs=configs,
+        macros=macros,
+        fingerprint=fingerprint,
+        target=target,
+    )
 
 
 def _first_setting(value, environment_names, default=None):
@@ -134,7 +323,18 @@ def resolve_vortex_compile_config(
         "LLVM-Vortex root is required",
     )
 
-    default_profile = _DEFAULT_LP64F_PROFILE if xlen == 64 else None
+    target_march = getattr(target, "vortex_march", None)
+    target_mabi = getattr(target, "vortex_mabi", None)
+    if march is None and target_march:
+        march = str(target_march)
+    if mabi is None and target_mabi:
+        mabi = str(target_mabi)
+
+    default_profile = (
+        Path("/opt/vortex")
+        if xlen == 64 and mabi == "lp64d"
+        else _DEFAULT_LP64F_PROFILE if xlen == 64 else None
+    )
     profile_root = _as_path(
         _first_setting(
             profile_root,
@@ -206,6 +406,20 @@ def resolve_vortex_compile_config(
         startup_addr=int(startup_addr),
         num_warps=int(getattr(target, "num_warps", 4)),
         thread_warp_size=int(getattr(target, "thread_warp_size", 32)),
+        tcu_mode=str(getattr(target, "vortex_tcu_mode", "none")),
+        tcu_fp_formats=tuple(
+            value
+            for value in str(getattr(target, "vortex_tcu_fp_formats", "")).split(",")
+            if value
+        ),
+        gemm_mode=str(getattr(target, "vortex_gemm_mode", "none")),
+        mxu_row=int(getattr(target, "vortex_mxu_row", 32)),
+        mxu_col=int(getattr(target, "vortex_mxu_col", 32)),
+        mxu_col_tile=int(getattr(target, "vortex_mxu_col_tile", 1)),
+        tmem_bank_size=int(getattr(target, "vortex_tmem_bank_size", 64 << 10)),
+        num_dma_channels=int(getattr(target, "vortex_num_dma_channels", 8)),
+        gemm_acc_mem_depth=int(getattr(target, "vortex_gemm_acc_mem_depth", 1024)),
+        platform=str(getattr(target, "vortex_platform", "generic")),
     )
 
 
@@ -369,6 +583,35 @@ def _compile_command(config, source_path, elf_path):
         command.append("-DEXT_D_DISABLE")
     if "zfh" in config.march:
         command.append("-DEXT_ZFH_ENABLE")
+    if config.platform == "vivado":
+        command.append("-DVIVADO")
+    if config.tcu_mode != "none":
+        command.append("-DEXT_TCU_ENABLE")
+        if config.tcu_mode == "fp":
+            command.append("-DDISABLE_TCU_INT")
+        elif config.tcu_mode == "int":
+            command.append("-DDISABLE_TCU_FP")
+        if config.tcu_mode in ("fp", "fp_int"):
+            if "fp16" not in config.tcu_fp_formats:
+                command.append("-DDISABLE_FP16")
+            if "bf16" not in config.tcu_fp_formats:
+                command.append("-DDISABLE_BF16")
+    if config.gemm_mode != "none":
+        command.extend(
+            [
+                "-DENABLE_GEMM_ACCEL",
+                f"-DMXU_ROW={config.mxu_row}",
+                f"-DMXU_COL={config.mxu_col}",
+                f"-DMXU_COL_TILE={config.mxu_col_tile}",
+                f"-DTMEM_BANK_SIZE={config.tmem_bank_size}",
+                f"-DNUM_DMA_CHANNELS={config.num_dma_channels}",
+                f"-DGEMM_ACC_MEM_DEPTH={config.gemm_acc_mem_depth}",
+            ]
+        )
+        if config.gemm_mode == "naive":
+            command.append("-DGEMM_NAIVE")
+        elif config.gemm_mode == "improve":
+            command.append("-DGEMM_IMPROVE")
     command.extend(
         [
             str(source_path),

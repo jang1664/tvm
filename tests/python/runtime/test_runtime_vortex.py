@@ -18,12 +18,14 @@
 import json
 import os
 import struct
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 import tvm
 from tvm.script import tirx as T
+from tvm.support.vortex import load_vortex_accelerator_profile
 
 
 @T.prim_func
@@ -201,6 +203,92 @@ def test_module_serialization_rejects_wrong_version_and_truncation(
     truncated.write_bytes(module_path.read_bytes()[:8])
     with pytest.raises(ValueError, match="Truncated Vortex module serialization"):
         tvm.runtime.load_module(str(truncated))
+
+
+def test_module_serialization_preserves_accelerator_profile(vortex_module, tmp_path):
+    module_path = tmp_path / "vecadd-profile.vortex"
+    vortex_module.write_to_file(str(module_path))
+    restored = tvm.runtime.load_module(str(module_path))
+    metadata = restored["vortex.get_accelerator_profile_metadata"]()
+    assert metadata["profile_version"] == "1"
+    assert metadata["tcu_mode"] == "none"
+    assert metadata["gemm_mode"] == "none"
+    assert metadata["configs"] == ""
+    assert metadata["mxu_row"] == "32"
+    assert metadata["mxu_col"] == "32"
+    assert metadata["mxu_col_tile"] == "1"
+    assert metadata["tmem_bank_size"] == str(64 << 10)
+    assert metadata["num_dma_channels"] == "8"
+    assert metadata["gemm_acc_mem_depth"] == "1024"
+
+
+def test_accelerator_profile_validation_uses_exact_sibling_manifest(tmp_path):
+    profile_dir = tmp_path / "profile"
+    bin_dir = profile_dir / "bin"
+    bin_dir.mkdir(parents=True)
+    xclbin = bin_dir / "vortex_afu.xclbin"
+    xclbin.write_bytes(b"unused")
+    configs = "-DENABLE_GEMM_ACCEL -DGEMM_IMPROVE -DNUM_THREADS=32"
+    (profile_dir / "manifest.json").write_text(
+        json.dumps({"params": {"CONFIGS": configs}}), encoding="utf-8"
+    )
+    metadata = {
+        "profile_version": "1",
+        "fingerprint": "a" * 64,
+        "configs": configs,
+        "tcu_mode": "none",
+        "tcu_fp_formats": "",
+        "gemm_mode": "improve",
+        "platform": "generic",
+        "gemm_abi_version": "1",
+        "layout_abi_version": "1",
+    }
+    validate = tvm.get_global_func("runtime.vortex.validate_accelerator_profile")
+    validate(metadata, "xrt", str(xclbin))
+
+    metadata["configs"] += " -DMXU_COL_TILE=32"
+    with pytest.raises(
+        RuntimeError, match="does not match the module compiled profile"
+    ):
+        validate(metadata, "xrt", str(xclbin))
+
+
+@pytest.mark.skipif(
+    os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
+    reason="set TVM_VORTEX_RUN_HARDWARE=1 inside the exact improved GEMM XRT environment",
+)
+def test_module_launch_rejects_loaded_accelerator_profile_mismatch_before_upload():
+    improved_xclbin = Path(
+        "/opt/vortex_fpga_bins/fpint/"
+        "xrt_hw_u55c_c_f100_fpint_64300e5119/bin/vortex_afu.xclbin"
+    )
+    tcu_manifest = Path(
+        "/opt/vortex_fpga_bins/fpint/"
+        "xrt_hw_u55c_c_f100_fpint_tcu_94c5b39919/manifest.json"
+    )
+    assert Path(os.environ["XRT_XCLBIN_PATH"]).resolve() == improved_xclbin.resolve()
+    target = load_vortex_accelerator_profile(tcu_manifest).target
+    callback_name = "tvm_callback_vortex_compile"
+    previous = tvm.get_global_func(callback_name)
+    tvm.register_global_func(
+        callback_name, lambda source, unused_target: bytearray(range(32)), override=True
+    )
+    try:
+        module = tvm.get_global_func("target.build.vortex")(
+            tvm.IRModule({"vecadd": vecadd}), target
+        )
+    finally:
+        tvm.register_global_func(callback_name, previous, override=True)
+
+    device = tvm.vortex(0)
+    arrays = [
+        tvm.runtime.tensor(np.zeros((256,), dtype="int32"), device=device)
+        for _ in range(3)
+    ]
+    with pytest.raises(
+        RuntimeError, match="does not match the module compiled profile"
+    ):
+        module["vecadd"](*arrays, 2, 128)
 
 
 @pytest.mark.parametrize(

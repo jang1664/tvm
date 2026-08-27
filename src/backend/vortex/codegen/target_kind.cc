@@ -31,6 +31,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <set>
 #include <string>
 
 #include "vortex_resource.h"
@@ -45,6 +46,11 @@ ffi::Map<ffi::String, ffi::Any> CanonicalizeVortexTarget(ffi::Map<ffi::String, f
   int64_t local_mem_size = target.at("local_mem_size").cast<int64_t>();
   int64_t max_local_memory_per_thread = target.at("max_local_memory_per_thread").cast<int64_t>();
   int64_t xlen = target.at("xlen").cast<int64_t>();
+  int64_t profile_version = target.at("vortex_accelerator_profile_version").cast<int64_t>();
+  std::string tcu_mode = target.at("vortex_tcu_mode").cast<std::string>();
+  std::string tcu_fp_formats = target.at("vortex_tcu_fp_formats").cast<std::string>();
+  std::string gemm_mode = target.at("vortex_gemm_mode").cast<std::string>();
+  std::string platform = target.at("vortex_platform").cast<std::string>();
 
   TVM_FFI_CHECK_GT(num_warps, 0, ValueError) << "Vortex num_warps must be positive";
   TVM_FFI_CHECK_GT(thread_warp_size, 0, ValueError) << "Vortex thread_warp_size must be positive";
@@ -53,6 +59,84 @@ ffi::Map<ffi::String, ffi::Any> CanonicalizeVortexTarget(ffi::Map<ffi::String, f
       << "Vortex max_local_memory_per_thread must be positive";
   TVM_FFI_CHECK(xlen == 32 || xlen == 64, ValueError)
       << "Vortex xlen must be either 32 or 64, but got " << xlen;
+  TVM_FFI_CHECK_EQ(profile_version, 1, ValueError)
+      << "Vortex vortex_accelerator_profile_version must be 1";
+  TVM_FFI_CHECK(tcu_mode == "none" || tcu_mode == "fp" || tcu_mode == "int" || tcu_mode == "fp_int",
+                ValueError)
+      << "Vortex vortex_tcu_mode must be none, fp, int, or fp_int, but got " << tcu_mode;
+  TVM_FFI_CHECK(gemm_mode == "none" || gemm_mode == "naive" || gemm_mode == "non_naive" ||
+                    gemm_mode == "improve",
+                ValueError)
+      << "Vortex vortex_gemm_mode must be none, naive, non_naive, or improve, but got "
+      << gemm_mode;
+  TVM_FFI_CHECK(platform == "generic" || platform == "vivado", ValueError)
+      << "Vortex vortex_platform must be generic or vivado, but got " << platform;
+  if (target.count("vortex_mabi")) {
+    std::string mabi = target.at("vortex_mabi").cast<std::string>();
+    TVM_FFI_CHECK(
+        (xlen == 64 && (mabi == "lp64f" || mabi == "lp64d")) || (xlen == 32 && mabi == "ilp32f"),
+        ValueError)
+        << "Vortex vortex_mabi does not match xlen=" << xlen << ": " << mabi;
+  }
+  if (target.count("vortex_march")) {
+    std::string march = target.at("vortex_march").cast<std::string>();
+    std::string march_prefix = xlen == 64 ? "rv64" : "rv32";
+    TVM_FFI_CHECK(march.rfind(march_prefix, 0) == 0, ValueError)
+        << "Vortex vortex_march does not match xlen=" << xlen << ": " << march;
+  }
+
+  std::set<std::string> unique_fp_formats;
+  size_t format_begin = 0;
+  while (format_begin < tcu_fp_formats.size()) {
+    size_t format_end = tcu_fp_formats.find(',', format_begin);
+    if (format_end == std::string::npos) format_end = tcu_fp_formats.size();
+    std::string value = tcu_fp_formats.substr(format_begin, format_end - format_begin);
+    TVM_FFI_CHECK(value == "fp16" || value == "bf16", ValueError)
+        << "Vortex vortex_tcu_fp_formats supports only fp16 and bf16, but got " << value;
+    TVM_FFI_CHECK(unique_fp_formats.insert(value).second, ValueError)
+        << "Vortex vortex_tcu_fp_formats contains duplicate " << value;
+    format_begin = format_end + 1;
+  }
+  bool has_fp_tcu = tcu_mode == "fp" || tcu_mode == "fp_int";
+  TVM_FFI_CHECK_EQ(has_fp_tcu, !unique_fp_formats.empty(), ValueError)
+      << "Vortex vortex_tcu_fp_formats must be non-empty exactly when vortex_tcu_mode "
+         "contains the FP path";
+  std::string canonical_fp_formats;
+  for (const char* format : {"fp16", "bf16"}) {
+    if (unique_fp_formats.count(format)) {
+      if (!canonical_fp_formats.empty()) canonical_fp_formats += ',';
+      canonical_fp_formats += format;
+    }
+  }
+  target.Set("vortex_tcu_fp_formats", ffi::String(canonical_fp_formats));
+
+  auto require_positive = [&target](const char* name) {
+    int64_t value = target.at(name).cast<int64_t>();
+    TVM_FFI_CHECK_GT(value, 0, ValueError) << "Vortex " << name << " must be positive";
+    return value;
+  };
+  int64_t mxu_row = require_positive("vortex_mxu_row");
+  int64_t mxu_col = require_positive("vortex_mxu_col");
+  int64_t mxu_col_tile = require_positive("vortex_mxu_col_tile");
+  require_positive("vortex_tmem_bank_size");
+  require_positive("vortex_num_dma_channels");
+  require_positive("vortex_gemm_acc_mem_depth");
+  require_positive("vortex_gemm_abi_version");
+  require_positive("vortex_layout_abi_version");
+  TVM_FFI_CHECK_EQ(mxu_col % mxu_col_tile, 0, ValueError)
+      << "Vortex vortex_mxu_col must be divisible by vortex_mxu_col_tile";
+  TVM_FFI_CHECK_GT(mxu_row, 0, ValueError);
+
+  std::string fingerprint = target.at("vortex_accelerator_profile_fingerprint").cast<std::string>();
+  std::string profile_configs = target.at("vortex_accelerator_profile_configs").cast<std::string>();
+  TVM_FFI_CHECK(fingerprint.empty() ||
+                    (fingerprint.size() == 64 &&
+                     fingerprint.find_first_not_of("0123456789abcdef") == std::string::npos),
+                ValueError)
+      << "Vortex vortex_accelerator_profile_fingerprint must be empty or 64 lowercase hex digits";
+  TVM_FFI_CHECK(fingerprint.empty() == profile_configs.empty(), ValueError)
+      << "Vortex accelerator profile fingerprint and CONFIGS must either both be empty or both "
+         "be present";
   TVM_FFI_CHECK_LE(num_warps, std::numeric_limits<int64_t>::max() / thread_warp_size, ValueError)
       << "Vortex thread capacity overflows int64: num_warps=" << num_warps
       << ", thread_warp_size=" << thread_warp_size;
@@ -107,8 +191,27 @@ void RegisterTargetKind() {
       .add_attr_option<int64_t>("max_local_memory_per_thread", refl::DefaultValue(int64_t{4} << 10))
       .add_attr_option<int64_t>("xlen", refl::DefaultValue(64))
       .add_attr_option<ffi::String>("mtriple")
+      .add_attr_option<ffi::String>("vortex_march")
+      .add_attr_option<ffi::String>("vortex_mabi")
       .add_attr_option<ffi::String>("mcpu")
       .add_attr_option<ffi::Array<ffi::String>>("mattr")
+      .add_attr_option<int64_t>("vortex_accelerator_profile_version", refl::DefaultValue(1))
+      .add_attr_option<ffi::String>("vortex_accelerator_profile_fingerprint",
+                                    refl::DefaultValue(ffi::String("")))
+      .add_attr_option<ffi::String>("vortex_accelerator_profile_configs",
+                                    refl::DefaultValue(ffi::String("")))
+      .add_attr_option<ffi::String>("vortex_tcu_mode", refl::DefaultValue(ffi::String("none")))
+      .add_attr_option<ffi::String>("vortex_tcu_fp_formats", refl::DefaultValue(ffi::String("")))
+      .add_attr_option<ffi::String>("vortex_gemm_mode", refl::DefaultValue(ffi::String("none")))
+      .add_attr_option<int64_t>("vortex_mxu_row", refl::DefaultValue(32))
+      .add_attr_option<int64_t>("vortex_mxu_col", refl::DefaultValue(32))
+      .add_attr_option<int64_t>("vortex_mxu_col_tile", refl::DefaultValue(1))
+      .add_attr_option<int64_t>("vortex_tmem_bank_size", refl::DefaultValue(int64_t{64} << 10))
+      .add_attr_option<int64_t>("vortex_num_dma_channels", refl::DefaultValue(8))
+      .add_attr_option<int64_t>("vortex_gemm_acc_mem_depth", refl::DefaultValue(1024))
+      .add_attr_option<ffi::String>("vortex_platform", refl::DefaultValue(ffi::String("generic")))
+      .add_attr_option<int64_t>("vortex_gemm_abi_version", refl::DefaultValue(1))
+      .add_attr_option<int64_t>("vortex_layout_abi_version", refl::DefaultValue(1))
       .set_default_keys({"vortex", "gpu"})
       .set_target_canonicalizer(CanonicalizeVortexTarget);
 }

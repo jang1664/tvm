@@ -15,15 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import json
 import struct
 import subprocess
 from pathlib import Path
 
 import pytest
+
 import tvm
 from tvm.script import tirx as T
 from tvm.support import vortex
-
 
 VORTEX_HOME = Path("/home/jaeyongjang/project.local/vortex_base")
 VORTEX_BUILD_DIR = VORTEX_HOME / "build"
@@ -146,6 +147,130 @@ def test_target_cpu_and_features_reach_compiler_argv(tmp_path):
     assert f"-I{VORTEX_BUILD_DIR / 'hw'}" in command
 
 
+def test_parse_config_defines_supports_shell_quoting_and_exact_duplicates():
+    macros = vortex.parse_vortex_configs(
+        "-DEXT_TCU_ENABLE -DNUM_THREADS=32 "
+        "'-DPROFILE_LABEL=fp16 tcu' -DNUM_THREADS=32"
+    )
+
+    assert macros == {
+        "EXT_TCU_ENABLE": None,
+        "NUM_THREADS": "32",
+        "PROFILE_LABEL": "fp16 tcu",
+    }
+
+
+def test_parse_config_defines_rejects_conflicting_duplicates():
+    with pytest.raises(ValueError, match="conflicting definitions.*NUM_THREADS"):
+        vortex.parse_vortex_configs("-DNUM_THREADS=16 -DNUM_THREADS=32")
+
+
+def test_accelerator_profile_from_tcu_manifest(tmp_path):
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "name": "fp16-tcu",
+                "params": {
+                    "CONFIGS": (
+                        "-DNUM_THREADS=32 -DLMEM_LOG_SIZE=20 -DEXT_TCU_ENABLE "
+                        "-DDISABLE_BF16 -DDISABLE_TCU_INT"
+                    )
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profile = vortex.load_vortex_accelerator_profile(manifest_path)
+    target = profile.target
+
+    assert profile.name == "fp16-tcu"
+    assert len(profile.fingerprint) == 64
+    assert target.attrs["thread_warp_size"] == 32
+    assert target.attrs["local_mem_size"] == 1 << 20
+    assert target.attrs["vortex_tcu_mode"] == "fp"
+    assert target.attrs["vortex_tcu_fp_formats"] == "fp16"
+    assert target.attrs["vortex_march"] == "rv64imafd"
+    assert target.attrs["vortex_mabi"] == "lp64d"
+    assert target.attrs["vortex_gemm_mode"] == "none"
+    assert target.attrs["vortex_accelerator_profile_fingerprint"] == profile.fingerprint
+    assert target.attrs["vortex_accelerator_profile_configs"] == profile.configs
+
+
+@pytest.mark.parametrize(
+    ("configs", "message"),
+    [
+        (
+            "-DEXT_TCU_ENABLE -DDISABLE_TCU_FP -DDISABLE_TCU_INT",
+            "both TCU paths",
+        ),
+        (
+            "-DEXT_TCU_ENABLE -DDISABLE_FP16 -DDISABLE_BF16",
+            "both floating TCU formats",
+        ),
+        ("-DGEMM_NAIVE", "requires ENABLE_GEMM_ACCEL"),
+        (
+            "-DENABLE_GEMM_ACCEL -DGEMM_NAIVE -DGEMM_IMPROVE",
+            "both GEMM_NAIVE and GEMM_IMPROVE",
+        ),
+    ],
+)
+def test_accelerator_profile_rejects_impossible_macro_combinations(
+    tmp_path, configs, message
+):
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"name": "invalid", "params": {"CONFIGS": configs}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        vortex.load_vortex_accelerator_profile(manifest_path)
+
+
+def test_accelerator_target_macros_reach_compiler_argv(tmp_path):
+    target = tvm.target.Target(
+        {
+            "kind": "vortex",
+            "vortex_tcu_mode": "fp",
+            "vortex_tcu_fp_formats": "fp16",
+            "vortex_gemm_mode": "improve",
+            "vortex_mxu_row": 32,
+            "vortex_mxu_col": 32,
+            "vortex_mxu_col_tile": 16,
+            "vortex_tmem_bank_size": 65536,
+            "vortex_num_dma_channels": 8,
+            "vortex_gemm_acc_mem_depth": 1024,
+            "vortex_platform": "vivado",
+        }
+    )
+    config = vortex.resolve_vortex_compile_config(
+        target,
+        vortex_home=VORTEX_HOME,
+        profile_root=PROFILE_ROOT,
+    )
+    command = vortex._compile_command(
+        config, tmp_path / "kernel.cpp", tmp_path / "kernel.elf"
+    )
+
+    for define in (
+        "-DEXT_TCU_ENABLE",
+        "-DDISABLE_BF16",
+        "-DDISABLE_TCU_INT",
+        "-DENABLE_GEMM_ACCEL",
+        "-DGEMM_IMPROVE",
+        "-DMXU_ROW=32",
+        "-DMXU_COL=32",
+        "-DMXU_COL_TILE=16",
+        "-DTMEM_BANK_SIZE=65536",
+        "-DNUM_DMA_CHANNELS=8",
+        "-DGEMM_ACC_MEM_DEPTH=1024",
+        "-DVIVADO",
+    ):
+        assert define in command
+
+
 def test_compile_timeout_preserves_stage_and_output(monkeypatch, tmp_path):
     def timeout(*args, **kwargs):
         raise subprocess.TimeoutExpired(
@@ -181,7 +306,7 @@ def test_generated_vecadd_compiles_to_vxbin(monkeypatch):
     monkeypatch.setenv("PATH", "/ambient/path/must/not/be-used")
     binary = tvm.get_global_func("tvm_callback_vortex_compile")(source, target)
 
-    assert isinstance(binary, (bytes, bytearray))
+    assert isinstance(binary, bytes | bytearray)
     assert len(binary) > 16
     min_vma, max_vma = struct.unpack_from("<QQ", binary)
     assert min_vma == 0x180000000

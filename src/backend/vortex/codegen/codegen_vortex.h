@@ -57,6 +57,7 @@ class CodeGenVortex final : public CodeGenC {
   void PreFunctionBody(const PrimFunc& func) final;
   void PrintFuncPrefix(std::ostream& os) final;  // NOLINT(*)
   using CodeGenC::PrintType;
+  void PrintType(const PrimType& type, std::ostream& os) final;              // NOLINT(*)
   void PrintType(const Type& type, std::ostream& os) final;                  // NOLINT(*)
   void PrintStorageSync(const CallNode* op) final;                           // NOLINT(*)
   void PrintStorageScope(const std::string& scope, std::ostream& os) final;  // NOLINT(*)
@@ -65,6 +66,7 @@ class CodeGenVortex final : public CodeGenC {
   void VisitStmt_(const ForNode* op) final;
   void VisitStmt_(const AllocBufferNode* op) final;
   void VisitExpr_(const MaxNode* op, std::ostream& os) final;  // NOLINT(*)
+  void VisitExpr_(const MinNode* op, std::ostream& os) final;  // NOLINT(*)
 
   const std::vector<VortexKernelResourceMetadata>& kernel_resources() const {
     return kernel_resources_;

@@ -103,7 +103,8 @@ set(USE_VULKAN OFF)
 # Possible values:
 # - OFF: disable Vortex runtime support
 # - /path/to/vortex: use an explicit Vortex repository containing
-#                    runtime/include/vortex.h and runtime/libvortex.so
+#                    runtime/include/vortex.h; the library is read from
+#                    <repo>/build/runtime/libvortex.so (or TVM_VORTEX_BUILD_DIR)
 set(USE_VORTEX OFF)
 
 # Whether to use spirv-tools and SPIRV-Headers from Khronos GitHub or GitLab.

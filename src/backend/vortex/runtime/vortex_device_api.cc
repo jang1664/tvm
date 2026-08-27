@@ -41,6 +41,11 @@ namespace vortex {
 namespace {
 
 constexpr size_t kCopyStagingBytes = 1 << 20;
+// The improved GEMM external-DMA layout requires source and destination base
+// addresses to preserve the 512-byte channel-slot bits.  Use this as the
+// device-wide minimum so user inputs and compiler-created intermediates obey
+// the same allocation contract.
+constexpr size_t kMinimumAllocationAlignment = 512;
 constexpr uint64_t kDefaultKernelTimeoutMs = 5 * 60 * 1000;
 
 uint64_t KernelTimeoutMs() {
@@ -219,9 +224,9 @@ void* VortexDeviceAPI::AllocDataSpace(Device dev, size_t nbytes, size_t alignmen
 
   auto* allocation = new VortexAllocation();
   allocation->size = nbytes;
-  int error = alignment > 1 ? vx_mem_alloc_aligned(device_, nbytes, alignment, VX_MEM_READ_WRITE,
-                                                   &allocation->buffer)
-                            : vx_mem_alloc(device_, nbytes, VX_MEM_READ_WRITE, &allocation->buffer);
+  alignment = std::max(alignment, kMinimumAllocationAlignment);
+  int error =
+      vx_mem_alloc_aligned(device_, nbytes, alignment, VX_MEM_READ_WRITE, &allocation->buffer);
   if (error != 0) {
     delete allocation;
     TVM_FFI_THROW(RuntimeError) << "Vortex allocation failed with error " << error;

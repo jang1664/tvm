@@ -137,6 +137,9 @@ ffi::Module BuildVortex(IRModule mod, Target target) {
         << "Vortex target attribute " << name << " does not fit uint32";
     return static_cast<uint32_t>(value);
   };
+  auto get_string_attr = [&target](const char* name) {
+    return target->GetAttr<ffi::String>(name).value();
+  };
 
   auto create = ffi::Function::GetGlobal("ffi.Module.create.vortex");
   TVM_FFI_CHECK(create.has_value(), RuntimeError)
@@ -145,7 +148,16 @@ ffi::Module BuildVortex(IRModule mod, Target target) {
   return (*create)(binary, ffi::String(code), ExtractFuncInfo(mod), kernel_ids, kernel_resources,
                    get_u32_attr("num_warps"), get_u32_attr("thread_warp_size"),
                    get_u32_attr("max_threads_per_block"), get_u32_attr("local_mem_size"),
-                   get_u32_attr("xlen"))
+                   get_u32_attr("xlen"), get_u32_attr("vortex_accelerator_profile_version"),
+                   get_string_attr("vortex_accelerator_profile_fingerprint"),
+                   get_string_attr("vortex_accelerator_profile_configs"),
+                   get_string_attr("vortex_tcu_mode"), get_string_attr("vortex_tcu_fp_formats"),
+                   get_string_attr("vortex_gemm_mode"), get_string_attr("vortex_platform"),
+                   get_u32_attr("vortex_gemm_abi_version"),
+                   get_u32_attr("vortex_layout_abi_version"), get_u32_attr("vortex_mxu_row"),
+                   get_u32_attr("vortex_mxu_col"), get_u32_attr("vortex_mxu_col_tile"),
+                   get_u32_attr("vortex_tmem_bank_size"), get_u32_attr("vortex_num_dma_channels"),
+                   get_u32_attr("vortex_gemm_acc_mem_depth"))
       .cast<ffi::Module>();
 }
 

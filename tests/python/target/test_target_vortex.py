@@ -43,6 +43,82 @@ def test_vortex_target_defaults():
     assert target.attrs["max_local_memory_per_thread"] == 4 << 10
     assert target.attrs["xlen"] == 64
     assert target.attrs["mtriple"] == "riscv64-unknown-elf"
+    assert target.attrs["vortex_accelerator_profile_version"] == 1
+    assert target.attrs["vortex_accelerator_profile_configs"] == ""
+    assert target.attrs["vortex_tcu_mode"] == "none"
+    assert target.attrs["vortex_tcu_fp_formats"] == ""
+    assert target.attrs["vortex_gemm_mode"] == "none"
+    assert target.attrs["vortex_mxu_row"] == 32
+    assert target.attrs["vortex_mxu_col"] == 32
+    assert target.attrs["vortex_mxu_col_tile"] == 1
+    assert target.attrs["vortex_tmem_bank_size"] == 64 << 10
+    assert target.attrs["vortex_num_dma_channels"] == 8
+    assert target.attrs["vortex_gemm_acc_mem_depth"] == 1024
+    assert target.attrs["vortex_platform"] == "generic"
+    assert target.attrs["vortex_gemm_abi_version"] == 1
+    assert target.attrs["vortex_layout_abi_version"] == 1
+
+
+@pytest.mark.parametrize("mode", ["invalid", "FP", "fp-int"])
+def test_vortex_target_rejects_invalid_tcu_mode(mode):
+    with pytest.raises(ValueError, match="vortex_tcu_mode"):
+        Target({"kind": "vortex", "vortex_tcu_mode": mode})
+
+
+def test_vortex_target_rejects_tcu_formats_without_fp_path():
+    with pytest.raises(ValueError, match="vortex_tcu_fp_formats"):
+        Target(
+            {
+                "kind": "vortex",
+                "vortex_tcu_mode": "int",
+                "vortex_tcu_fp_formats": "fp16",
+            }
+        )
+
+
+@pytest.mark.parametrize("formats", ["float16", "fp16,fp16"])
+def test_vortex_target_rejects_invalid_tcu_formats(formats):
+    with pytest.raises(ValueError, match="vortex_tcu_fp_formats"):
+        Target(
+            {
+                "kind": "vortex",
+                "vortex_tcu_mode": "fp",
+                "vortex_tcu_fp_formats": formats,
+            }
+        )
+
+
+@pytest.mark.parametrize("mode", ["invalid", "row_major", "IMPROVE"])
+def test_vortex_target_rejects_invalid_gemm_mode(mode):
+    with pytest.raises(ValueError, match="vortex_gemm_mode"):
+        Target({"kind": "vortex", "vortex_gemm_mode": mode})
+
+
+def test_vortex_accelerator_target_round_trip():
+    target = Target(
+        {
+            "kind": "vortex",
+            "vortex_accelerator_profile_fingerprint": "a" * 64,
+            "vortex_accelerator_profile_configs": "-DEXT_TCU_ENABLE -DNUM_THREADS=32",
+            "vortex_tcu_mode": "fp_int",
+            "vortex_tcu_fp_formats": "fp16,bf16",
+            "vortex_gemm_mode": "improve",
+            "vortex_mxu_col_tile": 32,
+            "vortex_platform": "vivado",
+        }
+    )
+
+    assert dict(Target(str(target)).attrs) == dict(target.attrs)
+
+
+def test_vortex_accelerator_fingerprint_and_configs_are_coupled():
+    with pytest.raises(ValueError, match="fingerprint and CONFIGS"):
+        Target(
+            {
+                "kind": "vortex",
+                "vortex_accelerator_profile_fingerprint": "a" * 64,
+            }
+        )
 
 
 def test_vortex_target_derives_hardware_limits():

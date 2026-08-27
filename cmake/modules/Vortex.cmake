@@ -22,9 +22,14 @@ if(USE_VORTEX)
   endif()
 
   get_filename_component(VORTEX_ROOT "${USE_VORTEX}" ABSOLUTE)
+  if(DEFINED ENV{TVM_VORTEX_BUILD_DIR} AND NOT "$ENV{TVM_VORTEX_BUILD_DIR}" STREQUAL "")
+    get_filename_component(VORTEX_BUILD_DIR "$ENV{TVM_VORTEX_BUILD_DIR}" ABSOLUTE)
+  else()
+    set(VORTEX_BUILD_DIR "${VORTEX_ROOT}/build")
+  endif()
   set(VORTEX_INCLUDE_DIR "${VORTEX_ROOT}/runtime/include")
   set(VORTEX_ABI_INCLUDE_DIR "${VORTEX_ROOT}/kernel/include")
-  set(VORTEX_RUNTIME_LIBRARY "${VORTEX_ROOT}/runtime/libvortex.so")
+  set(VORTEX_RUNTIME_LIBRARY "${VORTEX_BUILD_DIR}/runtime/libvortex.so")
 
   if(NOT EXISTS "${VORTEX_INCLUDE_DIR}/vortex.h")
     message(FATAL_ERROR "Vortex runtime header not found: ${VORTEX_INCLUDE_DIR}/vortex.h")
@@ -36,13 +41,14 @@ if(USE_VORTEX)
     message(FATAL_ERROR "Vortex runtime library not found: ${VORTEX_RUNTIME_LIBRARY}")
   endif()
 
-  message(STATUS "Build with Vortex runtime: ${VORTEX_ROOT}")
+  message(STATUS "Build with Vortex runtime: source=${VORTEX_ROOT}, build=${VORTEX_BUILD_DIR}")
   tvm_file_glob(GLOB RUNTIME_VORTEX_SRCS src/backend/vortex/runtime/*.cc)
 
   add_library(tvm_runtime_vortex_objs OBJECT ${RUNTIME_VORTEX_SRCS})
   target_include_directories(tvm_runtime_vortex_objs PRIVATE
     "${VORTEX_INCLUDE_DIR}"
     "${VORTEX_ABI_INCLUDE_DIR}"
+    "${VORTEX_BUILD_DIR}/hw"
     "${VORTEX_ROOT}/hw"
   )
   target_link_libraries(tvm_runtime_vortex_objs PUBLIC tvm_ffi_header)
@@ -55,8 +61,8 @@ if(USE_VORTEX)
   list(APPEND TVM_RUNTIME_BACKEND_LIBS tvm_runtime_vortex)
   target_link_libraries(tvm_runtime_vortex PUBLIC tvm_runtime "${VORTEX_RUNTIME_LIBRARY}")
   set_target_properties(tvm_runtime_vortex PROPERTIES
-    BUILD_RPATH "${VORTEX_ROOT}/runtime"
-    INSTALL_RPATH "${VORTEX_ROOT}/runtime"
+    BUILD_RPATH "${VORTEX_BUILD_DIR}/runtime"
+    INSTALL_RPATH "${VORTEX_BUILD_DIR}/runtime"
   )
   tvm_configure_target_library(tvm_runtime_vortex RUNTIME_MODULE)
 endif()

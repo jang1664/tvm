@@ -326,11 +326,19 @@ class BarrierUniformityValidator final : public tirx::StmtVisitor {
 
 CodeGenVortex::CodeGenVortex(Target target) : target_(std::move(target)) {
   restrict_keyword_ = "__restrict__";
+  decl_stream << "#include <stdint.h>\n"
+                 "#include <math.h>\n"
+                 "#include <vx_intrinsics.h>\n"
+                 "#include <vx_spawn.h>\n"
+                 "#include <vx_tvm_abi.h>\n";
+  if (target_->GetAttr<ffi::String>("vortex_tcu_mode").value() != "none") {
+    decl_stream << "#include <vx_tvm_tcu.h>\n";
+  }
+  if (target_->GetAttr<ffi::String>("vortex_gemm_mode").value() != "none") {
+    decl_stream << "#include <vx_tvm_gemm.h>\n";
+  }
   decl_stream
-      << "#include <stdint.h>\n"
-         "#include <vx_intrinsics.h>\n"
-         "#include <vx_spawn.h>\n"
-         "#include <vx_tvm_abi.h>\n\n"
+      << "\n"
          "template <typename T>\n"
          "static inline T __tvm_vortex_decode_scalar(uint64_t bits) {\n"
          "  static_assert(sizeof(T) <= sizeof(bits), \"Vortex ABI scalar exceeds one slot\");\n"
@@ -341,6 +349,10 @@ CodeGenVortex::CodeGenVortex(Target target) : target_(std::move(target)) {
          "template <typename T>\n"
          "static inline T __tvm_vortex_max(T a, T b) {\n"
          "  return a > b ? a : b;\n"
+         "}\n\n"
+         "template <typename T>\n"
+         "static inline T __tvm_vortex_min(T a, T b) {\n"
+         "  return a < b ? a : b;\n"
          "}\n\n";
 }
 
@@ -398,6 +410,14 @@ void CodeGenVortex::PreFunctionBody(const PrimFunc& func) {
 }
 
 void CodeGenVortex::PrintFuncPrefix(std::ostream& os) { os << "static "; }
+
+void CodeGenVortex::PrintType(const PrimType& type, std::ostream& os) {
+  if (type.MatchesCode(DLDataTypeCode::kDLFloat) && type.bits() == 16 && type.IsScalar()) {
+    os << "_Float16";
+    return;
+  }
+  CodeGenC::PrintType(type, os);
+}
 
 void CodeGenVortex::PrintType(const Type& type, std::ostream& os) {
   if (const auto* buffer_type = type.as<BufferTypeNode>()) {
@@ -594,6 +614,14 @@ void CodeGenVortex::VisitStmt_(const AllocBufferNode* op) {
 
 void CodeGenVortex::VisitExpr_(const MaxNode* op, std::ostream& os) {  // NOLINT(*)
   os << "__tvm_vortex_max(";
+  PrintExpr(op->a, os);
+  os << ", ";
+  PrintExpr(op->b, os);
+  os << ")";
+}
+
+void CodeGenVortex::VisitExpr_(const MinNode* op, std::ostream& os) {  // NOLINT(*)
+  os << "__tvm_vortex_min(";
   PrintExpr(op->a, os);
   os << ", ";
   PrintExpr(op->b, os);

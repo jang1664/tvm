@@ -52,10 +52,13 @@ namespace tvm {
 namespace runtime {
 namespace vortex {
 
-static constexpr uint32_t kVortexModuleSerializationVersion = 4;
+static constexpr uint32_t kVortexModuleSerializationVersion = 5;
 static constexpr size_t kVortexKernelResourceFieldCount = 8;
+static constexpr const char* kAcceleratorProfileMetadataFunction =
+    "vortex.get_accelerator_profile_metadata";
 
 using SerializedKernelResources = ffi::Map<ffi::String, ffi::Array<int64_t>>;
+using SerializedAcceleratorProfile = ffi::Map<ffi::String, ffi::String>;
 
 struct KernelResourceMetadata {
   uint32_t launch_rank;
@@ -66,21 +69,25 @@ struct KernelResourceMetadata {
   bool uses_shared_barrier;
 };
 
-uint64_t ReadLegacyXrtBarrierCount(const std::string& xclbin_path, uint64_t default_count) {
+std::pair<std::filesystem::path, std::string> ReadAuthoritativeXrtManifestConfigs(
+    const std::string& xclbin_path) {
   TVM_FFI_CHECK(!xclbin_path.empty(), RuntimeError)
-      << "Vortex barrier capability is unavailable and XRT_XCLBIN_PATH is empty";
+      << "Vortex XRT manifest validation requires a non-empty XRT_XCLBIN_PATH";
   std::filesystem::path manifest_path =
       std::filesystem::path(xclbin_path).parent_path().parent_path() / "manifest.json";
   std::ifstream stream(manifest_path);
   TVM_FFI_CHECK(stream.good(), RuntimeError)
-      << "Vortex barrier capability is unavailable and the authoritative XRT manifest cannot be "
-         "opened: "
-      << manifest_path.string();
+      << "The authoritative Vortex XRT manifest cannot be opened: " << manifest_path.string();
   std::string content((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
   namespace json = ::tvm::ffi::json;
   json::Object root = json::Parse(content).cast<json::Object>();
   json::Object params = root.at("params").cast<json::Object>();
   std::string configs = params.at("CONFIGS").cast<ffi::String>();
+  return {manifest_path, configs};
+}
+
+uint64_t ReadLegacyXrtBarrierCount(const std::string& xclbin_path, uint64_t default_count) {
+  auto [manifest_path, configs] = ReadAuthoritativeXrtManifestConfigs(xclbin_path);
   std::regex override_pattern(R"((^|\s)-DNUM_BARRIERS(?:=([0-9]+))?(?=\s|$))");
   std::smatch match;
   if (!std::regex_search(configs, match, override_pattern)) return default_count;
@@ -91,6 +98,35 @@ uint64_t ReadLegacyXrtBarrierCount(const std::string& xclbin_path, uint64_t defa
     TVM_FFI_THROW(RuntimeError) << "Invalid NUM_BARRIERS override in authoritative XRT manifest "
                                 << manifest_path.string();
   }
+}
+
+void ValidateAcceleratorProfile(const SerializedAcceleratorProfile& expected,
+                                const std::string& driver_name, const std::string& xclbin_path) {
+  auto required = [&expected](const char* name) -> std::string {
+    auto value = expected.Get(ffi::String(name));
+    TVM_FFI_CHECK(value.has_value(), ValueError)
+        << "Vortex accelerator profile metadata is missing " << name;
+    return value.value();
+  };
+  std::string tcu_mode = required("tcu_mode");
+  std::string gemm_mode = required("gemm_mode");
+  bool accelerated = tcu_mode != "none" || gemm_mode != "none";
+  if (!accelerated) return;
+
+  TVM_FFI_CHECK_EQ(driver_name, "xrt", RuntimeError)
+      << "Vortex accelerator profile validation requires the XRT driver, but got " << driver_name;
+  std::string fingerprint = required("fingerprint");
+  std::string expected_configs = required("configs");
+  TVM_FFI_CHECK_EQ(fingerprint.size(), 64, RuntimeError)
+      << "Accelerated Vortex modules require a 64-digit manifest fingerprint";
+  TVM_FFI_CHECK(!expected_configs.empty(), RuntimeError)
+      << "Accelerated Vortex modules require exact manifest CONFIGS metadata; rebuild the target "
+         "with load_vortex_accelerator_profile";
+  auto [manifest_path, actual_configs] = ReadAuthoritativeXrtManifestConfigs(xclbin_path);
+  TVM_FFI_CHECK_EQ(actual_configs, expected_configs, RuntimeError)
+      << "Loaded Vortex xclbin accelerator profile does not match the module compiled profile; "
+         "module fingerprint="
+      << fingerprint << ", manifest=" << manifest_path.string();
 }
 
 void ValidateBarrierConfiguration(uint64_t num_warps, uint64_t reported_num_barriers,
@@ -116,7 +152,8 @@ class VortexModuleNode final : public ffi::ModuleObj {
                    ffi::Map<ffi::String, int64_t> kernel_ids,
                    SerializedKernelResources serialized_kernel_resources, uint32_t abi_version,
                    uint32_t num_warps, uint32_t thread_warp_size, uint32_t max_threads_per_block,
-                   uint32_t local_mem_size, uint32_t xlen)
+                   uint32_t local_mem_size, uint32_t xlen,
+                   SerializedAcceleratorProfile accelerator_profile)
       : binary_(std::move(binary)),
         source_(std::move(source)),
         fmap_(std::move(fmap)),
@@ -127,7 +164,8 @@ class VortexModuleNode final : public ffi::ModuleObj {
         thread_warp_size_(thread_warp_size),
         max_threads_per_block_(max_threads_per_block),
         local_mem_size_(local_mem_size),
-        xlen_(xlen) {
+        xlen_(xlen),
+        accelerator_profile_(std::move(accelerator_profile)) {
     TVM_FFI_CHECK(!fmap_.empty(), ValueError)
         << "The Vortex runtime requires at least one function";
     TVM_FFI_CHECK_EQ(kernel_ids_.size(), fmap_.size(), ValueError)
@@ -233,6 +271,40 @@ class VortexModuleNode final : public ffi::ModuleObj {
     }
     TVM_FFI_CHECK(xlen_ == 32 || xlen_ == 64, ValueError)
         << "Vortex pointer width must be 32 or 64 bits";
+    for (const char* field :
+         {"profile_version", "fingerprint", "configs", "tcu_mode", "tcu_fp_formats", "gemm_mode",
+          "platform", "gemm_abi_version", "layout_abi_version", "mxu_row", "mxu_col",
+          "mxu_col_tile", "tmem_bank_size", "num_dma_channels", "gemm_acc_mem_depth"}) {
+      TVM_FFI_CHECK(accelerator_profile_.count(ffi::String(field)), ValueError)
+          << "Vortex accelerator profile metadata is missing " << field;
+    }
+    auto profile_value = [this](const char* field) {
+      return std::string(accelerator_profile_.at(ffi::String(field)));
+    };
+    TVM_FFI_CHECK_EQ(profile_value("profile_version"), "1", ValueError)
+        << "Unsupported Vortex accelerator profile metadata version";
+    std::string fingerprint = profile_value("fingerprint");
+    std::string configs = profile_value("configs");
+    TVM_FFI_CHECK(fingerprint.empty() == configs.empty(), ValueError)
+        << "Vortex accelerator profile fingerprint and CONFIGS must be coupled";
+    TVM_FFI_CHECK(fingerprint.empty() ||
+                      (fingerprint.size() == 64 &&
+                       fingerprint.find_first_not_of("0123456789abcdef") == std::string::npos),
+                  ValueError)
+        << "Vortex accelerator profile fingerprint must be empty or 64 lowercase hex digits";
+    std::string tcu_mode = profile_value("tcu_mode");
+    std::string gemm_mode = profile_value("gemm_mode");
+    std::string platform = profile_value("platform");
+    TVM_FFI_CHECK(
+        tcu_mode == "none" || tcu_mode == "fp" || tcu_mode == "int" || tcu_mode == "fp_int",
+        ValueError)
+        << "Invalid serialized Vortex TCU mode " << tcu_mode;
+    TVM_FFI_CHECK(gemm_mode == "none" || gemm_mode == "naive" || gemm_mode == "non_naive" ||
+                      gemm_mode == "improve",
+                  ValueError)
+        << "Invalid serialized Vortex GEMM mode " << gemm_mode;
+    TVM_FFI_CHECK(platform == "generic" || platform == "vivado", ValueError)
+        << "Invalid serialized Vortex platform " << platform;
   }
 
   const char* kind() const final { return "vortex"; }
@@ -251,6 +323,7 @@ class VortexModuleNode final : public ffi::ModuleObj {
     stream.Write(source_);
     stream.Write(fmap_);
     stream.Write(kernel_ids_);
+    stream.Write(accelerator_profile_);
     stream.Write(serialized_kernel_resources_);
     stream.Write(abi_version_);
     stream.Write(num_warps_);
@@ -331,6 +404,33 @@ class VortexModuleNode final : public ffi::ModuleObj {
         << resource.compile_time_resident_groups;
 
     VortexDeviceAPI* device_api = VortexDeviceAPI::Global();
+    bool accelerated = accelerator_profile_.at("tcu_mode") != "none" ||
+                       accelerator_profile_.at("gemm_mode") != "none";
+    auto validate_actual_profile = [&]() {
+      VortexActualResourceProfile actual = device_api->ActualResourceProfile();
+      ValidateAcceleratorProfile(accelerator_profile_, actual.driver_name, actual.xclbin_path);
+      TVM_FFI_CHECK_EQ(actual.thread_warp_size, thread_warp_size_, ValueError)
+          << "Vortex target thread_warp_size " << thread_warp_size_
+          << " does not match actual hardware " << actual.thread_warp_size;
+      TVM_FFI_CHECK_EQ(actual.num_warps, num_warps_, ValueError)
+          << "Vortex target num_warps " << num_warps_ << " does not match actual hardware "
+          << actual.num_warps;
+      TVM_FFI_CHECK_GE(actual.local_mem_size, local_mem_size_, ValueError)
+          << "Vortex target local_mem_size " << local_mem_size_
+          << " exceeds actual VX_CAPS_LOCAL_MEM_SIZE " << actual.local_mem_size;
+      TVM_FFI_CHECK_LE(resource.static_shared_bytes,
+                       actual.local_mem_size / resource.compile_time_resident_groups, ValueError)
+          << "Vortex kernel requires "
+          << resource.static_shared_bytes * resource.compile_time_resident_groups
+          << " resident shared-memory bytes, exceeding actual VX_CAPS_LOCAL_MEM_SIZE "
+          << actual.local_mem_size;
+      if (resource.uses_shared_barrier) {
+        ValidateBarrierConfiguration(actual.num_warps, actual.num_barriers, actual.driver_name,
+                                     actual.xclbin_path);
+      }
+    };
+    if (accelerated) validate_actual_profile();
+
     std::vector<uint64_t> slots(num_kernel_args, 0);
     for (size_t i = 0; i < num_kernel_args; ++i) {
       DLDataType dtype = info->arg_types[i];
@@ -356,27 +456,7 @@ class VortexModuleNode final : public ffi::ModuleObj {
         TVM_FFI_THROW(ValueError) << "Unsupported Vortex argument dtype " << dtype;
       }
     }
-
-    VortexActualResourceProfile actual = device_api->ActualResourceProfile();
-    TVM_FFI_CHECK_EQ(actual.thread_warp_size, thread_warp_size_, ValueError)
-        << "Vortex target thread_warp_size " << thread_warp_size_
-        << " does not match actual hardware " << actual.thread_warp_size;
-    TVM_FFI_CHECK_EQ(actual.num_warps, num_warps_, ValueError)
-        << "Vortex target num_warps " << num_warps_ << " does not match actual hardware "
-        << actual.num_warps;
-    TVM_FFI_CHECK_GE(actual.local_mem_size, local_mem_size_, ValueError)
-        << "Vortex target local_mem_size " << local_mem_size_
-        << " exceeds actual VX_CAPS_LOCAL_MEM_SIZE " << actual.local_mem_size;
-    TVM_FFI_CHECK_LE(resource.static_shared_bytes,
-                     actual.local_mem_size / resource.compile_time_resident_groups, ValueError)
-        << "Vortex kernel requires "
-        << resource.static_shared_bytes * resource.compile_time_resident_groups
-        << " resident shared-memory bytes, exceeding actual VX_CAPS_LOCAL_MEM_SIZE "
-        << actual.local_mem_size;
-    if (resource.uses_shared_barrier) {
-      ValidateBarrierConfiguration(actual.num_warps, actual.num_barriers, actual.driver_name,
-                                   actual.xclbin_path);
-    }
+    if (!accelerated) validate_actual_profile();
 
     std::vector<uint8_t> packet(sizeof(vx_tvm_launch_header_t) + slots.size() * sizeof(uint64_t));
     auto* header = reinterpret_cast<vx_tvm_launch_header_t*>(packet.data());
@@ -409,6 +489,7 @@ class VortexModuleNode final : public ffi::ModuleObj {
   uint32_t max_threads_per_block_;
   uint32_t local_mem_size_;
   uint32_t xlen_;
+  SerializedAcceleratorProfile accelerator_profile_;
 };
 
 ffi::Optional<ffi::Function> VortexModuleNode::GetFunction(const ffi::String& name) {
@@ -418,6 +499,14 @@ ffi::Optional<ffi::Function> VortexModuleNode::GetFunction(const ffi::String& na
       TVM_FFI_CHECK_EQ(args.size(), 0, ValueError)
           << kKernelResourceMetadataFunction << " expects no arguments";
       *rv = serialized_kernel_resources_;
+    });
+  }
+  if (name == kAcceleratorProfileMetadataFunction) {
+    ffi::ObjectPtr<ffi::Object> self = ffi::GetObjectPtr<ffi::Object>(this);
+    return ffi::Function([self, this](ffi::PackedArgs args, ffi::Any* rv) {
+      TVM_FFI_CHECK_EQ(args.size(), 0, ValueError)
+          << kAcceleratorProfileMetadataFunction << " expects no arguments";
+      *rv = accelerator_profile_;
     });
   }
   auto info = fmap_.Get(name);
@@ -437,17 +526,36 @@ ffi::Optional<ffi::Function> VortexModuleNode::GetFunction(const ffi::String& na
   return PackFuncVoidAddr(launch, function_info->arg_types, function_info->arg_extra_tags);
 }
 
-static ffi::Module VortexModuleCreate(ffi::Bytes binary, ffi::String source,
-                                      ffi::Map<ffi::String, FunctionInfo> fmap,
-                                      ffi::Map<ffi::String, int64_t> kernel_ids,
-                                      SerializedKernelResources kernel_resources,
-                                      uint32_t num_warps, uint32_t thread_warp_size,
-                                      uint32_t max_threads_per_block, uint32_t local_mem_size,
-                                      uint32_t xlen) {
+static ffi::Module VortexModuleCreate(
+    ffi::Bytes binary, ffi::String source, ffi::Map<ffi::String, FunctionInfo> fmap,
+    ffi::Map<ffi::String, int64_t> kernel_ids, SerializedKernelResources kernel_resources,
+    uint32_t num_warps, uint32_t thread_warp_size, uint32_t max_threads_per_block,
+    uint32_t local_mem_size, uint32_t xlen, uint32_t accelerator_profile_version,
+    ffi::String accelerator_profile_fingerprint, ffi::String accelerator_profile_configs,
+    ffi::String tcu_mode, ffi::String tcu_fp_formats, ffi::String gemm_mode, ffi::String platform,
+    uint32_t gemm_abi_version, uint32_t layout_abi_version, uint32_t mxu_row, uint32_t mxu_col,
+    uint32_t mxu_col_tile, uint32_t tmem_bank_size, uint32_t num_dma_channels,
+    uint32_t gemm_acc_mem_depth) {
+  SerializedAcceleratorProfile accelerator_profile{
+      {"profile_version", ffi::String(std::to_string(accelerator_profile_version))},
+      {"fingerprint", std::move(accelerator_profile_fingerprint)},
+      {"configs", std::move(accelerator_profile_configs)},
+      {"tcu_mode", std::move(tcu_mode)},
+      {"tcu_fp_formats", std::move(tcu_fp_formats)},
+      {"gemm_mode", std::move(gemm_mode)},
+      {"platform", std::move(platform)},
+      {"gemm_abi_version", ffi::String(std::to_string(gemm_abi_version))},
+      {"layout_abi_version", ffi::String(std::to_string(layout_abi_version))},
+      {"mxu_row", ffi::String(std::to_string(mxu_row))},
+      {"mxu_col", ffi::String(std::to_string(mxu_col))},
+      {"mxu_col_tile", ffi::String(std::to_string(mxu_col_tile))},
+      {"tmem_bank_size", ffi::String(std::to_string(tmem_bank_size))},
+      {"num_dma_channels", ffi::String(std::to_string(num_dma_channels))},
+      {"gemm_acc_mem_depth", ffi::String(std::to_string(gemm_acc_mem_depth))}};
   auto node = ffi::make_object<VortexModuleNode>(
       std::move(binary), std::move(source), std::move(fmap), std::move(kernel_ids),
       std::move(kernel_resources), VX_TVM_ABI_VERSION, num_warps, thread_warp_size,
-      max_threads_per_block, local_mem_size, xlen);
+      max_threads_per_block, local_mem_size, xlen, std::move(accelerator_profile));
   return ffi::Module(node);
 }
 
@@ -455,11 +563,12 @@ static ffi::Module VortexModuleCreateFromSerialized(
     ffi::Bytes binary, ffi::String source, ffi::Map<ffi::String, FunctionInfo> fmap,
     ffi::Map<ffi::String, int64_t> kernel_ids, SerializedKernelResources kernel_resources,
     uint32_t abi_version, uint32_t num_warps, uint32_t thread_warp_size,
-    uint32_t max_threads_per_block, uint32_t local_mem_size, uint32_t xlen) {
+    uint32_t max_threads_per_block, uint32_t local_mem_size, uint32_t xlen,
+    SerializedAcceleratorProfile accelerator_profile) {
   auto node = ffi::make_object<VortexModuleNode>(
       std::move(binary), std::move(source), std::move(fmap), std::move(kernel_ids),
       std::move(kernel_resources), abi_version, num_warps, thread_warp_size, max_threads_per_block,
-      local_mem_size, xlen);
+      local_mem_size, xlen, std::move(accelerator_profile));
   return ffi::Module(node);
 }
 
@@ -477,21 +586,23 @@ static ffi::Module VortexModuleLoadFromBytes(const ffi::Bytes& bytes) {
   uint32_t max_threads_per_block = 0;
   uint32_t local_mem_size = 0;
   uint32_t xlen = 0;
+  SerializedAcceleratorProfile accelerator_profile;
   TVM_FFI_CHECK(stream.Read(&serialization_version), ValueError)
       << "Invalid Vortex module serialization";
   TVM_FFI_CHECK_EQ(serialization_version, kVortexModuleSerializationVersion, ValueError)
       << "Unsupported Vortex module serialization version " << serialization_version;
   TVM_FFI_CHECK(stream.Read(&binary) && stream.Read(&source) && stream.Read(&fmap) &&
-                    stream.Read(&kernel_ids) && stream.Read(&kernel_resources) &&
-                    stream.Read(&abi_version) && stream.Read(&num_warps) &&
-                    stream.Read(&thread_warp_size) && stream.Read(&max_threads_per_block) &&
-                    stream.Read(&local_mem_size) && stream.Read(&xlen),
+                    stream.Read(&kernel_ids) && stream.Read(&accelerator_profile) &&
+                    stream.Read(&kernel_resources) && stream.Read(&abi_version) &&
+                    stream.Read(&num_warps) && stream.Read(&thread_warp_size) &&
+                    stream.Read(&max_threads_per_block) && stream.Read(&local_mem_size) &&
+                    stream.Read(&xlen),
                 ValueError)
       << "Truncated Vortex module serialization";
-  return VortexModuleCreateFromSerialized(std::move(binary), std::move(source), std::move(fmap),
-                                          std::move(kernel_ids), std::move(kernel_resources),
-                                          abi_version, num_warps, thread_warp_size,
-                                          max_threads_per_block, local_mem_size, xlen);
+  return VortexModuleCreateFromSerialized(
+      std::move(binary), std::move(source), std::move(fmap), std::move(kernel_ids),
+      std::move(kernel_resources), abi_version, num_warps, thread_warp_size, max_threads_per_block,
+      local_mem_size, xlen, std::move(accelerator_profile));
 }
 
 static ffi::Module VortexModuleLoadFromFile(const ffi::String& file_name,
@@ -518,6 +629,11 @@ TVM_FFI_STATIC_INIT_BLOCK() {
              ValidateBarrierConfiguration(static_cast<uint64_t>(num_warps),
                                           static_cast<uint64_t>(reported_num_barriers), driver_name,
                                           xclbin_path);
+           })
+      .def("runtime.vortex.validate_accelerator_profile",
+           [](SerializedAcceleratorProfile expected, ffi::String driver_name,
+              ffi::String xclbin_path) {
+             ValidateAcceleratorProfile(expected, driver_name, xclbin_path);
            });
 }
 
