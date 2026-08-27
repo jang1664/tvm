@@ -25,7 +25,11 @@ import torch
 
 import tvm
 from tvm import relax
-from tvm.relax.backend.vortex.pipeline import _w4a16_lowering_pass
+from tvm.relax.backend.vortex.layout import plan_improve_layout
+from tvm.relax.backend.vortex.pipeline import (
+    _make_w4a16_improve,
+    _w4a16_lowering_pass,
+)
 from tvm.relax.frontend.torch import from_exported_program
 from tvm.support.vortex import load_vortex_accelerator_profile
 
@@ -70,10 +74,13 @@ class _Attention(torch.nn.Module):
 
 
 class _PackedW4A16(torch.nn.Module):
-    def __init__(self, transpose_rhs=False, quant_axis=0):
+    def __init__(self, transpose_rhs=False, quant_axis=0, rhs_shape=None):
         super().__init__()
         self.transpose_rhs = transpose_rhs
         self.quant_axis = quant_axis
+        self.rhs_shape = rhs_shape or (
+            (32, 128) if self.transpose_rhs else (128, 32)
+        )
 
     def forward(self, lhs, packed, scale, zero_point):
         return torch.ops.vortex.mm_w4a16(
@@ -81,7 +88,7 @@ class _PackedW4A16(torch.nn.Module):
             packed,
             scale,
             zero_point,
-            [32, 128] if self.transpose_rhs else [128, 32],
+            list(self.rhs_shape),
             32,
             self.quant_axis,
             1,
@@ -257,23 +264,116 @@ class _W4CachedDecode(torch.nn.Module):
         return context, *key_cache, *value_cache
 
 
-def _import_packed_w4a16(transpose_rhs=False, quant_axis=0):
+def _import_packed_w4a16(
+    transpose_rhs=False, quant_axis=0, m=8, n=32, k=128
+):
     _register_logical_ops()
-    rhs_shape = (32, 128) if transpose_rhs else (128, 32)
+    rhs_shape = (n, k) if transpose_rhs else (k, n)
     packed_shape = (rhs_shape[0], (rhs_shape[1] + 1) // 2)
     qparam_shape = list(rhs_shape)
     qparam_shape[quant_axis] = (qparam_shape[quant_axis] + 31) // 32
     inputs = (
-        torch.ones((8, 128), dtype=torch.float16),
+        torch.ones((m, k), dtype=torch.float16),
         torch.zeros(packed_shape, dtype=torch.uint8),
         torch.ones(qparam_shape, dtype=torch.float16),
         torch.zeros(qparam_shape, dtype=torch.int16),
     )
     return from_exported_program(
-        torch.export.export(_PackedW4A16(transpose_rhs, quant_axis), inputs),
+        torch.export.export(
+            _PackedW4A16(transpose_rhs, quant_axis, rhs_shape), inputs
+        ),
         run_ep_decomposition=False,
         unwrap_unit_return_tuple=True,
     )
+
+
+def _pack_improve_physical(lhs, weight, scale, zero_point, plan):
+    """Independently pack logical QCOL/WTRANS=0 tensors for a direct ABI test."""
+
+    assert not plan.weight_transpose and plan.quant_direction == 0
+    profile = plan.profile
+    tiled_a = np.zeros(plan.a_elements, dtype="float16")
+    a_base = 0
+    for mt, cur_m in enumerate(plan.m_tiles):
+        slot_m = (cur_m + profile.num_dma_channels - 1) // profile.num_dma_channels
+        slot_m *= profile.num_dma_channels
+        for kt, cur_k in enumerate(plan.k_tiles):
+            kt_base = a_base + kt * slot_m * profile.dma_kt
+            for micro_k in range(cur_k // profile.mxu_kt):
+                for local_m in range(cur_m):
+                    for inner_k in range(profile.mxu_kt):
+                        logical_k = (
+                            kt * profile.dma_kt
+                            + micro_k * profile.mxu_kt
+                            + inner_k
+                        )
+                        if logical_k < plan.logical_k:
+                            index = kt_base + micro_k * cur_m * profile.mxu_kt
+                            index += local_m * profile.mxu_kt + inner_k
+                            tiled_a[index] = lhs[
+                                mt * profile.dma_mt + local_m, logical_k
+                            ]
+        a_base += slot_m * plan.execution_k
+
+    tiled_w = np.zeros(plan.weight_bytes, dtype="uint8")
+    for logical_k in range(plan.logical_k):
+        kt, local_k = divmod(logical_k, profile.dma_kt)
+        for logical_n in range(plan.logical_n):
+            nt, inner_n = divmod(logical_n, profile.mxu_nt)
+            index = kt * profile.dma_kt * plan.execution_n // 2
+            cur_k = min(profile.dma_kt, plan.execution_k - kt * profile.dma_kt)
+            index += nt * cur_k * profile.mxu_nt // 2
+            index += local_k * (profile.mxu_nt // 2) + inner_n // 2
+            nibble = np.uint8(int(weight[logical_k, logical_n]) & 0xF)
+            if inner_n & 1:
+                tiled_w[index] |= np.uint8(nibble << np.uint8(4))
+            else:
+                tiled_w[index] |= nibble
+
+    tiled_scale = np.zeros(plan.qparam_elements, dtype="float16")
+    tiled_zero = np.zeros(plan.qparam_elements, dtype="int16")
+    for slot in plan.qparam_slots:
+        offset = slot.offset_bytes // 2
+        groups = slot.execution_k // plan.qblock
+        for group in range(groups):
+            global_group = slot.outer_k * (profile.dma_kt // plan.qblock) + group
+            for local_n in range(slot.execution_n):
+                global_n = slot.outer_n * profile.dma_nt + local_n
+                if global_group < scale.shape[0] and global_n < plan.logical_n:
+                    micro_n, inner_n = divmod(local_n, profile.mxu_nt)
+                    index = offset + micro_n * groups * profile.mxu_nt
+                    index += group * profile.mxu_nt + inner_n
+                    tiled_scale[index] = scale[global_group, global_n]
+                    tiled_zero[index] = zero_point[global_group, global_n]
+    return tiled_a, tiled_w, tiled_scale, tiled_zero
+
+
+def _detile_improve_output(tiled, plan):
+    output = np.empty((plan.logical_m, plan.logical_n), dtype="float16")
+    c_base = 0
+    for mt, cur_m in enumerate(plan.m_tiles):
+        slot_m = (cur_m + plan.profile.num_dma_channels - 1)
+        slot_m //= plan.profile.num_dma_channels
+        slot_m *= plan.profile.num_dma_channels
+        for local_m in range(cur_m):
+            for logical_n in range(plan.logical_n):
+                nt, inner_n = divmod(logical_n, plan.profile.mxu_nt)
+                index = c_base + nt * slot_m * plan.profile.mxu_nt
+                index += local_m * plan.profile.mxu_nt + inner_n
+                output[mt * plan.profile.dma_mt + local_m, logical_n] = tiled[index]
+        c_base += slot_m * plan.execution_n
+    return output
+
+
+def _pack_int4_last_axis(source):
+    padded_shape = list(source.shape)
+    padded_shape[-1] = (padded_shape[-1] + 1) // 2 * 2
+    padded = np.zeros(padded_shape, dtype="int8")
+    padded[..., : source.shape[-1]] = source
+    return np.bitwise_or(
+        np.bitwise_and(padded[..., 0::2], 0xF),
+        np.left_shift(np.bitwise_and(padded[..., 1::2], 0xF), 4),
+    ).astype("uint8")
 
 
 def test_vortex_logical_int4_ops_import_one_to_one():
@@ -489,6 +589,164 @@ def test_naive_w4a16_relax_vm_hardware(transpose_rhs, quant_axis):
         *[
             tvm.runtime.tensor(array, device=device)
             for array in (lhs_host, packed, scale, zero_point)
+        ]
+    ).numpy()
+    np.testing.assert_allclose(actual, expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(
+    os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
+    reason="set TVM_VORTEX_RUN_HARDWARE=1 inside the exact improved GEMM XRT environment",
+)
+def test_direct_improved_gemm_abi_v2_hardware():
+    """Bypass Relax transforms and submit known-good physical buffers directly."""
+
+    assert Path(os.environ["XRT_XCLBIN_PATH"]).resolve() == IMPROVED_XCLBIN.resolve()
+    accelerator = load_vortex_accelerator_profile(
+        IMPROVED_XCLBIN.parent.parent / "manifest.json"
+    )
+    target = tvm.target.Target(accelerator.target, host="llvm")
+    plan = plan_improve_layout(7, 31, 33, 32)
+    kernel = _make_w4a16_improve(
+        plan.a_elements,
+        plan.weight_bytes,
+        plan.qparam_elements,
+        plan.c_elements,
+        plan.logical_m,
+        plan.execution_n,
+        plan.execution_k,
+        plan.qblock,
+        0,
+        0,
+        plan.logical_n,
+        plan.logical_k,
+        plan.profile.layout_abi_version,
+    ).with_attr("global_symbol", "direct_improve_gemm")
+    executable = tvm.tirx.build(kernel, target=target)
+
+    rng = np.random.default_rng(59)
+    lhs = rng.uniform(-0.5, 0.5, (plan.logical_m, plan.logical_k)).astype("float16")
+    weight = rng.integers(
+        -3, 4, size=(plan.logical_k, plan.logical_n), dtype="int8"
+    )
+    scale = np.full(
+        ((plan.logical_k + plan.qblock - 1) // plan.qblock, plan.logical_n),
+        0.125,
+        dtype="float16",
+    )
+    zero_point = np.zeros(scale.shape, dtype="int16")
+    physical = _pack_improve_physical(lhs, weight, scale, zero_point, plan)
+
+    device = tvm.vortex(0)
+    device_inputs = [tvm.runtime.tensor(value, device=device) for value in physical]
+    tiled_output = tvm.runtime.empty((plan.c_elements,), "float16", device=device)
+    executable["direct_improve_gemm"](*device_inputs, tiled_output)
+    actual = _detile_improve_output(tiled_output.numpy(), plan)
+
+    scale_by_k = np.repeat(scale.astype("float32"), plan.qblock, axis=0)
+    dequantized = weight.astype("float32") * scale_by_k[: plan.logical_k]
+    expected = (lhs.astype("float32") @ dequantized).astype("float16")
+    np.testing.assert_allclose(actual, expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(
+    os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
+    reason="set TVM_VORTEX_RUN_HARDWARE=1 inside the exact improved GEMM XRT environment",
+)
+def test_improved_w4a16_first_k_tail_group_sentinel_hardware():
+    """The first padded K micro-tile must contribute through the full Relax VM."""
+
+    assert Path(os.environ["XRT_XCLBIN_PATH"]).resolve() == IMPROVED_XCLBIN.resolve()
+    accelerator = load_vortex_accelerator_profile(
+        IMPROVED_XCLBIN.parent.parent / "manifest.json"
+    )
+    target = tvm.target.Target(accelerator.target, host="llvm")
+    executable = relax.build(
+        _import_packed_w4a16(False, 0, m=7, n=31, k=33),
+        target,
+        exec_mode="bytecode",
+    )
+
+    lhs = np.zeros((7, 33), dtype="float16")
+    lhs[:, 32] = np.float16(1)
+    weight = np.zeros((33, 31), dtype="int8")
+    weight[32, :] = np.int8(2)
+    packed = _pack_int4_last_axis(weight)
+    scale = np.zeros((2, 31), dtype="float16")
+    scale[1, :] = np.float16(0.125)
+    zero_point = np.zeros((2, 31), dtype="int16")
+
+    device = tvm.vortex(0)
+    vm = relax.VirtualMachine(executable, device=device, memory_cfg="naive")
+    actual = vm["main"](
+        *[
+            tvm.runtime.tensor(value, device=device)
+            for value in (lhs, packed, scale, zero_point)
+        ]
+    ).numpy()
+    np.testing.assert_array_equal(actual, np.full((7, 31), 0.25, dtype="float16"))
+
+
+@pytest.mark.skipif(
+    os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
+    reason="set TVM_VORTEX_RUN_HARDWARE=1 inside the exact improved GEMM XRT environment",
+)
+@pytest.mark.parametrize(
+    ("m", "n", "k", "transpose_rhs", "quant_direction"),
+    [
+        (7, 31, 31, False, 0),
+        (7, 31, 32, False, 0),
+        (7, 31, 33, False, 0),
+        (7, 31, 63, False, 0),
+        (7, 31, 64, False, 0),
+        (7, 31, 65, False, 0),
+        (9, 33, 31, False, 1),
+        (9, 33, 31, True, 0),
+        (9, 33, 31, True, 1),
+        (129, 257, 193, False, 0),
+    ],
+)
+def test_improved_w4a16_arbitrary_shape_hardware(
+    m, n, k, transpose_rhs, quant_direction
+):
+    """Cover K boundaries, both layout directions, transpose, and outer tiles."""
+
+    assert Path(os.environ["XRT_XCLBIN_PATH"]).resolve() == IMPROVED_XCLBIN.resolve()
+    accelerator = load_vortex_accelerator_profile(
+        IMPROVED_XCLBIN.parent.parent / "manifest.json"
+    )
+    target = tvm.target.Target(accelerator.target, host="llvm")
+    source_k_axis = 1 if transpose_rhs else 0
+    quant_axis = source_k_axis if quant_direction == 0 else 1 - source_k_axis
+    executable = relax.build(
+        _import_packed_w4a16(
+            transpose_rhs, quant_axis, m=m, n=n, k=k
+        ),
+        target,
+        exec_mode="bytecode",
+    )
+
+    rng = np.random.default_rng(
+        1000 + m * 3 + n * 5 + k * 7 + int(transpose_rhs) * 11 + quant_direction
+    )
+    lhs = rng.uniform(-0.1, 0.1, (m, k)).astype("float16")
+    weight = rng.integers(-2, 3, size=(k, n), dtype="int8")
+    source_rhs = weight.T if transpose_rhs else weight
+    packed = _pack_int4_last_axis(source_rhs)
+    qparam_shape = list(source_rhs.shape)
+    qparam_shape[quant_axis] = (qparam_shape[quant_axis] + 31) // 32
+    scale = np.full(qparam_shape, 0.125, dtype="float16")
+    zero_point = np.zeros(qparam_shape, dtype="int16")
+    expected = (lhs.astype("float32") @ (weight.astype("float32") * 0.125)).astype(
+        "float16"
+    )
+
+    device = tvm.vortex(0)
+    vm = relax.VirtualMachine(executable, device=device, memory_cfg="naive")
+    actual = vm["main"](
+        *[
+            tvm.runtime.tensor(value, device=device)
+            for value in (lhs, packed, scale, zero_point)
         ]
     ).numpy()
     np.testing.assert_allclose(actual, expected, rtol=3e-2, atol=3e-2)

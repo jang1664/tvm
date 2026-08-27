@@ -24,6 +24,7 @@ from tvm.relax import expr_functor
 from tvm.script import tirx as T
 
 from .. import gpu_generic
+from .layout import ImproveProfile, plan_improve_layout
 
 
 def _make_quantize_int4_row_major(shape, group_size, scheme):
@@ -361,31 +362,58 @@ def _make_w4a16_naive(
     return mm_w4a16_naive
 
 
-def _make_gemm_a_tiled(m, k):
-    m_pad = (m + 7) // 8 * 8
-    total = m * k
+def _make_gemm_a_tiled(plan):
+    m = plan.logical_m
+    k = plan.logical_k
+    k_exec = plan.execution_k
+    dma_mt = plan.profile.dma_mt
+    dma_kt = plan.profile.dma_kt
+    mxu_kt = plan.profile.mxu_kt
+    channels = plan.profile.num_dma_channels
+    total = plan.a_elements
 
     @T.prim_func(private=True)
     def gemm_a_tiled(
         source: T.Buffer((m, k), "float16"),
-        tiled: T.Buffer((m_pad * k,), "float16"),
+        tiled: T.Buffer((total,), "float16"),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
         for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
             for tx in T.thread_binding(128, thread="threadIdx.x"):
-                if bx * 128 + tx < total:
-                    tiled[
-                        (bx * 128 + tx) % k // 32 * m_pad * 32
-                        + (bx * 128 + tx) // k * 32
-                        + (bx * 128 + tx) % 32
-                    ] = source[(bx * 128 + tx) // k, (bx * 128 + tx) % k]
+                index = bx * 128 + tx
+                if index < total:
+                    mt = index // (dma_mt * k_exec)
+                    within_mt = index % (dma_mt * k_exec)
+                    cur_m = T.min(dma_mt, m - mt * dma_mt)
+                    slot_m = (cur_m + channels - 1) // channels * channels
+                    kt = within_mt // (slot_m * dma_kt)
+                    within_kt = within_mt % (slot_m * dma_kt)
+                    cur_k = T.min(dma_kt, k_exec - kt * dma_kt)
+                    tiled[index] = T.float16(0)
+                    if within_kt < cur_m * cur_k:
+                        micro_k = within_kt // (cur_m * mxu_kt)
+                        within_micro = within_kt % (cur_m * mxu_kt)
+                        local_m = within_micro // mxu_kt
+                        inner_k = within_micro % mxu_kt
+                        global_m = mt * dma_mt + local_m
+                        global_k = kt * dma_kt + micro_k * mxu_kt + inner_k
+                        if global_k < k:
+                            tiled[index] = source[global_m, global_k]
 
     return gemm_a_tiled
 
 
-def _make_gemm_w_tiled(rhs_shape, transpose_rhs):
+def _make_gemm_w_tiled(rhs_shape, plan):
     rows, columns = rhs_shape
-    total_bytes = rows * ((columns + 1) // 2)
+    transpose_rhs = plan.weight_transpose
+    total_bytes = plan.weight_bytes
+    k = plan.logical_k
+    n = plan.logical_n
+    k_exec = plan.execution_k
+    n_exec = plan.execution_n
+    dma_kt = plan.profile.dma_kt
+    mxu_kt = plan.profile.mxu_kt
+    mxu_nt = plan.profile.mxu_nt
 
     @T.prim_func(private=True)
     def gemm_w_tiled(
@@ -396,36 +424,54 @@ def _make_gemm_w_tiled(rhs_shape, transpose_rhs):
         for bx in T.thread_binding((total_bytes + 127) // 128, thread="blockIdx.x"):
             for tx in T.thread_binding(128, thread="threadIdx.x"):
                 if bx * 128 + tx < total_bytes:
+                    index = bx * 128 + tx
+                    kt = index // (dma_kt * n_exec // 2)
+                    within_kt = index % (dma_kt * n_exec // 2)
+                    cur_k = T.min(dma_kt, k_exec - kt * dma_kt)
+                    bytes_per_nt = cur_k * mxu_nt // 2
+                    nt = within_kt // bytes_per_nt
+                    within_nt = within_kt % bytes_per_nt
+                    tiled[index] = T.uint8(0)
                     if transpose_rhs:
-                        tiled[
-                            (bx * 128 + tx)
-                            // ((columns + 1) // 2)
-                            // 32
-                            * (columns * 16)
-                            + (bx * 128 + tx) % ((columns + 1) // 2) // 16 * (32 * 16)
-                            + (bx * 128 + tx) // ((columns + 1) // 2) % 32 * 16
-                            + (bx * 128 + tx) % 16
-                        ] = source[
-                            (bx * 128 + tx) // ((columns + 1) // 2),
-                            (bx * 128 + tx) % ((columns + 1) // 2),
-                        ]
+                        kb = within_nt // (mxu_nt * (mxu_kt // 2))
+                        within_kb = within_nt % (mxu_nt * (mxu_kt // 2))
+                        local_n = within_kb // (mxu_kt // 2)
+                        k_pair = within_kb % (mxu_kt // 2)
+                        global_n = nt * mxu_nt + local_n
+                        global_k = kt * dma_kt + kb * mxu_kt + k_pair * 2
+                        if global_n < n and global_k < k:
+                            tiled[index] = source[global_n, global_k // 2]
+                            if global_k + 1 >= k:
+                                tiled[index] = tiled[index] & T.uint8(15)
                     else:
-                        tiled[
-                            (bx * 128 + tx) // ((columns + 1) // 2) // 32 * (32 * 16)
-                            + (bx * 128 + tx) // ((columns + 1) // 2) % 32 * 16
-                            + (bx * 128 + tx) % ((columns + 1) // 2)
-                        ] = source[
-                            (bx * 128 + tx) // ((columns + 1) // 2),
-                            (bx * 128 + tx) % ((columns + 1) // 2),
-                        ]
+                        local_k = within_nt // (mxu_nt // 2)
+                        n_pair = within_nt % (mxu_nt // 2)
+                        global_k = kt * dma_kt + local_k
+                        global_n = nt * mxu_nt + n_pair * 2
+                        if global_k < k and global_n < n:
+                            tiled[index] = source[global_k, global_n // 2]
+                            if global_n + 1 >= n:
+                                tiled[index] = tiled[index] & T.uint8(15)
 
     return gemm_w_tiled
 
 
-def _make_gemm_qparam_tiled(
-    source_shape, output_elements, dtype, quant_direction, transpose_rhs
-):
-    total = source_shape[0] * source_shape[1]
+def _make_gemm_qparam_tiled(source_shape, dtype, plan):
+    output_elements = plan.qparam_elements
+    quant_direction = plan.quant_direction
+    transpose_rhs = plan.weight_transpose
+    k = plan.logical_k
+    n = plan.logical_n
+    k_exec = plan.execution_k
+    dma_kt = plan.profile.dma_kt
+    dma_nt = plan.profile.dma_nt
+    mxu_nt = plan.profile.mxu_nt
+    qblock = plan.qblock
+    alignment = plan.profile.qparam_slot_alignment
+    ng_per_micro = (mxu_nt + qblock - 1) // qblock
+    full_k_row_elements = sum(
+        slot.reserved_bytes for slot in plan.qparam_slots if slot.outer_k == 0
+    ) // 2
 
     @T.prim_func(private=True)
     def gemm_qparam_tiled(
@@ -436,21 +482,55 @@ def _make_gemm_qparam_tiled(
         for bx in T.thread_binding((output_elements + 127) // 128, thread="blockIdx.x"):
             for tx in T.thread_binding(128, thread="threadIdx.x"):
                 if bx * 128 + tx < output_elements:
-                    tiled[bx * 128 + tx] = T.Cast(dtype, 0)
-                if bx * 128 + tx < total:
-                    if quant_direction == 0 and transpose_rhs:
-                        tiled[
-                            (bx * 128 + tx) % source_shape[1] * source_shape[0]
-                            + (bx * 128 + tx) // source_shape[1]
-                        ] = source[
-                            (bx * 128 + tx) // source_shape[1],
-                            (bx * 128 + tx) % source_shape[1],
-                        ]
+                    index = bx * 128 + tx
+                    kt = index // full_k_row_elements
+                    within_kt = index % full_k_row_elements
+                    cur_k = T.min(dma_kt, k_exec - kt * dma_kt)
+                    if quant_direction == 0:
+                        full_n_payload_bytes = cur_k // qblock * dma_nt * 2
                     else:
-                        tiled[bx * 128 + tx] = source[
-                            (bx * 128 + tx) // source_shape[1],
-                            (bx * 128 + tx) % source_shape[1],
-                        ]
+                        full_n_payload_bytes = (
+                            dma_nt // mxu_nt * cur_k * ng_per_micro * 2
+                        )
+                    full_n_slot_elements = (
+                        (full_n_payload_bytes + alignment - 1) // alignment * alignment // 2
+                    )
+                    nt_dma = within_kt // full_n_slot_elements
+                    slot_index = within_kt % full_n_slot_elements
+                    cur_n = T.min(dma_nt, plan.execution_n - nt_dma * dma_nt)
+                    if quant_direction == 0:
+                        payload_elements = cur_k // qblock * cur_n
+                    else:
+                        payload_elements = (
+                            cur_n // mxu_nt * cur_k * ng_per_micro
+                        )
+                    tiled[index] = T.Cast(dtype, 0)
+                    if slot_index < payload_elements:
+                        if quant_direction == 0:
+                            groups = cur_k // qblock
+                            nb = slot_index // (groups * mxu_nt)
+                            within_nb = slot_index % (groups * mxu_nt)
+                            group = within_nb // mxu_nt
+                            inner_n = within_nb % mxu_nt
+                            global_group = kt * (dma_kt // qblock) + group
+                            global_n = nt_dma * dma_nt + nb * mxu_nt + inner_n
+                            if global_group < (k + qblock - 1) // qblock and global_n < n:
+                                if transpose_rhs:
+                                    tiled[index] = source[global_n, global_group]
+                                else:
+                                    tiled[index] = source[global_group, global_n]
+                        else:
+                            nb = slot_index // (cur_k * ng_per_micro)
+                            within_nb = slot_index % (cur_k * ng_per_micro)
+                            local_k = within_nb // ng_per_micro
+                            ng = within_nb % ng_per_micro
+                            global_k = kt * dma_kt + local_k
+                            global_ng = (nt_dma * dma_nt + nb * mxu_nt) // qblock + ng
+                            if global_k < k and global_ng < (n + qblock - 1) // qblock:
+                                if transpose_rhs:
+                                    tiled[index] = source[global_ng, global_k]
+                                else:
+                                    tiled[index] = source[global_k, global_ng]
 
     return gemm_qparam_tiled
 
@@ -466,6 +546,9 @@ def _make_w4a16_improve(
     group_size,
     weight_transpose,
     quant_direction,
+    logical_n,
+    logical_k,
+    layout_abi_version,
 ):
     @T.prim_func(private=True)
     def mm_w4a16_improve(
@@ -481,7 +564,7 @@ def _make_w4a16_improve(
                 T.evaluate(
                     T.call_extern(
                         "int32",
-                        "vx_tvm_gemm_w4a16",
+                        "vx_tvm_gemm_w4a16_v2",
                         lhs.data,
                         packed.data,
                         scale.data,
@@ -494,29 +577,47 @@ def _make_w4a16_improve(
                         weight_transpose,
                         quant_direction,
                         2,
+                        logical_n,
+                        logical_k,
+                        layout_abi_version,
                     )
                 )
 
     return mm_w4a16_improve
 
 
-def _make_gemm_c_detile(m, n):
-    m_pad = (m + 7) // 8 * 8
+def _make_gemm_c_detile(plan):
+    m = plan.logical_m
+    n = plan.logical_n
+    n_exec = plan.execution_n
+    dma_mt = plan.profile.dma_mt
+    mxu_nt = plan.profile.mxu_nt
+    channels = plan.profile.num_dma_channels
     total = m * n
 
     @T.prim_func(private=True)
     def gemm_c_detile(
-        tiled: T.Buffer((m_pad * n,), "float16"),
+        tiled: T.Buffer((plan.c_elements,), "float16"),
         output: T.Buffer((m, n), "float16"),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
         for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
             for tx in T.thread_binding(128, thread="threadIdx.x"):
                 if bx * 128 + tx < total:
-                    output[(bx * 128 + tx) // n, (bx * 128 + tx) % n] = tiled[
-                        (bx * 128 + tx) % n // 32 * m_pad * 32
-                        + (bx * 128 + tx) // n * 32
-                        + (bx * 128 + tx) % 32
+                    index = bx * 128 + tx
+                    global_m = index // n
+                    global_n = index % n
+                    mt = global_m // dma_mt
+                    local_m = global_m % dma_mt
+                    cur_m = T.min(dma_mt, m - mt * dma_mt)
+                    slot_m = (cur_m + channels - 1) // channels * channels
+                    nt = global_n // mxu_nt
+                    inner_n = global_n % mxu_nt
+                    output[global_m, global_n] = tiled[
+                        mt * dma_mt * n_exec
+                        + nt * slot_m * mxu_nt
+                        + local_m * mxu_nt
+                        + inner_n
                     ]
 
     return gemm_c_detile
@@ -551,6 +652,7 @@ class _W4A16Lowerer(relax.PyExprMutator):
         super().__init__(mod)
         self.target = target
         self.mode = str(target.attrs.get("vortex_gemm_mode", "none"))
+        self.improve_profile = ImproveProfile.from_target(target)
         self.implementations = {}
         self.original_bindings = {}
         self.tiled_w4a16_outputs = {}
@@ -818,31 +920,29 @@ class _W4A16Lowerer(relax.PyExprMutator):
 
         m, k = lhs_shape
         n = output_shape[1]
-        if (
-            m > 128
-            or n > 128
-            or k != 128
-            or n % 32 != 0
-            or m % 8 != 0
-            or pack_axis != 1
-        ):
+        if pack_axis != 1:
             raise ValueError(
-                "Vortex improved W4A16 initial lowering requires M<=128 divisible by 8, "
-                "N<=128 divisible by 32, K=128, and pack_axis=1"
+                "Vortex improved W4A16 requires packed INT4 on source RHS axis 1"
             )
         source_k_axis = 1 if transpose_rhs else 0
         quant_direction = 0 if quant_axis == source_k_axis else 1
-        m_pad = (m + 7) // 8 * 8
-        tiled_a_elements = m_pad * k
-        tiled_w_bytes = packed_shape[0] * packed_shape[1]
-        tiled_qparam_elements = (
-            (scale_shape[0] * scale_shape[1] * 2 + 511) // 512
-        ) * 256
-        tiled_c_elements = m_pad * n
+        plan = plan_improve_layout(
+            m,
+            n,
+            k,
+            group_size,
+            transpose_rhs,
+            quant_direction,
+            self.improve_profile,
+        )
+        tiled_a_elements = plan.a_elements
+        tiled_w_bytes = plan.weight_bytes
+        tiled_qparam_elements = plan.qparam_elements
+        tiled_c_elements = plan.c_elements
 
         layout_specs = {
             "w": (
-                _make_gemm_w_tiled(rhs_shape, transpose_rhs),
+                _make_gemm_w_tiled(rhs_shape, plan),
                 (
                     "vortex_gemm_w_tiled_transposed"
                     if transpose_rhs
@@ -852,20 +952,16 @@ class _W4A16Lowerer(relax.PyExprMutator):
             "scale": (
                 _make_gemm_qparam_tiled(
                     scale_shape,
-                    tiled_qparam_elements,
                     "float16",
-                    quant_direction,
-                    transpose_rhs,
+                    plan,
                 ),
                 "vortex_gemm_scale_tiled",
             ),
             "zero": (
                 _make_gemm_qparam_tiled(
                     zero_point_shape,
-                    tiled_qparam_elements,
                     "int16",
-                    quant_direction,
-                    transpose_rhs,
+                    plan,
                 ),
                 "vortex_gemm_zero_point_tiled",
             ),
@@ -876,24 +972,27 @@ class _W4A16Lowerer(relax.PyExprMutator):
                     tiled_qparam_elements,
                     tiled_c_elements,
                     m,
-                    n,
-                    k,
+                    plan.execution_n,
+                    plan.execution_k,
                     group_size,
                     int(transpose_rhs),
                     quant_direction,
+                    n,
+                    k,
+                    plan.profile.layout_abi_version,
                 ),
                 "vortex_mm_w4a16_improve",
             ),
-            "detile": (_make_gemm_c_detile(m, n), "vortex_gemm_c_detile"),
+            "detile": (_make_gemm_c_detile(plan), "vortex_gemm_c_detile"),
         }
         if fused_tiled_lhs is None:
             layout_specs["a"] = (
-                _make_gemm_a_tiled(m, k),
+                _make_gemm_a_tiled(plan),
                 f"vortex_gemm_a_tiled_{m}_{k}",
             )
-        elif fused_tiled_lhs[1] != lhs_shape:
+        elif not fused_tiled_lhs[1].compatible_gemm_input(plan.a_descriptor):
             raise ValueError(
-                "Vortex fused GEMM-C to GEMM-A logical shapes are inconsistent"
+                "Vortex fused GEMM-C to GEMM-A physical layout descriptors are incompatible"
             )
         globals_by_name = {}
         for layout_name, (primfunc, name_hint) in layout_specs.items():
@@ -952,7 +1051,7 @@ class _W4A16Lowerer(relax.PyExprMutator):
             [tiled_output],
             out_ty=call.ty,
         )
-        self.tiled_w4a16_outputs[original_call] = (tiled_output, output_shape)
+        self.tiled_w4a16_outputs[original_call] = (tiled_output, plan.c_descriptor)
         return detiled_output
 
 
