@@ -281,6 +281,35 @@ def _make_kv_cache_update(cache_shapes, update_shapes, position):
     return kv_cache_update
 
 
+def _make_fp16_tcu_matmul(m: int, n: int, k: int):
+    """Create the exact-tile FP16 TCU implementation for a rank-2 matmul."""
+
+    @T.prim_func(private=True)
+    def tcu_matmul(
+        lhs: T.Buffer((m, k), "float16"),
+        rhs: T.Buffer((k, n), "float16"),
+        output: T.Buffer((m, n), "float16"),
+    ):
+        T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
+        for by in T.thread_binding(m // 16, thread="blockIdx.y"):
+            for bx in T.thread_binding(n // 16, thread="blockIdx.x"):
+                for tx in T.thread_binding(32, thread="threadIdx.x"):
+                    T.evaluate(
+                        T.call_extern(
+                            "int32",
+                            "vx_tvm_tcu_fp16_tile",
+                            lhs.data,
+                            rhs.data,
+                            output.data,
+                            m,
+                            n,
+                            k,
+                        )
+                    )
+
+    return tcu_matmul
+
+
 def _make_w4a16_naive(
     lhs_shape,
     packed_shape,
@@ -939,6 +968,80 @@ def _w4a16_lowering_pass(target):
     return lower
 
 
+def _static_rank2_fp16_shape(expr):
+    tensor_type = expr.ty
+    shape = getattr(tensor_type, "shape", None)
+    if str(getattr(tensor_type, "dtype", "")) != "float16" or shape is None:
+        return None
+    values = list(shape.values)
+    if len(values) != 2 or not all(
+        isinstance(value, tvm.tirx.IntImm) for value in values
+    ):
+        return None
+    return tuple(int(value) for value in values)
+
+
+def _tcu_tensorize_pass(target: tvm.target.Target):
+    """Rewrite eligible logical matmul calls to the versioned Vortex TCU ABI."""
+
+    mode = str(target.attrs.get("vortex_tcu_mode", "none"))
+    formats = str(target.attrs.get("vortex_tcu_fp_formats", ""))
+    enabled = mode in ("fp", "fp_int") and "fp16" in formats.split(",")
+
+    @tvm.transform.module_pass(opt_level=0, name="VortexTensorizeTCU")
+    def tensorize(mod: tvm.ir.IRModule, _ctx: tvm.transform.PassContext):
+        if not enabled:
+            return mod
+
+        lhs_pattern = relax.dpl.wildcard()
+        rhs_pattern = relax.dpl.wildcard()
+        matmul_pattern = relax.dpl.is_op("relax.matmul")(lhs_pattern, rhs_pattern)
+        builder = relax.BlockBuilder(mod)
+        implementations = {}
+
+        def rewriter(original, matches):
+            lhs = matches[lhs_pattern]
+            rhs = matches[rhs_pattern]
+            lhs_shape = _static_rank2_fp16_shape(lhs)
+            rhs_shape = _static_rank2_fp16_shape(rhs)
+            output_shape = _static_rank2_fp16_shape(original)
+            if lhs_shape is None or rhs_shape is None or output_shape is None:
+                return original
+
+            m, k = lhs_shape
+            rhs_k, n = rhs_shape
+            if (
+                rhs_k != k
+                or output_shape != (m, n)
+                or m % 16 != 0
+                or n % 16 != 0
+                or k % 32 != 0
+            ):
+                return original
+
+            shape_key = (m, n, k)
+            if shape_key not in implementations:
+                implementations[shape_key] = builder.add_func(
+                    _make_fp16_tcu_matmul(m, n, k),
+                    f"vortex_tcu_fp16_matmul_{m}_{n}_{k}",
+                )
+            return relax.call_tir(
+                implementations[shape_key],
+                [lhs, rhs],
+                out_ty=original.ty,
+            )
+
+        for global_var, func in list(mod.functions_items()):
+            if isinstance(func, relax.Function):
+                builder.update_func(
+                    global_var,
+                    relax.dpl.rewrite_call(matmul_pattern, rewriter, func),
+                )
+        return builder.finalize()
+
+    return tensorize
+
+
 def library_dispatch_passes(target: tvm.target.Target):
     """Return library dispatch passes supported by Vortex."""
     return gpu_generic.library_dispatch_passes(target)
@@ -949,6 +1052,7 @@ def legalize_passes(target: tvm.target.Target):  # pylint: disable=unused-argume
     from tvm.s_tir import dlight as dl  # pylint: disable=import-outside-toplevel
 
     return [
+        _tcu_tensorize_pass(target),
         relax.transform.LegalizeOps(),
         relax.transform.AnnotateTIROpPattern(),
         relax.transform.FoldConstant(),
