@@ -19,6 +19,8 @@
 from dataclasses import dataclass
 from math import gcd
 
+import numpy as np
+
 
 _U32_MAX = (1 << 32) - 1
 _U64_MAX = (1 << 64) - 1
@@ -432,3 +434,126 @@ def plan_improve_layout(
         peak_live,
         scratch,
     )
+
+
+def prepack_improve_weight(source, plan):
+    """Prepack one constant canonical INT4 payload for ``GEMM_IMPROVE``."""
+
+    source = np.asarray(source, dtype="uint8")
+    expected_shape = (
+        (plan.logical_n, (plan.logical_k + 1) // 2)
+        if plan.weight_transpose
+        else (plan.logical_k, (plan.logical_n + 1) // 2)
+    )
+    if source.shape != expected_shape:
+        raise ValueError(
+            f"Vortex constant W shape {source.shape} does not match {expected_shape}"
+        )
+    profile = plan.profile
+    tiled = np.zeros(plan.weight_bytes, dtype="uint8")
+    for index in range(plan.weight_bytes):
+        kt, within_kt = divmod(
+            index, profile.dma_kt * plan.execution_n // 2
+        )
+        cur_k = min(
+            profile.dma_kt, plan.execution_k - kt * profile.dma_kt
+        )
+        bytes_per_nt = cur_k * profile.mxu_nt // 2
+        nt, within_nt = divmod(within_kt, bytes_per_nt)
+        if plan.weight_transpose:
+            kb, within_kb = divmod(
+                within_nt, profile.mxu_nt * (profile.mxu_kt // 2)
+            )
+            local_n, k_pair = divmod(within_kb, profile.mxu_kt // 2)
+            global_n = nt * profile.mxu_nt + local_n
+            global_k = kt * profile.dma_kt + kb * profile.mxu_kt + k_pair * 2
+            if global_n < plan.logical_n and global_k < plan.logical_k:
+                value = source[global_n, global_k // 2]
+                tiled[index] = value if global_k + 1 < plan.logical_k else value & 15
+        else:
+            local_k, n_pair = divmod(within_nt, profile.mxu_nt // 2)
+            global_k = kt * profile.dma_kt + local_k
+            global_n = nt * profile.mxu_nt + n_pair * 2
+            if global_k < plan.logical_k and global_n < plan.logical_n:
+                value = source[global_k, global_n // 2]
+                tiled[index] = value if global_n + 1 < plan.logical_n else value & 15
+    return tiled
+
+
+def prepack_improve_qparam(source, plan, dtype):
+    """Prepack one constant scale or zero-point tensor for ``GEMM_IMPROVE``."""
+
+    source = np.asarray(source, dtype=dtype)
+    logical_groups = (
+        (plan.logical_k + plan.qblock - 1) // plan.qblock
+        if plan.quant_direction == 0
+        else (plan.logical_n + plan.qblock - 1) // plan.qblock
+    )
+    expected_shape = (
+        (plan.logical_n, logical_groups)
+        if plan.weight_transpose
+        else (logical_groups, plan.logical_n)
+    )
+    if plan.quant_direction == 1:
+        expected_shape = (
+            (logical_groups, plan.logical_k)
+            if plan.weight_transpose
+            else (plan.logical_k, logical_groups)
+        )
+    if source.shape != expected_shape:
+        raise ValueError(
+            f"Vortex constant qparam shape {source.shape} does not match {expected_shape}"
+        )
+
+    profile = plan.profile
+    tiled = np.zeros(plan.qparam_elements, dtype=dtype)
+    ng_per_micro = (profile.mxu_nt + plan.qblock - 1) // plan.qblock
+    for slot in plan.qparam_slots:
+        offset = slot.offset_bytes // 2
+        if plan.quant_direction == 0:
+            groups = slot.execution_k // plan.qblock
+            for nb in range(slot.execution_n // profile.mxu_nt):
+                for group in range(groups):
+                    global_group = (
+                        slot.outer_k * (profile.dma_kt // plan.qblock) + group
+                    )
+                    for inner_n in range(profile.mxu_nt):
+                        global_n = (
+                            slot.outer_n * profile.dma_nt
+                            + nb * profile.mxu_nt
+                            + inner_n
+                        )
+                        if global_group < logical_groups and global_n < plan.logical_n:
+                            source_index = (
+                                (global_n, global_group)
+                                if plan.weight_transpose
+                                else (global_group, global_n)
+                            )
+                            tiled[
+                                offset
+                                + nb * groups * profile.mxu_nt
+                                + group * profile.mxu_nt
+                                + inner_n
+                            ] = source[source_index]
+        else:
+            for nb in range(slot.execution_n // profile.mxu_nt):
+                for local_k in range(slot.execution_k):
+                    global_k = slot.outer_k * profile.dma_kt + local_k
+                    for ng in range(ng_per_micro):
+                        global_group = (
+                            slot.outer_n * profile.dma_nt
+                            + nb * profile.mxu_nt
+                        ) // plan.qblock + ng
+                        if global_k < plan.logical_k and global_group < logical_groups:
+                            source_index = (
+                                (global_group, global_k)
+                                if plan.weight_transpose
+                                else (global_k, global_group)
+                            )
+                            tiled[
+                                offset
+                                + nb * slot.execution_k * ng_per_micro
+                                + local_k * ng_per_micro
+                                + ng
+                            ] = source[source_index]
+    return tiled

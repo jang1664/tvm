@@ -24,7 +24,12 @@ from tvm.relax import expr_functor
 from tvm.script import tirx as T
 
 from .. import gpu_generic
-from .layout import ImproveProfile, plan_improve_layout
+from .layout import (
+    ImproveProfile,
+    plan_improve_layout,
+    prepack_improve_qparam,
+    prepack_improve_weight,
+)
 
 
 def _make_quantize_int4_row_major(shape, group_size, scheme):
@@ -377,7 +382,9 @@ def _make_gemm_a_tiled(plan):
         source: T.Buffer((m, k), "float16"),
         tiled: T.Buffer((total,), "float16"),
     ):
-        T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
+        T.func_attr(
+            {"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8}
+        )
         for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
             for tx in T.thread_binding(128, thread="threadIdx.x"):
                 index = bx * 128 + tx
@@ -420,7 +427,9 @@ def _make_gemm_w_tiled(rhs_shape, plan):
         source: T.Buffer((rows, (columns + 1) // 2), "uint8"),
         tiled: T.Buffer((total_bytes,), "uint8"),
     ):
-        T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
+        T.func_attr(
+            {"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8}
+        )
         for bx in T.thread_binding((total_bytes + 127) // 128, thread="blockIdx.x"):
             for tx in T.thread_binding(128, thread="threadIdx.x"):
                 if bx * 128 + tx < total_bytes:
@@ -478,7 +487,9 @@ def _make_gemm_qparam_tiled(source_shape, dtype, plan):
         source: T.Buffer(source_shape, dtype),
         tiled: T.Buffer((output_elements,), dtype),
     ):
-        T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
+        T.func_attr(
+            {"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8}
+        )
         for bx in T.thread_binding((output_elements + 127) // 128, thread="blockIdx.x"):
             for tx in T.thread_binding(128, thread="threadIdx.x"):
                 if bx * 128 + tx < output_elements:
@@ -558,7 +569,9 @@ def _make_w4a16_improve(
         zero_point: T.Buffer((tiled_qparam_elements,), "int16"),
         output: T.Buffer((tiled_c_elements,), "float16"),
     ):
-        T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
+        T.func_attr(
+            {"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8}
+        )
         for bx in T.thread_binding(1, thread="blockIdx.x"):
             for tx in T.thread_binding(1, thread="threadIdx.x"):
                 T.evaluate(
@@ -600,7 +613,9 @@ def _make_gemm_c_detile(plan):
         tiled: T.Buffer((plan.c_elements,), "float16"),
         output: T.Buffer((m, n), "float16"),
     ):
-        T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
+        T.func_attr(
+            {"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8}
+        )
         for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
             for tx in T.thread_binding(128, thread="threadIdx.x"):
                 if bx * 128 + tx < total:
@@ -621,6 +636,119 @@ def _make_gemm_c_detile(plan):
                     ]
 
     return gemm_c_detile
+
+
+def _make_gemm_tiled_relu(plan):
+    """Create an in-layout ReLU that keeps neutral physical padding."""
+
+    total = plan.c_elements
+
+    @T.prim_func(private=True)
+    def gemm_tiled_relu(
+        source: T.Buffer((total,), "float16"),
+        output: T.Buffer((total,), "float16"),
+    ):
+        T.func_attr(
+            {
+                "tirx.is_scheduled": True,
+                "tirx.noalias": True,
+                "op_pattern": 8,
+                "vortex.improve.layout_preserving": 1,
+            }
+        )
+        for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
+            for tx in T.thread_binding(128, thread="threadIdx.x"):
+                index = bx * 128 + tx
+                if index < total:
+                    output[index] = T.max(source[index], T.float16(0))
+
+    return gemm_tiled_relu
+
+
+def _make_gemm_tiled_add(plan, rhs_shape=None):
+    """Create a descriptor-preserving tiled add with tiled or row-major RHS."""
+
+    total = plan.c_elements
+    m = plan.logical_m
+    n = plan.logical_n
+    n_exec = plan.execution_n
+    dma_mt = plan.profile.dma_mt
+    mxu_nt = plan.profile.mxu_nt
+    channels = plan.profile.num_dma_channels
+
+    if rhs_shape is None:
+
+        @T.prim_func(private=True)
+        def gemm_tiled_add(
+            lhs: T.Buffer((total,), "float16"),
+            rhs: T.Buffer((total,), "float16"),
+            output: T.Buffer((total,), "float16"),
+        ):
+            T.func_attr(
+                {
+                    "tirx.is_scheduled": True,
+                    "tirx.noalias": True,
+                    "op_pattern": 8,
+                    "vortex.improve.layout_preserving": 1,
+                }
+            )
+            for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
+                for tx in T.thread_binding(128, thread="threadIdx.x"):
+                    index = bx * 128 + tx
+                    if index < total:
+                        output[index] = lhs[index] + rhs[index]
+
+        return gemm_tiled_add
+
+    @T.prim_func(private=True)
+    def gemm_tiled_add_row_major(
+        lhs: T.Buffer((total,), "float16"),
+        rhs: T.Buffer(rhs_shape, "float16"),
+        output: T.Buffer((total,), "float16"),
+    ):
+        T.func_attr(
+            {
+                "tirx.is_scheduled": True,
+                "tirx.noalias": True,
+                "op_pattern": 8,
+                "vortex.improve.layout_preserving": 1,
+            }
+        )
+        for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
+            for tx in T.thread_binding(128, thread="threadIdx.x"):
+                index = bx * 128 + tx
+                if index < total:
+                    output[index] = T.float16(0)
+        for bx in T.thread_binding((m * n + 127) // 128, thread="blockIdx.x"):
+            for tx in T.thread_binding(128, thread="threadIdx.x"):
+                index = bx * 128 + tx
+                if index < m * n:
+                    global_m = index // n
+                    global_n = index % n
+                    mt = global_m // dma_mt
+                    local_m = global_m % dma_mt
+                    cur_m = T.min(dma_mt, m - mt * dma_mt)
+                    slot_m = (cur_m + channels - 1) // channels * channels
+                    nt = global_n // mxu_nt
+                    inner_n = global_n % mxu_nt
+                    physical_index = (
+                        mt * dma_mt * n_exec
+                        + nt * slot_m * mxu_nt
+                        + local_m * mxu_nt
+                        + inner_n
+                    )
+                    if len(rhs_shape) == 1:
+                        output[physical_index] = lhs[physical_index] + rhs[global_n]
+                    elif rhs_shape[0] == 1 and rhs_shape[1] == n:
+                        output[physical_index] = lhs[physical_index] + rhs[0, global_n]
+                    elif rhs_shape[0] == m and rhs_shape[1] == 1:
+                        output[physical_index] = lhs[physical_index] + rhs[global_m, 0]
+                    else:
+                        output[physical_index] = (
+                            lhs[physical_index] + rhs[global_m, global_n]
+                        )
+
+    return gemm_tiled_add_row_major
 
 
 def _static_tensor_shape(expr, dtype=None):
@@ -648,14 +776,26 @@ def _prim_value(expr):
 class _W4A16Lowerer(relax.PyExprMutator):
     """Lower logical W4A16 calls after target selection."""
 
-    def __init__(self, mod, target):
+    def __init__(
+        self,
+        mod,
+        target,
+        enable_layout_fusion=True,
+        lower_w4a16=True,
+        lower_auxiliary_ops=True,
+    ):
         super().__init__(mod)
         self.target = target
         self.mode = str(target.attrs.get("vortex_gemm_mode", "none"))
         self.improve_profile = ImproveProfile.from_target(target)
+        self.enable_layout_fusion = enable_layout_fusion
+        self.lower_w4a16 = lower_w4a16
+        self.lower_auxiliary_ops = lower_auxiliary_ops
         self.implementations = {}
         self.original_bindings = {}
-        self.tiled_w4a16_outputs = {}
+        self.tiled_outputs = {}
+        self.prepacked_descriptors = []
+        self.lowered_w4a16 = 0
         for _, function in mod.functions_items():
             if not isinstance(function, relax.Function) or not isinstance(
                 function.body, relax.SeqExpr
@@ -666,20 +806,128 @@ class _W4A16Lowerer(relax.PyExprMutator):
                     if isinstance(binding, relax.VarBinding):
                         self.original_bindings[binding.var] = binding.value
 
+    def _lookup_tiled(self, expr):
+        if isinstance(expr, relax.Var):
+            expr = self.original_bindings.get(expr)
+        return self.tiled_outputs.get(expr)
+
+    def _constant_data(self, expr):
+        visited = set()
+        while isinstance(expr, relax.Var) and expr not in visited:
+            visited.add(expr)
+            expr = self.original_bindings.get(expr)
+        if isinstance(expr, relax.Constant):
+            return expr.data.numpy()
+        return None
+
+    @staticmethod
+    def _plan_key(plan):
+        return (
+            plan.logical_m,
+            plan.logical_n,
+            plan.logical_k,
+            plan.execution_n,
+            plan.execution_k,
+            plan.qblock,
+            plan.weight_transpose,
+            plan.quant_direction,
+            plan.profile.layout_abi_version,
+        )
+
+    def _emit_detile(self, tiled, plan, out_ty):
+        key = ("improve", "detile", self._plan_key(plan))
+        if key not in self.implementations:
+            self.implementations[key] = self.builder_.add_func(
+                _make_gemm_c_detile(plan), "vortex_gemm_c_detile"
+            )
+        return relax.call_tir(self.implementations[key], [tiled], out_ty=out_ty)
+
+    def _lower_tiled_vector(self, original_call, call, symbol, tiled_args):
+        """Keep supported vector operators inside a compatible IMPROVE region."""
+
+        if symbol == "relax.nn.relu" and tiled_args[0] is not None:
+            tiled_input, descriptor, plan = tiled_args[0]
+            key = ("improve", "relu", self._plan_key(plan))
+            if key not in self.implementations:
+                self.implementations[key] = self.builder_.add_func(
+                    _make_gemm_tiled_relu(plan), "vortex_gemm_tiled_relu"
+                )
+            tiled_output = self.builder_.emit(
+                relax.call_tir(
+                    self.implementations[key],
+                    [tiled_input],
+                    out_ty=relax.TensorType((plan.c_elements,), "float16"),
+                ),
+                name_hint="gemm_tiled_relu",
+            )
+            self.tiled_outputs[original_call] = (tiled_output, descriptor, plan)
+            return self._emit_detile(tiled_output, plan, call.ty)
+
+        if symbol != "relax.add" or not any(value is not None for value in tiled_args):
+            return call
+        primary_index = 0 if tiled_args[0] is not None else 1
+        tiled_input, descriptor, plan = tiled_args[primary_index]
+        other_index = 1 - primary_index
+        other_tiled = tiled_args[other_index]
+        if other_tiled is not None:
+            if not descriptor.compatible_gemm_input(other_tiled[1]):
+                return call
+            rhs = other_tiled[0]
+            rhs_shape = None
+        else:
+            rhs = call.args[other_index]
+            rhs_shape = _static_tensor_shape(rhs, "float16")
+            valid_shapes = {
+                (plan.logical_n,),
+                (1, plan.logical_n),
+                (plan.logical_m, 1),
+                (plan.logical_m, plan.logical_n),
+            }
+            if rhs_shape not in valid_shapes:
+                return call
+        key = ("improve", "add", self._plan_key(plan), rhs_shape)
+        if key not in self.implementations:
+            self.implementations[key] = self.builder_.add_func(
+                _make_gemm_tiled_add(plan, rhs_shape), "vortex_gemm_tiled_add"
+            )
+        tiled_output = self.builder_.emit(
+            relax.call_tir(
+                self.implementations[key],
+                [tiled_input, rhs],
+                out_ty=relax.TensorType((plan.c_elements,), "float16"),
+            ),
+            name_hint="gemm_tiled_add",
+        )
+        self.tiled_outputs[original_call] = (tiled_output, descriptor, plan)
+        return self._emit_detile(tiled_output, plan, call.ty)
+
     def visit_call_(self, call):
         original_call = call
+        original_tiled_args = []
+        original_symbol = None
+        if (
+            self.mode == "improve"
+            and self.enable_layout_fusion
+            and isinstance(call.op, tvm.ir.Op)
+        ):
+            original_symbol = call.op.name
+            if original_symbol in ("relax.nn.relu", "relax.add"):
+                original_tiled_args = [self._lookup_tiled(arg) for arg in call.args]
         fused_tiled_lhs = None
         if (
             self.mode == "improve"
+            and self.enable_layout_fusion
             and isinstance(call.op, tvm.ir.Op)
             and call.op.name == "relax.call_pure_packed"
             and isinstance(call.args[0], relax.ExternFunc)
             and call.args[0].global_symbol == "relax.vortex.mm_w4a16"
-            and isinstance(call.args[1], relax.Var)
         ):
-            producer = self.original_bindings.get(call.args[1])
-            fused_tiled_lhs = self.tiled_w4a16_outputs.get(producer)
+            fused_tiled_lhs = self._lookup_tiled(call.args[1])
         call = super().visit_call_(call)
+        if original_tiled_args:
+            return self._lower_tiled_vector(
+                original_call, call, original_symbol, original_tiled_args
+            )
         if (
             not isinstance(call.op, tvm.ir.Op)
             or call.op.name != "relax.call_pure_packed"
@@ -688,6 +936,8 @@ class _W4A16Lowerer(relax.PyExprMutator):
             return call
         symbol = call.args[0].global_symbol
         if symbol == "relax.vortex.quantize_int4":
+            if not self.lower_auxiliary_ops:
+                return call
             source = call.args[1]
             source_shape = _static_tensor_shape(source, "float16")
             quant_axis = int(_prim_value(call.args[2]))
@@ -733,6 +983,8 @@ class _W4A16Lowerer(relax.PyExprMutator):
             )
 
         if symbol == "relax.vortex.dequantize_int4":
+            if not self.lower_auxiliary_ops:
+                return call
             packed, scale, zero_point = call.args[1:4]
             logical_shape = call.args[4]
             if not isinstance(logical_shape, relax.ShapeExpr):
@@ -780,6 +1032,8 @@ class _W4A16Lowerer(relax.PyExprMutator):
             )
 
         if symbol == "relax.vortex.kv_cache_update":
+            if not self.lower_auxiliary_ops:
+                return call
             caches = call.args[1:4]
             updates = call.args[4:7]
             position = int(_prim_value(call.args[7]))
@@ -829,6 +1083,8 @@ class _W4A16Lowerer(relax.PyExprMutator):
             )
 
         if symbol != "relax.vortex.mm_w4a16":
+            return call
+        if not self.lower_w4a16:
             return call
         if self.mode not in ("naive", "improve"):
             return call
@@ -905,6 +1161,7 @@ class _W4A16Lowerer(relax.PyExprMutator):
             quant_axis,
             transpose_rhs,
         )
+        self.lowered_w4a16 += 1
         if self.mode == "naive":
             backend_key = ("naive", key)
             if backend_key not in self.implementations:
@@ -941,30 +1198,6 @@ class _W4A16Lowerer(relax.PyExprMutator):
         tiled_c_elements = plan.c_elements
 
         layout_specs = {
-            "w": (
-                _make_gemm_w_tiled(rhs_shape, plan),
-                (
-                    "vortex_gemm_w_tiled_transposed"
-                    if transpose_rhs
-                    else "vortex_gemm_w_tiled"
-                ),
-            ),
-            "scale": (
-                _make_gemm_qparam_tiled(
-                    scale_shape,
-                    "float16",
-                    plan,
-                ),
-                "vortex_gemm_scale_tiled",
-            ),
-            "zero": (
-                _make_gemm_qparam_tiled(
-                    zero_point_shape,
-                    "int16",
-                    plan,
-                ),
-                "vortex_gemm_zero_point_tiled",
-            ),
             "gemm": (
                 _make_w4a16_improve(
                     tiled_a_elements,
@@ -983,8 +1216,29 @@ class _W4A16Lowerer(relax.PyExprMutator):
                 ),
                 "vortex_mm_w4a16_improve",
             ),
-            "detile": (_make_gemm_c_detile(plan), "vortex_gemm_c_detile"),
         }
+        packed_constant = self._constant_data(original_call.args[2])
+        scale_constant = self._constant_data(original_call.args[3])
+        zero_constant = self._constant_data(original_call.args[4])
+        if packed_constant is None:
+            layout_specs["w"] = (
+                _make_gemm_w_tiled(rhs_shape, plan),
+                (
+                    "vortex_gemm_w_tiled_transposed"
+                    if transpose_rhs
+                    else "vortex_gemm_w_tiled"
+                ),
+            )
+        if scale_constant is None:
+            layout_specs["scale"] = (
+                _make_gemm_qparam_tiled(scale_shape, "float16", plan),
+                "vortex_gemm_scale_tiled",
+            )
+        if zero_constant is None:
+            layout_specs["zero"] = (
+                _make_gemm_qparam_tiled(zero_point_shape, "int16", plan),
+                "vortex_gemm_zero_point_tiled",
+            )
         if fused_tiled_lhs is None:
             layout_specs["a"] = (
                 _make_gemm_a_tiled(plan),
@@ -1014,30 +1268,60 @@ class _W4A16Lowerer(relax.PyExprMutator):
             )
         else:
             tiled_a = fused_tiled_lhs[0]
-        tiled_w = self.builder_.emit(
-            relax.call_tir(
-                globals_by_name["w"],
-                [packed],
-                out_ty=relax.TensorType((tiled_w_bytes,), "uint8"),
-            ),
-            name_hint="gemm_w_tiled",
-        )
-        tiled_scale = self.builder_.emit(
-            relax.call_tir(
-                globals_by_name["scale"],
-                [scale],
-                out_ty=relax.TensorType((tiled_qparam_elements,), "float16"),
-            ),
-            name_hint="gemm_scale_tiled",
-        )
-        tiled_zero = self.builder_.emit(
-            relax.call_tir(
-                globals_by_name["zero"],
-                [zero_point],
-                out_ty=relax.TensorType((tiled_qparam_elements,), "int16"),
-            ),
-            name_hint="gemm_zero_point_tiled",
-        )
+        if packed_constant is None:
+            tiled_w = self.builder_.emit(
+                relax.call_tir(
+                    globals_by_name["w"],
+                    [packed],
+                    out_ty=relax.TensorType((tiled_w_bytes,), "uint8"),
+                ),
+                name_hint="gemm_w_tiled",
+            )
+        else:
+            tiled_w = relax.const(prepack_improve_weight(packed_constant, plan))
+        if scale_constant is None:
+            tiled_scale = self.builder_.emit(
+                relax.call_tir(
+                    globals_by_name["scale"],
+                    [scale],
+                    out_ty=relax.TensorType((tiled_qparam_elements,), "float16"),
+                ),
+                name_hint="gemm_scale_tiled",
+            )
+        else:
+            tiled_scale = relax.const(
+                prepack_improve_qparam(scale_constant, plan, "float16")
+            )
+        if zero_constant is None:
+            tiled_zero = self.builder_.emit(
+                relax.call_tir(
+                    globals_by_name["zero"],
+                    [zero_point],
+                    out_ty=relax.TensorType((tiled_qparam_elements,), "int16"),
+                ),
+                name_hint="gemm_zero_point_tiled",
+            )
+        else:
+            tiled_zero = relax.const(
+                prepack_improve_qparam(zero_constant, plan, "int16")
+            )
+        if any(
+            value is not None
+            for value in (packed_constant, scale_constant, zero_constant)
+        ):
+            self.prepacked_descriptors.append(
+                "M={}:N={}:K={}:Nexec={}:Kexec={}:QBLK={}:WTRANS={}:QDIR={}:ABI={}".format(
+                    m,
+                    n,
+                    k,
+                    plan.execution_n,
+                    plan.execution_k,
+                    group_size,
+                    int(transpose_rhs),
+                    quant_direction,
+                    plan.profile.layout_abi_version,
+                )
+            )
         tiled_output = self.builder_.emit(
             relax.call_tir(
                 globals_by_name["gemm"],
@@ -1046,25 +1330,58 @@ class _W4A16Lowerer(relax.PyExprMutator):
             ),
             name_hint="gemm_c_tiled",
         )
-        detiled_output = relax.call_tir(
-            globals_by_name["detile"],
-            [tiled_output],
-            out_ty=call.ty,
+        detiled_output = self._emit_detile(tiled_output, plan, call.ty)
+        self.tiled_outputs[original_call] = (
+            tiled_output,
+            plan.c_descriptor,
+            plan,
         )
-        self.tiled_w4a16_outputs[original_call] = (tiled_output, plan.c_descriptor)
         return detiled_output
 
 
-def _w4a16_lowering_pass(target):
+def _w4a16_lowering_pass(
+    target,
+    enable_layout_fusion=True,
+    lower_w4a16=True,
+    lower_auxiliary_ops=True,
+):
     @tvm.transform.module_pass(opt_level=0, name="VortexLowerW4A16")
     def lower(mod, _ctx):
-        lowerer = _W4A16Lowerer(mod, target)
+        lowerer = _W4A16Lowerer(
+            mod,
+            target,
+            enable_layout_fusion,
+            lower_w4a16,
+            lower_auxiliary_ops,
+        )
         for global_var, func in list(mod.functions_items()):
             if isinstance(func, relax.Function):
                 lowerer.builder_.update_func(global_var, lowerer.visit_expr(func))
-        return lowerer.builder_.get()
+        lowered = lowerer.builder_.get()
+        if lowerer.lowered_w4a16:
+            lowered = lowered.with_attr(
+                "vortex.w4a16.lowered", lowerer.lowered_w4a16
+            )
+        if lowerer.prepacked_descriptors:
+            lowered = lowered.with_attr(
+                "vortex.improve.prepacked_constants",
+                tvm.runtime.convert(tuple(lowerer.prepacked_descriptors)),
+            )
+        return lowered
 
     return lower
+
+
+def _rewrite_dataflow_reshape_before_vortex():
+    """Run reshape analysis only before scheduled Vortex PrimFuncs exist."""
+
+    @tvm.transform.module_pass(opt_level=0, name="VortexRewriteDataflowReshape")
+    def rewrite(mod, _ctx):
+        if mod.attrs and mod.attrs.get("vortex.w4a16.lowered", 0):
+            return mod
+        return relax.transform.RewriteDataflowReshape()(mod)
+
+    return rewrite
 
 
 def _static_rank2_fp16_shape(expr):
@@ -1150,7 +1467,18 @@ def legalize_passes(target: tvm.target.Target):  # pylint: disable=unused-argume
     """Legalize Relax and schedule kernels for Vortex."""
     from tvm.s_tir import dlight as dl  # pylint: disable=import-outside-toplevel
 
+    improve_mode = str(target.attrs.get("vortex_gemm_mode", "none")) == "improve"
     return [
+        # Rewrite logical view-only dataflow before introducing pre-scheduled
+        # IMPROVE PrimFuncs; the generic analyzer expects unscheduled bodies.
+        _rewrite_dataflow_reshape_before_vortex(),
+        # Preserve descriptor-compatible IMPROVE regions while logical vector
+        # graph structure and immutable constants are still visible.
+        _w4a16_lowering_pass(
+            target,
+            lower_w4a16=improve_mode,
+            lower_auxiliary_ops=False,
+        ),
         _tcu_tensorize_pass(target),
         relax.transform.LegalizeOps(),
         relax.transform.AnnotateTIROpPattern(),
@@ -1167,12 +1495,13 @@ def legalize_passes(target: tvm.target.Target):  # pylint: disable=unused-argume
 
 def dataflow_lower_passes(target: tvm.target.Target):
     """Return Relax dataflow lowering passes for Vortex."""
-    passes = gpu_generic.dataflow_lower_passes(target)
-    # Preserve logical W4A16 calls through the generic reshape/dataflow
-    # rewrites, then materialize their pre-scheduled launch chain before
-    # RemovePurityChecking changes call_pure_packed into call_packed and before
-    # CallTIRRewrite lowers calls into the VM/runtime calling convention.
-    return [*passes[:2], _w4a16_lowering_pass(target), *passes[2:]]
+    passes = gpu_generic.dataflow_lower_passes(target)[1:]
+    improve_mode = str(target.attrs.get("vortex_gemm_mode", "none")) == "improve"
+    return [
+        passes[0],
+        _w4a16_lowering_pass(target, lower_w4a16=not improve_mode),
+        *passes[1:],
+    ]
 
 
 def finalize_passes(target: tvm.target.Target):
