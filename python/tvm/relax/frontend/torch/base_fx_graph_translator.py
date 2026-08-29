@@ -2641,6 +2641,9 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
     def _new_ones(self, node: fx.Node) -> relax.Var:
         args = self.retrieve_args(node)
         self_var = args[0]
+        dtype = self_var.ty.dtype.dtype
+        if node.kwargs.get("dtype") is not None:
+            dtype = self._convert_data_type(node.kwargs["dtype"], self.env)
         size = args[1] if isinstance(args[1], list | tuple) else args[1:]
         if not isinstance(size, list | tuple):
             size = (size,)
@@ -2648,14 +2651,17 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         return self.block_builder.emit(
             relax.op.full(
                 size,
-                relax.const(1, self_var.ty.dtype.dtype),
-                self_var.ty.dtype.dtype,
+                relax.const(1, dtype),
+                dtype,
             )
         )
 
     def _new_zeros(self, node: fx.Node) -> relax.Var:
         args = self.retrieve_args(node)
         input_tensor = args[0]
+        dtype = input_tensor.ty.dtype.dtype
+        if node.kwargs.get("dtype") is not None:
+            dtype = self._convert_data_type(node.kwargs["dtype"], self.env)
         size = (
             args[1]
             if isinstance(args[1], list | tuple)
@@ -2667,8 +2673,8 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         return self.block_builder.emit(
             relax.op.full(
                 size,
-                relax.const(0, input_tensor.ty.dtype.dtype),
-                input_tensor.ty.dtype.dtype,
+                relax.const(0, dtype),
+                dtype,
             )
         )
 

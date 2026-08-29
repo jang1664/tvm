@@ -52,7 +52,7 @@ def _full(is_like: bool, fill_value: float | None, primfunc_name: str) -> Legali
         return bb.call_te(
             topi.full,
             output_shape,
-            call.ty.dtype,
+            call.ty.dtype.dtype,
             _fill_value,
             primfunc_name_hint=primfunc_name,
         )

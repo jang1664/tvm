@@ -88,6 +88,19 @@ def test_vecadd_source_and_compile_callback():
     assert "reinterpret_cast<float*>(static_cast<uintptr_t>(args[2]))" in source
     assert "launch->abi_version != VX_TVM_ABI_VERSION" in source
     assert "launch->num_args != 3u" in source
+
+
+def test_infinity_uses_compiler_builtin():
+    @T.prim_func
+    def write_negative_infinity(output: T.Buffer((1,), "float32")):
+        T.func_attr({"global_symbol": "write_negative_infinity"})
+        for bx in T.thread_binding(1, thread="blockIdx.x"):
+            for tx in T.thread_binding(1, thread="threadIdx.x"):
+                output[0] = T.float32(float("-inf"))
+
+    source = _build_source_with_stub_compiler(write_negative_infinity)
+    assert "(-__builtin_inff())" in source
+    assert "-inff" not in source
     assert "switch (launch->kernel_id)" in source
     assert "case 0u:" in source
     assert "csr_read(VX_CSR_MSCRATCH)" in source

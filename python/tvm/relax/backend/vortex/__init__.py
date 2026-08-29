@@ -24,3 +24,9 @@ from .pipeline import (
     legalize_passes,
     library_dispatch_passes,
 )
+from .parameter_archive import (
+    C4ParameterArchive,
+    C4WeightSpec,
+    llama3_c4_weight_specs,
+    prepare_c4_parameter_archive,
+)

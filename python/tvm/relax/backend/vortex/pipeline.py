@@ -16,6 +16,7 @@
 # under the License.
 """The Relax Vortex backend compilation pipeline."""
 
+import itertools
 import math
 
 import tvm
@@ -182,8 +183,34 @@ def _make_dequantize_int4_row_major(shape, group_size):
     return dequantize_int4_row_major
 
 
+def _make_batched_output_barrier(shape):
+    """Create an opaque copy that keeps a large batched concat out of its consumer."""
+
+    matrices, rows, columns = shape
+    elements = matrices * rows * columns
+
+    @T.prim_func(private=True)
+    def batched_output_barrier(
+        source: T.Buffer(shape, "float16"),
+        output: T.Buffer(shape, "float16"),
+    ):
+        T.func_attr(
+            {"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8}
+        )
+        for bx in T.thread_binding((elements + 127) // 128, thread="blockIdx.x"):
+            for tx in T.thread_binding(128, thread="threadIdx.x"):
+                index = bx * 128 + tx
+                if index < elements:
+                    matrix = index // (rows * columns)
+                    row = index // columns % rows
+                    column = index % columns
+                    output[matrix, row, column] = source[matrix, row, column]
+
+    return batched_output_barrier
+
+
 def _make_kv_cache_update(cache_shapes, update_shapes, position):
-    """Create a functional rank-3 cache update for the coupled INT4 tuple."""
+    """Create a functional rank-2/3/4 cache update for the coupled INT4 tuple."""
 
     payload_shape, scale_shape, zero_shape = cache_shapes
     payload_update_shape, scale_update_shape, zero_update_shape = update_shapes
@@ -240,6 +267,54 @@ def _make_kv_cache_update(cache_shapes, update_shapes, position):
 
         return kv_cache_update_rank2
 
+    if len(payload_shape) == 3:
+
+        @T.prim_func(private=True)
+        def kv_cache_update_rank3(
+            cache_payload: T.Buffer(payload_shape, "uint8"),
+            cache_scale: T.Buffer(scale_shape, "float16"),
+            cache_zero: T.Buffer(zero_shape, "int16"),
+            payload: T.Buffer(payload_update_shape, "uint8"),
+            scale: T.Buffer(scale_update_shape, "float16"),
+            zero: T.Buffer(zero_update_shape, "int16"),
+            output_payload: T.Buffer(payload_shape, "uint8"),
+            output_scale: T.Buffer(scale_shape, "float16"),
+            output_zero: T.Buffer(zero_shape, "int16"),
+        ):
+            T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
+            for bx in T.thread_binding((max_elements + 127) // 128, thread="blockIdx.x"):
+                for tx in T.thread_binding(128, thread="threadIdx.x"):
+                    index = bx * 128 + tx
+                    if index < payload_shape[0] * payload_shape[1] * payload_shape[2]:
+                        batch = index // (payload_shape[1] * payload_shape[2])
+                        sequence = index // payload_shape[2] % payload_shape[1]
+                        column = index % payload_shape[2]
+                        output_payload[batch, sequence, column] = T.Select(
+                            sequence == position,
+                            payload[batch, 0, column],
+                            cache_payload[batch, sequence, column],
+                        )
+                    if index < scale_shape[0] * scale_shape[1] * scale_shape[2]:
+                        batch = index // (scale_shape[1] * scale_shape[2])
+                        sequence = index // scale_shape[2] % scale_shape[1]
+                        column = index % scale_shape[2]
+                        output_scale[batch, sequence, column] = T.Select(
+                            sequence == position,
+                            scale[batch, 0, column],
+                            cache_scale[batch, sequence, column],
+                        )
+                    if index < zero_shape[0] * zero_shape[1] * zero_shape[2]:
+                        batch = index // (zero_shape[1] * zero_shape[2])
+                        sequence = index // zero_shape[2] % zero_shape[1]
+                        column = index % zero_shape[2]
+                        output_zero[batch, sequence, column] = T.Select(
+                            sequence == position,
+                            zero[batch, 0, column],
+                            cache_zero[batch, sequence, column],
+                        )
+
+        return kv_cache_update_rank3
+
     @T.prim_func(private=True)
     def kv_cache_update(
         cache_payload: T.Buffer(payload_shape, "uint8"),
@@ -256,35 +331,172 @@ def _make_kv_cache_update(cache_shapes, update_shapes, position):
         for bx in T.thread_binding((max_elements + 127) // 128, thread="blockIdx.x"):
             for tx in T.thread_binding(128, thread="threadIdx.x"):
                 index = bx * 128 + tx
-                if index < payload_shape[0] * payload_shape[1] * payload_shape[2]:
-                    batch = index // (payload_shape[1] * payload_shape[2])
-                    sequence = index // payload_shape[2] % payload_shape[1]
-                    column = index % payload_shape[2]
-                    output_payload[batch, sequence, column] = T.Select(
+                if index < math.prod(payload_shape):
+                    batch = index // (payload_shape[1] * payload_shape[2] * payload_shape[3])
+                    head = index // (payload_shape[2] * payload_shape[3]) % payload_shape[1]
+                    sequence = index // payload_shape[3] % payload_shape[2]
+                    column = index % payload_shape[3]
+                    output_payload[batch, head, sequence, column] = T.Select(
                         sequence == position,
-                        payload[batch, 0, column],
-                        cache_payload[batch, sequence, column],
+                        payload[batch, head, 0, column],
+                        cache_payload[batch, head, sequence, column],
                     )
-                if index < scale_shape[0] * scale_shape[1] * scale_shape[2]:
-                    batch = index // (scale_shape[1] * scale_shape[2])
-                    sequence = index // scale_shape[2] % scale_shape[1]
-                    column = index % scale_shape[2]
-                    output_scale[batch, sequence, column] = T.Select(
+                if index < math.prod(scale_shape):
+                    batch = index // (scale_shape[1] * scale_shape[2] * scale_shape[3])
+                    head = index // (scale_shape[2] * scale_shape[3]) % scale_shape[1]
+                    sequence = index // scale_shape[3] % scale_shape[2]
+                    column = index % scale_shape[3]
+                    output_scale[batch, head, sequence, column] = T.Select(
                         sequence == position,
-                        scale[batch, 0, column],
-                        cache_scale[batch, sequence, column],
+                        scale[batch, head, 0, column],
+                        cache_scale[batch, head, sequence, column],
                     )
-                if index < zero_shape[0] * zero_shape[1] * zero_shape[2]:
-                    batch = index // (zero_shape[1] * zero_shape[2])
-                    sequence = index // zero_shape[2] % zero_shape[1]
-                    column = index % zero_shape[2]
-                    output_zero[batch, sequence, column] = T.Select(
+                if index < math.prod(zero_shape):
+                    batch = index // (zero_shape[1] * zero_shape[2] * zero_shape[3])
+                    head = index // (zero_shape[2] * zero_shape[3]) % zero_shape[1]
+                    sequence = index // zero_shape[3] % zero_shape[2]
+                    column = index % zero_shape[3]
+                    output_zero[batch, head, sequence, column] = T.Select(
                         sequence == position,
-                        zero[batch, 0, column],
-                        cache_zero[batch, sequence, column],
+                        zero[batch, head, 0, column],
+                        cache_zero[batch, head, sequence, column],
                     )
 
     return kv_cache_update
+
+
+def _make_kv_cache_update_dynamic(cache_shapes, update_shapes):
+    """Create a bounds-safe functional rank-4 cache update at a runtime position."""
+
+    payload_shape, scale_shape, zero_shape = cache_shapes
+    payload_update_shape, scale_update_shape, zero_update_shape = update_shapes
+    max_elements = max(
+        math.prod(payload_shape),
+        math.prod(scale_shape),
+        math.prod(zero_shape),
+    )
+
+    @T.prim_func(private=True)
+    def kv_cache_update_dynamic_rank4(
+        cache_payload: T.Buffer(payload_shape, "uint8"),
+        cache_scale: T.Buffer(scale_shape, "float16"),
+        cache_zero: T.Buffer(zero_shape, "int16"),
+        payload: T.Buffer(payload_update_shape, "uint8"),
+        scale: T.Buffer(scale_update_shape, "float16"),
+        zero: T.Buffer(zero_update_shape, "int16"),
+        position: T.Buffer((), "int64"),
+        output_payload: T.Buffer(payload_shape, "uint8"),
+        output_scale: T.Buffer(scale_shape, "float16"),
+        output_zero: T.Buffer(zero_shape, "int16"),
+    ):
+        T.func_attr({"tirx.is_scheduled": True})
+        for bx in T.thread_binding((max_elements + 127) // 128, thread="blockIdx.x"):
+            for tx in T.thread_binding(128, thread="threadIdx.x"):
+                index = bx * 128 + tx
+                if index < math.prod(payload_shape):
+                    batch = index // (payload_shape[1] * payload_shape[2] * payload_shape[3])
+                    head = index // (payload_shape[2] * payload_shape[3]) % payload_shape[1]
+                    sequence = index // payload_shape[3] % payload_shape[2]
+                    column = index % payload_shape[3]
+                    output_payload[batch, head, sequence, column] = T.Select(
+                        T.Cast("int64", sequence) == position[()],
+                        payload[batch, head, 0, column],
+                        cache_payload[batch, head, sequence, column],
+                    )
+                if index < math.prod(scale_shape):
+                    batch = index // (scale_shape[1] * scale_shape[2] * scale_shape[3])
+                    head = index // (scale_shape[2] * scale_shape[3]) % scale_shape[1]
+                    sequence = index // scale_shape[3] % scale_shape[2]
+                    column = index % scale_shape[3]
+                    output_scale[batch, head, sequence, column] = T.Select(
+                        T.Cast("int64", sequence) == position[()],
+                        scale[batch, head, 0, column],
+                        cache_scale[batch, head, sequence, column],
+                    )
+                if index < math.prod(zero_shape):
+                    batch = index // (zero_shape[1] * zero_shape[2] * zero_shape[3])
+                    head = index // (zero_shape[2] * zero_shape[3]) % zero_shape[1]
+                    sequence = index // zero_shape[3] % zero_shape[2]
+                    column = index % zero_shape[3]
+                    output_zero[batch, head, sequence, column] = T.Select(
+                        T.Cast("int64", sequence) == position[()],
+                        zero[batch, head, 0, column],
+                        cache_zero[batch, head, sequence, column],
+                    )
+
+    return kv_cache_update_dynamic_rank4
+
+
+def _make_kv_cache_update_dynamic_inplace(cache_shapes, update_shapes):
+    """Create a checked rank-4 append that mutates uniquely owned cache buffers."""
+
+    payload_shape, scale_shape, zero_shape = cache_shapes
+    payload_update_shape, scale_update_shape, zero_update_shape = update_shapes
+    capacity = payload_shape[-2]
+    max_elements = max(
+        math.prod(payload_update_shape),
+        math.prod(scale_update_shape),
+        math.prod(zero_update_shape),
+    )
+
+    @T.prim_func(private=True)
+    def kv_cache_update_dynamic_inplace_rank4(
+        cache_payload: T.Buffer(payload_shape, "uint8"),
+        cache_scale: T.Buffer(scale_shape, "float16"),
+        cache_zero: T.Buffer(zero_shape, "int16"),
+        payload: T.Buffer(payload_update_shape, "uint8"),
+        scale: T.Buffer(scale_update_shape, "float16"),
+        zero: T.Buffer(zero_update_shape, "int16"),
+        position: T.Buffer((), "int64"),
+    ):
+        T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
+        for bx in T.thread_binding((max_elements + 127) // 128, thread="blockIdx.x"):
+            for tx in T.thread_binding(128, thread="threadIdx.x"):
+                index = bx * 128 + tx
+                valid_position = T.And(
+                    T.int64(0) <= position[()], position[()] < T.int64(capacity)
+                )
+                if index < math.prod(payload_update_shape) and valid_position:
+                    batch = index // (
+                        payload_update_shape[1]
+                        * payload_update_shape[2]
+                        * payload_update_shape[3]
+                    )
+                    head = index // (
+                        payload_update_shape[2] * payload_update_shape[3]
+                    ) % payload_update_shape[1]
+                    column = index % payload_update_shape[3]
+                    cache_payload[batch, head, position[()], column] = payload[
+                        batch, head, 0, column
+                    ]
+                if index < math.prod(scale_update_shape) and valid_position:
+                    batch = index // (
+                        scale_update_shape[1]
+                        * scale_update_shape[2]
+                        * scale_update_shape[3]
+                    )
+                    head = index // (
+                        scale_update_shape[2] * scale_update_shape[3]
+                    ) % scale_update_shape[1]
+                    column = index % scale_update_shape[3]
+                    cache_scale[batch, head, position[()], column] = scale[
+                        batch, head, 0, column
+                    ]
+                if index < math.prod(zero_update_shape) and valid_position:
+                    batch = index // (
+                        zero_update_shape[1]
+                        * zero_update_shape[2]
+                        * zero_update_shape[3]
+                    )
+                    head = index // (
+                        zero_update_shape[2] * zero_update_shape[3]
+                    ) % zero_update_shape[1]
+                    column = index % zero_update_shape[3]
+                    cache_zero[batch, head, position[()], column] = zero[
+                        batch, head, 0, column
+                    ]
+
+    return kv_cache_update_dynamic_inplace_rank4
 
 
 def _make_fp16_tcu_matmul(m: int, n: int, k: int):
@@ -783,6 +995,7 @@ class _W4A16Lowerer(relax.PyExprMutator):
         enable_layout_fusion=True,
         lower_w4a16=True,
         lower_auxiliary_ops=True,
+        inplace_kv_cache=False,
     ):
         super().__init__(mod)
         self.target = target
@@ -791,11 +1004,15 @@ class _W4A16Lowerer(relax.PyExprMutator):
         self.enable_layout_fusion = enable_layout_fusion
         self.lower_w4a16 = lower_w4a16
         self.lower_auxiliary_ops = lower_auxiliary_ops
+        self.inplace_kv_cache = inplace_kv_cache
         self.implementations = {}
         self.original_bindings = {}
         self.tiled_outputs = {}
+        self.tiled_inputs = {}
         self.prepacked_descriptors = []
         self.lowered_w4a16 = 0
+        self.external_prepacked_w4a16 = 0
+        self.reused_a_layouts = 0
         for _, function in mod.functions_items():
             if not isinstance(function, relax.Function) or not isinstance(
                 function.body, relax.SeqExpr
@@ -819,6 +1036,153 @@ class _W4A16Lowerer(relax.PyExprMutator):
         if isinstance(expr, relax.Constant):
             return expr.data.numpy()
         return None
+
+    def _layout_source(self, expr):
+        """Look through row-major reshapes when identifying shared GEMM inputs."""
+
+        visited = set()
+        while expr not in visited:
+            visited.add(expr)
+            if isinstance(expr, relax.Var):
+                bound = self.original_bindings.get(expr)
+                if bound is None:
+                    break
+                expr = bound
+                continue
+            if (
+                isinstance(expr, relax.Call)
+                and isinstance(expr.op, tvm.ir.Op)
+                and expr.op.name == "relax.reshape"
+            ):
+                expr = expr.args[0]
+                continue
+            break
+        return expr
+
+    def _lower_batched_w4a16(
+        self,
+        call,
+        lhs_shape,
+        packed_shape,
+        scale_shape,
+        zero_point_shape,
+        output_shape,
+        rhs_shape,
+        quant_axis,
+        pack_axis,
+    ):
+        """Expand a static batched/GQA call into isolated rank-2 ABI submissions."""
+
+        rank = len(lhs_shape)
+        if rank != 5 or any(
+            len(shape) != rank
+            for shape in (
+                packed_shape,
+                scale_shape,
+                zero_point_shape,
+                output_shape,
+                rhs_shape,
+            )
+        ):
+            raise ValueError(
+                "Vortex batched W4A16 currently requires static rank-5 GQA tensors"
+            )
+        batch_shape = output_shape[:-2]
+        for operand_name, operand_shape in (
+            ("lhs", lhs_shape),
+            ("packed", packed_shape),
+            ("scale", scale_shape),
+            ("zero_point", zero_point_shape),
+            ("rhs", rhs_shape),
+        ):
+            for axis, (operand_extent, output_extent) in enumerate(
+                zip(operand_shape[:-2], batch_shape)
+            ):
+                if operand_extent not in (1, output_extent):
+                    raise ValueError(
+                        "Vortex batched W4A16 broadcast mismatch for "
+                        f"{operand_name} axis {axis}: {operand_extent} versus {output_extent}"
+                    )
+        if quant_axis < 0:
+            quant_axis += rank
+        if pack_axis < 0:
+            pack_axis += rank
+        matrix_quant_axis = quant_axis - (rank - 2)
+        matrix_pack_axis = pack_axis - (rank - 2)
+        if matrix_quant_axis not in (0, 1) or matrix_pack_axis not in (0, 1):
+            raise ValueError(
+                "Vortex batched W4A16 quantization and packing axes must be matrix axes"
+            )
+
+        def emit_matrix_slice(expr, shape, batch_index, name_hint):
+            begin = [0 if shape[axis] == 1 else batch_index[axis] for axis in range(3)]
+            sliced = self.builder_.emit(
+                relax.op.strided_slice(
+                    expr,
+                    axes=[0, 1, 2],
+                    begin=begin,
+                    end=[value + 1 for value in begin],
+                    assume_inbound=True,
+                ),
+                name_hint=f"{name_hint}_slice",
+            )
+            return self.builder_.emit(
+                relax.op.reshape(sliced, shape[-2:]),
+                name_hint=f"{name_hint}_matrix",
+            )
+
+        outputs = []
+        for batch_index in itertools.product(*(range(extent) for extent in batch_shape)):
+            lhs = emit_matrix_slice(call.args[1], lhs_shape, batch_index, "batched_lhs")
+            packed = emit_matrix_slice(
+                call.args[2], packed_shape, batch_index, "batched_packed"
+            )
+            scale = emit_matrix_slice(
+                call.args[3], scale_shape, batch_index, "batched_scale"
+            )
+            zero_point = emit_matrix_slice(
+                call.args[4], zero_point_shape, batch_index, "batched_zero_point"
+            )
+            matrix_call = relax.op.call_pure_packed(
+                "relax.vortex.mm_w4a16",
+                lhs,
+                packed,
+                scale,
+                zero_point,
+                relax.ShapeExpr(rhs_shape[-2:]),
+                call.args[6],
+                relax.prim_value(matrix_quant_axis),
+                relax.prim_value(matrix_pack_axis),
+                call.args[9],
+                call.args[10],
+                ty_args=relax.TensorType(output_shape[-2:], "float16"),
+            )
+            lowered = self.visit_call_(matrix_call)
+            outputs.append(
+                self.builder_.emit(
+                    relax.op.reshape(lowered, (1, *output_shape[-2:])),
+                    name_hint="batched_output_matrix",
+                )
+            )
+        concatenated = self.builder_.emit(
+            relax.op.concat(outputs, axis=0), name_hint="batched_output"
+        )
+        barrier_shape = (math.prod(batch_shape), *output_shape[-2:])
+        barrier_key = ("batched_output_barrier", barrier_shape)
+        if barrier_key not in self.implementations:
+            self.implementations[barrier_key] = self.builder_.add_func(
+                _make_batched_output_barrier(barrier_shape),
+                "vortex_batched_output_barrier",
+            )
+        concatenated = self.builder_.emit(
+            relax.call_tir(
+                self.implementations[barrier_key],
+                [concatenated],
+                out_ty=relax.TensorType(barrier_shape, "float16"),
+            ),
+            name_hint="batched_output_barrier",
+        )
+        return relax.op.reshape(concatenated, output_shape)
 
     @staticmethod
     def _plan_key(plan):
@@ -1031,6 +1395,69 @@ class _W4A16Lowerer(relax.PyExprMutator):
                 out_ty=relax.TensorType(shape, "float16"),
             )
 
+        if symbol == "relax.vortex.kv_cache_update_dynamic":
+            if not self.lower_auxiliary_ops:
+                return call
+            caches = call.args[1:4]
+            updates = call.args[4:7]
+            position = call.args[7]
+            capacity = int(_prim_value(call.args[8]))
+            cache_shapes = (
+                _static_tensor_shape(caches[0], "uint8"),
+                _static_tensor_shape(caches[1], "float16"),
+                _static_tensor_shape(caches[2], "int16"),
+            )
+            update_shapes = (
+                _static_tensor_shape(updates[0], "uint8"),
+                _static_tensor_shape(updates[1], "float16"),
+                _static_tensor_shape(updates[2], "int16"),
+            )
+            if any(shape is None or len(shape) != 4 for shape in (*cache_shapes, *update_shapes)):
+                raise ValueError(
+                    "Vortex dynamic kv_cache_update requires static rank-4 cache tensors"
+                )
+            if _static_tensor_shape(position, "int64") != ():
+                raise ValueError(
+                    "Vortex dynamic kv_cache_update position must be a scalar INT64 tensor"
+                )
+            for cache_shape, update_shape in zip(cache_shapes, update_shapes):
+                if (
+                    cache_shape[-2] != capacity
+                    or update_shape[-2] != 1
+                    or cache_shape[:-2] != update_shape[:-2]
+                    or cache_shape[-1] != update_shape[-1]
+                ):
+                    raise ValueError(
+                        "Vortex dynamic kv_cache_update tuple shapes are inconsistent"
+                    )
+            key = (
+                "kv_cache_update_dynamic",
+                cache_shapes,
+                update_shapes,
+                self.inplace_kv_cache,
+            )
+            if key not in self.implementations:
+                make_update = (
+                    _make_kv_cache_update_dynamic_inplace
+                    if self.inplace_kv_cache
+                    else _make_kv_cache_update_dynamic
+                )
+                self.implementations[key] = self.builder_.add_func(
+                    make_update(cache_shapes, update_shapes),
+                    "vortex_kv_cache_update_dynamic",
+                )
+            cache_args = [*caches, *updates, position]
+            if self.inplace_kv_cache:
+                return relax.call_tir_inplace(
+                    self.implementations[key],
+                    cache_args,
+                    inplace_indices=[0, 1, 2],
+                    out_ty=list(call.ty.fields),
+                )
+            return relax.call_tir(
+                self.implementations[key], cache_args, out_ty=list(call.ty.fields)
+            )
+
         if symbol == "relax.vortex.kv_cache_update":
             if not self.lower_auxiliary_ops:
                 return call
@@ -1049,11 +1476,11 @@ class _W4A16Lowerer(relax.PyExprMutator):
                 _static_tensor_shape(updates[2], "int16"),
             )
             if any(
-                shape is None or len(shape) not in (2, 3)
+                shape is None or len(shape) not in (2, 3, 4)
                 for shape in (*cache_shapes, *update_shapes)
             ):
                 raise ValueError(
-                    "Vortex kv_cache_update initially requires static rank-2 or rank-3 tensors"
+                    "Vortex kv_cache_update requires static rank-2, rank-3, or rank-4 tensors"
                 )
             ranks = {len(shape) for shape in (*cache_shapes, *update_shapes)}
             if len(ranks) != 1:
@@ -1082,8 +1509,12 @@ class _W4A16Lowerer(relax.PyExprMutator):
                 out_ty=list(call.ty.fields),
             )
 
-        if symbol != "relax.vortex.mm_w4a16":
+        if symbol not in (
+            "relax.vortex.mm_w4a16",
+            "relax.vortex.mm_w4a16_prepacked",
+        ):
             return call
+        parameters_prepacked = symbol == "relax.vortex.mm_w4a16_prepacked"
         if not self.lower_w4a16:
             return call
         if self.mode not in ("naive", "improve"):
@@ -1112,11 +1543,6 @@ class _W4A16Lowerer(relax.PyExprMutator):
             output_shape,
         ):
             raise ValueError("Vortex naive W4A16 requires static rank-2 tensors")
-        if any(
-            len(shape) != 2
-            for shape in (lhs_shape, packed_shape, scale_shape, output_shape)
-        ):
-            raise ValueError("Vortex naive W4A16 initially supports rank-2 tensors")
         if scale_shape != zero_point_shape:
             raise ValueError(
                 "Vortex W4A16 scale and INT16 zero-point shapes must match"
@@ -1125,6 +1551,34 @@ class _W4A16Lowerer(relax.PyExprMutator):
             raise ValueError(f"unsupported Vortex W4A16 quantization scheme {scheme}")
         if group_size <= 0 or (group_size & (group_size - 1)) != 0:
             raise ValueError("Vortex W4A16 group_size must be a positive power of two")
+        if len(lhs_shape) > 2 and parameters_prepacked:
+            raise ValueError("Vortex prepacked W4A16 currently requires rank-2 lhs")
+        if len(lhs_shape) > 2:
+            return self._lower_batched_w4a16(
+                call,
+                lhs_shape,
+                packed_shape,
+                scale_shape,
+                zero_point_shape,
+                output_shape,
+                rhs_shape,
+                quant_axis,
+                pack_axis,
+            )
+        logical_rank_two = (lhs_shape, output_shape, rhs_shape)
+        if any(len(shape) != 2 for shape in logical_rank_two):
+            raise ValueError("Vortex W4A16 currently supports rank-2 or rank-5 tensors")
+        if parameters_prepacked:
+            if any(
+                len(shape) != 1
+                for shape in (packed_shape, scale_shape, zero_point_shape)
+            ):
+                raise ValueError("Vortex prepacked W4A16 parameters must be flat")
+        elif any(
+            len(shape) != 2
+            for shape in (packed_shape, scale_shape, zero_point_shape)
+        ):
+            raise ValueError("Vortex W4A16 currently supports rank-2 or rank-5 tensors")
         if quant_axis < 0:
             quant_axis += 2
         if pack_axis < 0:
@@ -1138,18 +1592,19 @@ class _W4A16Lowerer(relax.PyExprMutator):
         expected_n = rhs_shape[source_n_axis]
         if lhs_shape[1] != expected_k or output_shape != (lhs_shape[0], expected_n):
             raise ValueError("Vortex W4A16 logical matrix shapes are inconsistent")
-        expected_packed = list(rhs_shape)
-        expected_packed[pack_axis] = (expected_packed[pack_axis] + 1) // 2
-        expected_qparam = list(rhs_shape)
-        expected_qparam[quant_axis] = (
-            expected_qparam[quant_axis] + group_size - 1
-        ) // group_size
-        if packed_shape != tuple(expected_packed) or scale_shape != tuple(
-            expected_qparam
-        ):
-            raise ValueError(
-                "Vortex W4A16 packed payload or qparam shape is inconsistent"
-            )
+        if not parameters_prepacked:
+            expected_packed = list(rhs_shape)
+            expected_packed[pack_axis] = (expected_packed[pack_axis] + 1) // 2
+            expected_qparam = list(rhs_shape)
+            expected_qparam[quant_axis] = (
+                expected_qparam[quant_axis] + group_size - 1
+            ) // group_size
+            if packed_shape != tuple(expected_packed) or scale_shape != tuple(
+                expected_qparam
+            ):
+                raise ValueError(
+                    "Vortex W4A16 packed payload or qparam shape is inconsistent"
+                )
 
         key = (
             lhs_shape,
@@ -1192,6 +1647,26 @@ class _W4A16Lowerer(relax.PyExprMutator):
             quant_direction,
             self.improve_profile,
         )
+        if parameters_prepacked and (
+            packed_shape != (plan.weight_bytes,)
+            or scale_shape != (plan.qparam_elements,)
+        ):
+            raise ValueError(
+                "Vortex prepacked W4A16 buffer sizes do not match the physical layout plan"
+            )
+        if parameters_prepacked:
+            self.external_prepacked_w4a16 += 1
+        shared_a_key = None
+        if self.enable_layout_fusion and fused_tiled_lhs is None:
+            shared_a_key = (self._layout_source(original_call.args[1]), m, k)
+            shared_tiled_a = self.tiled_inputs.get(shared_a_key)
+            if shared_tiled_a is not None:
+                if not shared_tiled_a[1].compatible_gemm_input(plan.a_descriptor):
+                    raise ValueError(
+                        "Vortex shared GEMM-A physical layout descriptors are incompatible"
+                    )
+                fused_tiled_lhs = shared_tiled_a
+                self.reused_a_layouts += 1
         tiled_a_elements = plan.a_elements
         tiled_w_bytes = plan.weight_bytes
         tiled_qparam_elements = plan.qparam_elements
@@ -1217,10 +1692,22 @@ class _W4A16Lowerer(relax.PyExprMutator):
                 "vortex_mm_w4a16_improve",
             ),
         }
-        packed_constant = self._constant_data(original_call.args[2])
-        scale_constant = self._constant_data(original_call.args[3])
-        zero_constant = self._constant_data(original_call.args[4])
-        if packed_constant is None:
+        packed_constant = (
+            None
+            if parameters_prepacked
+            else self._constant_data(original_call.args[2])
+        )
+        scale_constant = (
+            None
+            if parameters_prepacked
+            else self._constant_data(original_call.args[3])
+        )
+        zero_constant = (
+            None
+            if parameters_prepacked
+            else self._constant_data(original_call.args[4])
+        )
+        if not parameters_prepacked and packed_constant is None:
             layout_specs["w"] = (
                 _make_gemm_w_tiled(rhs_shape, plan),
                 (
@@ -1229,12 +1716,12 @@ class _W4A16Lowerer(relax.PyExprMutator):
                     else "vortex_gemm_w_tiled"
                 ),
             )
-        if scale_constant is None:
+        if not parameters_prepacked and scale_constant is None:
             layout_specs["scale"] = (
                 _make_gemm_qparam_tiled(scale_shape, "float16", plan),
                 "vortex_gemm_scale_tiled",
             )
-        if zero_constant is None:
+        if not parameters_prepacked and zero_constant is None:
             layout_specs["zero"] = (
                 _make_gemm_qparam_tiled(zero_point_shape, "int16", plan),
                 "vortex_gemm_zero_point_tiled",
@@ -1266,9 +1753,17 @@ class _W4A16Lowerer(relax.PyExprMutator):
                 ),
                 name_hint="gemm_a_tiled",
             )
+            if shared_a_key is not None:
+                self.tiled_inputs[shared_a_key] = (
+                    tiled_a,
+                    plan.a_descriptor,
+                    plan,
+                )
         else:
             tiled_a = fused_tiled_lhs[0]
-        if packed_constant is None:
+        if parameters_prepacked:
+            tiled_w = packed
+        elif packed_constant is None:
             tiled_w = self.builder_.emit(
                 relax.call_tir(
                     globals_by_name["w"],
@@ -1279,7 +1774,9 @@ class _W4A16Lowerer(relax.PyExprMutator):
             )
         else:
             tiled_w = relax.const(prepack_improve_weight(packed_constant, plan))
-        if scale_constant is None:
+        if parameters_prepacked:
+            tiled_scale = scale
+        elif scale_constant is None:
             tiled_scale = self.builder_.emit(
                 relax.call_tir(
                     globals_by_name["scale"],
@@ -1292,7 +1789,9 @@ class _W4A16Lowerer(relax.PyExprMutator):
             tiled_scale = relax.const(
                 prepack_improve_qparam(scale_constant, plan, "float16")
             )
-        if zero_constant is None:
+        if parameters_prepacked:
+            tiled_zero = zero_point
+        elif zero_constant is None:
             tiled_zero = self.builder_.emit(
                 relax.call_tir(
                     globals_by_name["zero"],
@@ -1344,7 +1843,18 @@ def _w4a16_lowering_pass(
     enable_layout_fusion=True,
     lower_w4a16=True,
     lower_auxiliary_ops=True,
+    layout_policy=None,
+    inplace_kv_cache=False,
 ):
+    if layout_policy is not None:
+        if layout_policy not in ("alone", "fused"):
+            raise ValueError(
+                "Vortex C4 layout policy must be 'alone' or 'fused', "
+                f"but got {layout_policy!r}"
+            )
+        enable_layout_fusion = layout_policy == "fused"
+    effective_layout_policy = "fused" if enable_layout_fusion else "alone"
+
     @tvm.transform.module_pass(opt_level=0, name="VortexLowerW4A16")
     def lower(mod, _ctx):
         lowerer = _W4A16Lowerer(
@@ -1353,6 +1863,7 @@ def _w4a16_lowering_pass(
             enable_layout_fusion,
             lower_w4a16,
             lower_auxiliary_ops,
+            inplace_kv_cache,
         )
         for global_var, func in list(mod.functions_items()):
             if isinstance(func, relax.Function):
@@ -1367,6 +1878,20 @@ def _w4a16_lowering_pass(
                 "vortex.improve.prepacked_constants",
                 tvm.runtime.convert(tuple(lowerer.prepacked_descriptors)),
             )
+        if lowerer.reused_a_layouts:
+            lowered = lowered.with_attr(
+                "vortex.improve.reused_a_layouts", lowerer.reused_a_layouts
+            )
+        if lowerer.external_prepacked_w4a16:
+            lowered = lowered.with_attr(
+                "vortex.improve.external_prepacked_w4a16",
+                lowerer.external_prepacked_w4a16,
+            )
+        lowered = lowered.with_attr(
+            "vortex.c4.layout_policy", effective_layout_policy
+        )
+        if inplace_kv_cache:
+            lowered = lowered.with_attr("vortex.kv_cache_update_inplace", 1)
         return lowered
 
     return lower
@@ -1463,7 +1988,9 @@ def library_dispatch_passes(target: tvm.target.Target):
     return gpu_generic.library_dispatch_passes(target)
 
 
-def legalize_passes(target: tvm.target.Target):  # pylint: disable=unused-argument
+def legalize_passes(
+    target: tvm.target.Target, layout_policy=None, inplace_kv_cache=False
+):  # pylint: disable=unused-argument
     """Legalize Relax and schedule kernels for Vortex."""
     from tvm.s_tir import dlight as dl  # pylint: disable=import-outside-toplevel
 
@@ -1478,6 +2005,8 @@ def legalize_passes(target: tvm.target.Target):  # pylint: disable=unused-argume
             target,
             lower_w4a16=improve_mode,
             lower_auxiliary_ops=False,
+            layout_policy=layout_policy,
+            inplace_kv_cache=inplace_kv_cache,
         ),
         _tcu_tensorize_pass(target),
         relax.transform.LegalizeOps(),
@@ -1493,13 +2022,20 @@ def legalize_passes(target: tvm.target.Target):  # pylint: disable=unused-argume
     ]
 
 
-def dataflow_lower_passes(target: tvm.target.Target):
+def dataflow_lower_passes(
+    target: tvm.target.Target, layout_policy=None, inplace_kv_cache=False
+):
     """Return Relax dataflow lowering passes for Vortex."""
     passes = gpu_generic.dataflow_lower_passes(target)[1:]
     improve_mode = str(target.attrs.get("vortex_gemm_mode", "none")) == "improve"
     return [
         passes[0],
-        _w4a16_lowering_pass(target, lower_w4a16=not improve_mode),
+        _w4a16_lowering_pass(
+            target,
+            lower_w4a16=not improve_mode,
+            layout_policy=layout_policy,
+            inplace_kv_cache=inplace_kv_cache,
+        ),
         *passes[1:],
     ]
 
@@ -1509,7 +2045,9 @@ def finalize_passes(target: tvm.target.Target):
     return gpu_generic.finalize_passes(target)
 
 
-def get_default_pipeline(target: tvm.target.Target):
+def get_default_pipeline(
+    target: tvm.target.Target, layout_policy=None, inplace_kv_cache=False
+):
     """Return the default Relax compilation pipeline for Vortex."""
 
     @tvm.transform.module_pass(opt_level=0)
@@ -1517,8 +2055,16 @@ def get_default_pipeline(target: tvm.target.Target):
         with target:
             return tvm.transform.Sequential(
                 library_dispatch_passes(target)
-                + legalize_passes(target)
-                + dataflow_lower_passes(target)
+                + legalize_passes(
+                    target,
+                    layout_policy=layout_policy,
+                    inplace_kv_cache=inplace_kv_cache,
+                )
+                + dataflow_lower_passes(
+                    target,
+                    layout_policy=layout_policy,
+                    inplace_kv_cache=inplace_kv_cache,
+                )
                 + finalize_passes(target)
             )(mod)
 

@@ -65,6 +65,7 @@ class CodeGenVortex final : public CodeGenC {
   void VisitStmt_(const AttrStmtNode* op) final;
   void VisitStmt_(const ForNode* op) final;
   void VisitStmt_(const AllocBufferNode* op) final;
+  void VisitExpr_(const FloatImmNode* op, std::ostream& os) final;  // NOLINT(*)
   void VisitExpr_(const MaxNode* op, std::ostream& os) final;  // NOLINT(*)
   void VisitExpr_(const MinNode* op, std::ostream& os) final;  // NOLINT(*)
 

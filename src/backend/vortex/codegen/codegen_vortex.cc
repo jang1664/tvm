@@ -27,6 +27,7 @@
 #include <tvm/tirx/stmt_functor.h>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <sstream>
@@ -323,6 +324,22 @@ class BarrierUniformityValidator final : public tirx::StmtVisitor {
 };
 
 }  // namespace
+
+void CodeGenVortex::VisitExpr_(const FloatImmNode* op, std::ostream& os) {  // NOLINT(*)
+  if (!std::isinf(op->value)) {
+    CodeGenC::VisitExpr_(op, os);
+    return;
+  }
+
+  PrimType dtype = op->ty.as_or_throw<PrimType>();
+  if (dtype.bits() == 16) {
+    os << "(";
+    PrintType(dtype, os);
+    os << ")";
+  }
+  os << (op->value < 0 ? "(-" : "(")
+     << (dtype.bits() == 64 ? "__builtin_inf()" : "__builtin_inff()") << ")";
+}
 
 CodeGenVortex::CodeGenVortex(Target target) : target_(std::move(target)) {
   restrict_keyword_ = "__restrict__";

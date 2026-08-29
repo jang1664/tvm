@@ -80,7 +80,7 @@ class ImproveProfile:
     dram_capacity_bytes: int = _U64_MAX
     gemm_abi_version: int = 2
     layout_abi_version: int = 2
-    supported_qblocks: tuple = (32,)
+    supported_qblocks: tuple = (32, 64, 128)
 
     @staticmethod
     def from_target(target):
@@ -451,32 +451,47 @@ def prepack_improve_weight(source, plan):
         )
     profile = plan.profile
     tiled = np.zeros(plan.weight_bytes, dtype="uint8")
-    for index in range(plan.weight_bytes):
-        kt, within_kt = divmod(
-            index, profile.dma_kt * plan.execution_n // 2
-        )
-        cur_k = min(
-            profile.dma_kt, plan.execution_k - kt * profile.dma_kt
-        )
-        bytes_per_nt = cur_k * profile.mxu_nt // 2
-        nt, within_nt = divmod(within_kt, bytes_per_nt)
-        if plan.weight_transpose:
-            kb, within_kb = divmod(
-                within_nt, profile.mxu_nt * (profile.mxu_kt // 2)
-            )
-            local_n, k_pair = divmod(within_kb, profile.mxu_kt // 2)
-            global_n = nt * profile.mxu_nt + local_n
-            global_k = kt * profile.dma_kt + kb * profile.mxu_kt + k_pair * 2
-            if global_n < plan.logical_n and global_k < plan.logical_k:
-                value = source[global_n, global_k // 2]
-                tiled[index] = value if global_k + 1 < plan.logical_k else value & 15
-        else:
-            local_k, n_pair = divmod(within_nt, profile.mxu_nt // 2)
-            global_k = kt * profile.dma_kt + local_k
-            global_n = nt * profile.mxu_nt + n_pair * 2
-            if global_k < plan.logical_k and global_n < plan.logical_n:
-                value = source[global_k, global_n // 2]
-                tiled[index] = value if global_n + 1 < plan.logical_n else value & 15
+    destination_offset = 0
+    for k_base in range(0, plan.execution_k, profile.dma_kt):
+        cur_k = min(profile.dma_kt, plan.execution_k - k_base)
+        logical_k = max(0, min(cur_k, plan.logical_k - k_base))
+        for n_base in range(0, plan.execution_n, profile.mxu_nt):
+            logical_n = max(0, min(profile.mxu_nt, plan.logical_n - n_base))
+            block_bytes = cur_k * profile.mxu_nt // 2
+            destination = tiled[
+                destination_offset : destination_offset + block_bytes
+            ]
+            if plan.weight_transpose:
+                destination = destination.reshape(
+                    cur_k // profile.mxu_kt,
+                    profile.mxu_nt,
+                    profile.mxu_kt // 2,
+                )
+                for kb in range(cur_k // profile.mxu_kt):
+                    block_k_base = k_base + kb * profile.mxu_kt
+                    block_logical_k = max(
+                        0,
+                        min(profile.mxu_kt, plan.logical_k - block_k_base),
+                    )
+                    source_bytes = (block_logical_k + 1) // 2
+                    if logical_n and source_bytes:
+                        destination[kb, :logical_n, :source_bytes] = source[
+                            n_base : n_base + logical_n,
+                            block_k_base // 2 : block_k_base // 2 + source_bytes,
+                        ]
+                        if block_logical_k & 1:
+                            destination[kb, :logical_n, source_bytes - 1] &= 15
+            else:
+                destination = destination.reshape(cur_k, profile.mxu_nt // 2)
+                source_bytes = (logical_n + 1) // 2
+                if logical_k and source_bytes:
+                    destination[:logical_k, :source_bytes] = source[
+                        k_base : k_base + logical_k,
+                        n_base // 2 : n_base // 2 + source_bytes,
+                    ]
+                    if logical_n & 1:
+                        destination[:logical_k, source_bytes - 1] &= 15
+            destination_offset += block_bytes
     return tiled
 
 

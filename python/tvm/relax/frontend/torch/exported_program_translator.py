@@ -1720,6 +1720,15 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                     pass
         return False
 
+    @staticmethod
+    def _has_assert_op(nodes) -> bool:
+        """Check whether an FX graph contains a side-effecting runtime assertion."""
+        return any(
+            node.op == "call_function"
+            and getattr(node.target, "__name__", None) == "_assert_async.msg"
+            for node in nodes
+        )
+
     def _translate_fx_graph(
         self,
         graph_module,  # torch.fx.GraphModule or ExportedProgram
@@ -1736,6 +1745,8 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         output_args = None
 
         for node in nodes:
+            if node in self.env and node.op != "output":
+                continue
             if node.op == "placeholder":
                 if (
                     "grapharg" in node.meta
@@ -1763,6 +1774,51 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
         assert output_args is not None
         return self._flatten_output_args(output_args)
+
+    def _translate_assert_prelude(
+        self,
+        graph_module,
+        nodes,
+        inputs_vars: dict,
+        custom_ops: set[str],
+    ) -> None:
+        """Emit runtime assertions before entering the model dataflow block.
+
+        ``relax.assert_op`` is side-effecting and cannot be placed in a
+        DataflowBlock.  Translate only each assertion and its transitive input
+        dependencies in the function's entry binding block.  The regular graph
+        translation then reuses those bindings and keeps the remaining model in
+        dataflow form.
+        """
+
+        def translate(node) -> None:
+            if node in self.env:
+                return
+            if node.op == "placeholder":
+                if node.name in inputs_vars:
+                    self.env[node] = inputs_vars[node.name]
+                return
+            if node.op == "get_attr":
+                self.env[node] = getattr(graph_module, node.target)
+                return
+            if node.op != "call_function":
+                raise ValueError(
+                    f"Unsupported runtime assertion dependency {node.op}"
+                )
+            for dependency in node.all_input_nodes:
+                translate(dependency)
+            func_name = node.target.__name__
+            if func_name in custom_ops:
+                self.env[node] = self.convert_map[func_name](node, self)
+            else:
+                self.env[node] = self.convert_map[func_name](node)
+
+        for node in nodes:
+            if (
+                node.op == "call_function"
+                and getattr(node.target, "__name__", None) == "_assert_async.msg"
+            ):
+                translate(node)
 
     @staticmethod
     def _flatten_output_args(output_args) -> tuple[relax.Expr, ...]:
@@ -2002,6 +2058,16 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         return self.block_builder.emit(call, name_hint="vortex_dequantized")
 
     def _vortex_mm_w4a16(self, node: fx.Node) -> relax.Var:
+        return self._vortex_mm_w4a16_call(node, "relax.vortex.mm_w4a16")
+
+    def _vortex_mm_w4a16_prepacked(self, node: fx.Node) -> relax.Var:
+        return self._vortex_mm_w4a16_call(
+            node, "relax.vortex.mm_w4a16_prepacked"
+        )
+
+    def _vortex_mm_w4a16_call(
+        self, node: fx.Node, packed_symbol: str
+    ) -> relax.Var:
         (
             lhs,
             packed,
@@ -2026,7 +2092,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             )
         output_type = relax.TensorType([*lhs_shape[:-1], rhs_n], "float16")
         call = relax.op.call_pure_packed(
-            "relax.vortex.mm_w4a16",
+            packed_symbol,
             lhs,
             packed,
             scale,
@@ -2053,6 +2119,23 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         )
         return self.block_builder.emit(call, name_hint="vortex_cache")
 
+    def _vortex_kv_cache_update_dynamic(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        cache_payload, cache_scale, cache_zero_point = args[:3]
+        position = args[6]
+        capacity = args[7]
+        output_type = relax.TupleType(
+            [cache_payload.ty, cache_scale.ty, cache_zero_point.ty]
+        )
+        call = relax.op.call_pure_packed(
+            "relax.vortex.kv_cache_update_dynamic",
+            *args[:6],
+            position,
+            relax.prim_value(capacity),
+            ty_args=output_type,
+        )
+        return self.block_builder.emit(call, name_hint="vortex_cache_dynamic")
+
     ########## Others ##########
 
     def create_convert_map(
@@ -2066,7 +2149,9 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "quantize_int4.default": self._vortex_quantize_int4,
             "dequantize_int4.default": self._vortex_dequantize_int4,
             "mm_w4a16.default": self._vortex_mm_w4a16,
+            "mm_w4a16_prepacked.default": self._vortex_mm_w4a16_prepacked,
             "kv_cache_update.default": self._vortex_kv_cache_update,
+            "kv_cache_update_dynamic.default": self._vortex_kv_cache_update_dynamic,
             # unary
             "abs.default": self._unary_op(relax.op.abs),
             "acos.default": self._unary_op(relax.op.acos),
@@ -2359,6 +2444,9 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "_assert_tensor_metadata.default": lambda node: self.env[
                 node.args[0]
             ],  # metadata assertion: no-op
+            "_assert_async.msg": lambda node: self.block_builder.emit(
+                relax.op.assert_op(self.env[node.args[0]], format=node.args[1])
+            ),
             "empty.default": self._empty,
             "empty.memory_format": self._empty,
             "empty_permuted.default": self._empty,  # Similar to empty with permuted layout
@@ -2590,13 +2678,25 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         # Find all the missing function types
         self._check_unsupported_func_type(nodes)
 
-        # When the graph contains torch.cond, we must avoid DataflowBlock
-        # because relax.If cannot appear inside a dataflow region.
+        # Control-flow and side-effecting operators cannot appear in a
+        # DataflowBlock.  Runtime assertions additionally require an impure
+        # Relax function so that they cannot be reordered or removed.
+        has_assert_op = self._has_assert_op(nodes)
         use_dataflow = not self._has_cond_op(nodes)
 
         with self.block_builder.function(
-            name=func_name, params=list(inputs_vars.values()).copy(), attrs=func_attrs
+            name=func_name,
+            params=list(inputs_vars.values()).copy(),
+            attrs=func_attrs,
+            pure=not has_assert_op,
         ):
+            if has_assert_op:
+                self._translate_assert_prelude(
+                    exported_program.graph_module,
+                    nodes,
+                    inputs_vars,
+                    custom_ops,
+                )
             with contextlib.ExitStack() as stack:
                 if use_dataflow:
                     stack.enter_context(self.block_builder.dataflow())

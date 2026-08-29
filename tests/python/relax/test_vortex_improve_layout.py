@@ -17,18 +17,23 @@
 
 import dataclasses
 
+import numpy as np
 import pytest
 
-from tvm.relax.backend.vortex.layout import ImproveProfile, plan_improve_layout
+from tvm.relax.backend.vortex.layout import (
+    ImproveProfile,
+    plan_improve_layout,
+    prepack_improve_weight,
+)
 
 
 def _align(value, alignment):
     return (value + alignment - 1) // alignment * alignment
 
 
-def _reference_sizes(m, n, k, qdir):
-    n_exec = _align(n, 32)
-    k_exec = _align(k, 32)
+def _reference_sizes(m, n, k, qdir, qblock=32):
+    n_exec = _align(n, qblock if qdir == 1 else 32)
+    k_exec = _align(k, qblock if qdir == 0 else 32)
     a_elements = 0
     c_elements = 0
     for m_base in range(0, m, 128):
@@ -40,7 +45,11 @@ def _reference_sizes(m, n, k, qdir):
         cur_k = min(128, k_exec - k_base)
         for n_base in range(0, n_exec, 128):
             cur_n = min(128, n_exec - n_base)
-            records = cur_k // 32 * cur_n if qdir == 0 else cur_n // 32 * cur_k
+            records = (
+                cur_k // qblock * cur_n
+                if qdir == 0
+                else cur_n // 32 * cur_k * ((32 + qblock - 1) // qblock)
+            )
             qparam_bytes += _align(records * 2, 512)
     return n_exec, k_exec, a_elements, k_exec * n_exec // 2, qparam_bytes // 2, c_elements
 
@@ -80,6 +89,55 @@ def test_improve_plan_records_every_multi_tile_qparam_slot():
     )
     for previous, current in zip(plan.qparam_slots, plan.qparam_slots[1:]):
         assert previous.offset_bytes + previous.reserved_bytes == current.offset_bytes
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_vectorized_constant_weight_prepack_matches_index_contract(transpose):
+    plan = plan_improve_layout(7, 35, 37, 32, weight_transpose=transpose)
+    shape = (35, 19) if transpose else (37, 18)
+    source = np.arange(np.prod(shape), dtype="uint8").reshape(shape)
+    expected = np.zeros(plan.weight_bytes, dtype="uint8")
+    profile = plan.profile
+    for index in range(plan.weight_bytes):
+        kt, within_kt = divmod(index, profile.dma_kt * plan.execution_n // 2)
+        cur_k = min(profile.dma_kt, plan.execution_k - kt * profile.dma_kt)
+        bytes_per_nt = cur_k * profile.mxu_nt // 2
+        nt, within_nt = divmod(within_kt, bytes_per_nt)
+        if transpose:
+            kb, within_kb = divmod(
+                within_nt, profile.mxu_nt * (profile.mxu_kt // 2)
+            )
+            local_n, k_pair = divmod(within_kb, profile.mxu_kt // 2)
+            global_n = nt * profile.mxu_nt + local_n
+            global_k = kt * profile.dma_kt + kb * profile.mxu_kt + k_pair * 2
+            if global_n < plan.logical_n and global_k < plan.logical_k:
+                value = source[global_n, global_k // 2]
+                expected[index] = value if global_k + 1 < plan.logical_k else value & 15
+        else:
+            local_k, n_pair = divmod(within_nt, profile.mxu_nt // 2)
+            global_k = kt * profile.dma_kt + local_k
+            global_n = nt * profile.mxu_nt + n_pair * 2
+            if global_k < plan.logical_k and global_n < plan.logical_n:
+                value = source[global_k, global_n // 2]
+                expected[index] = value if global_n + 1 < plan.logical_n else value & 15
+    np.testing.assert_array_equal(prepack_improve_weight(source, plan), expected)
+
+
+@pytest.mark.parametrize("qblock", [64, 128])
+@pytest.mark.parametrize("qdir", [0, 1])
+def test_improve_plan_supports_versioned_large_qblocks(qblock, qdir):
+    shape = (7, 129, 193)
+    plan = plan_improve_layout(*shape, qblock, quant_direction=qdir)
+    expected = _reference_sizes(*shape, qdir, qblock)
+    assert (
+        plan.execution_n,
+        plan.execution_k,
+        plan.a_elements,
+        plan.weight_bytes,
+        plan.qparam_elements,
+        plan.c_elements,
+    ) == expected
+    assert plan.qblock == qblock
 
 
 def test_improve_plan_descriptor_requires_neutral_abi_compatible_padding():

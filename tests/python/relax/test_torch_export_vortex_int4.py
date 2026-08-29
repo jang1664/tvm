@@ -16,6 +16,7 @@
 
 import importlib.util
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -25,7 +26,12 @@ import torch
 
 import tvm
 from tvm import relax
-from tvm.relax.backend.vortex.layout import plan_improve_layout
+from tvm.relax.backend.vortex.layout import (
+    ImproveProfile,
+    plan_improve_layout,
+    prepack_improve_qparam,
+    prepack_improve_weight,
+)
 from tvm.relax.backend.vortex.pipeline import (
     _make_w4a16_improve,
     _w4a16_lowering_pass,
@@ -35,6 +41,17 @@ from tvm.support.vortex import load_vortex_accelerator_profile
 
 VORTEX_HOME = Path("/home/jaeyongjang/project.local/vortex_base")
 OPS_PATH = VORTEX_HOME / "pytorch/spinquant/spinquant_inference/vortex_export_ops.py"
+sys.path.insert(0, str(VORTEX_HOME / "pytorch/spinquant"))
+
+from spinquant_inference.llama3_c4_export import (  # noqa: E402
+    Llama3ExportConfig,
+    Llama3LayerDecode,
+    Llama3LayerPrefill,
+    Llama3StackDecode,
+    Llama3StackPrefill,
+    make_meta_parameters,
+    stack_parameter_shapes,
+)
 NAIVE_XCLBIN = Path(
     "/opt/vortex_fpga_bins/fpint/"
     "xrt_hw_u55c_c_f100_fpint_9600db3a37/bin/vortex_afu.xclbin"
@@ -74,10 +91,13 @@ class _Attention(torch.nn.Module):
 
 
 class _PackedW4A16(torch.nn.Module):
-    def __init__(self, transpose_rhs=False, quant_axis=0, rhs_shape=None):
+    def __init__(
+        self, transpose_rhs=False, quant_axis=0, rhs_shape=None, group_size=32
+    ):
         super().__init__()
         self.transpose_rhs = transpose_rhs
         self.quant_axis = quant_axis
+        self.group_size = group_size
         self.rhs_shape = rhs_shape or (
             (32, 128) if self.transpose_rhs else (128, 32)
         )
@@ -89,7 +109,7 @@ class _PackedW4A16(torch.nn.Module):
             scale,
             zero_point,
             list(self.rhs_shape),
-            32,
+            self.group_size,
             self.quant_axis,
             1,
             "signed_symmetric_int4",
@@ -140,6 +160,35 @@ class _W4FFN(torch.nn.Module):
             False,
         )
         return (hidden, output) if self.return_hidden else output
+
+
+class _W4SharedInput(torch.nn.Module):
+    def forward(self, lhs, packed1, scale1, zero1, packed2, scale2, zero2):
+        first = torch.ops.vortex.mm_w4a16(
+            lhs,
+            packed1,
+            scale1,
+            zero1,
+            [33, 31],
+            32,
+            0,
+            1,
+            "signed_symmetric_int4",
+            False,
+        )
+        second = torch.ops.vortex.mm_w4a16(
+            lhs.reshape(1, 7, 33).reshape(7, 33),
+            packed2,
+            scale2,
+            zero2,
+            [33, 17],
+            32,
+            0,
+            1,
+            "signed_symmetric_int4",
+            False,
+        )
+        return first, second
 
 
 class _ConstantPackedW4A16(torch.nn.Module):
@@ -333,14 +382,126 @@ class _W4CachedDecode(torch.nn.Module):
         return context, *key_cache, *value_cache
 
 
+def test_import_backend_neutral_llama3_prefill_and_decode_graphs():
+    config = Llama3ExportConfig(
+        batch_size=1,
+        query_length=1,
+        cache_capacity=32,
+        hidden_size=128,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        weight_group_size=32,
+        kv_group_size=32,
+    )
+    parameters = {
+        name: torch.empty_like(value, device="cpu")
+        for name, value in make_meta_parameters(config).items()
+    }
+    hidden = torch.empty((1, 1, 128), dtype=torch.float16)
+    positions = torch.empty((1, 1), dtype=torch.int64)
+    prefill_program = torch.export.export(
+        Llama3LayerPrefill(config),
+        (hidden, positions, parameters),
+        strict=True,
+    )
+    prefill = from_exported_program(
+        prefill_program,
+        run_ep_decomposition=False,
+        unwrap_unit_return_tuple=True,
+    )
+    prefill_script = prefill.script()
+    assert prefill_script.count('R.call_pure_packed("relax.vortex.mm_w4a16"') == 9
+    assert prefill_script.count('R.call_pure_packed("relax.vortex.quantize_int4"') == 2
+    assert prefill_script.count('R.call_pure_packed("relax.vortex.kv_cache_update"') == 2
+    assert "tile_input_a" not in prefill_script
+    assert "mm_w4a16_gemm_core" not in prefill_script
+
+    target = tvm.target.Target(
+        {"kind": "vortex", "vortex_gemm_mode": "improve"}, host="llvm"
+    )
+    prefill_alone = _w4a16_lowering_pass(target, layout_policy="alone")(prefill)
+    prefill_alone_script = prefill_alone.script()
+    assert prefill_alone.attrs["vortex.c4.layout_policy"] == "alone"
+    assert prefill_alone.attrs["vortex.w4a16.lowered"] == 15
+    assert "vortex_kv_cache_update" in prefill_alone_script
+    assert "batched_lhs_slice" in prefill_alone_script
+    assert "vortex_batched_output_barrier" in prefill_alone_script
+    assert 'R.call_pure_packed("relax.vortex.mm_w4a16"' not in prefill_alone_script
+    prefill_fused = _w4a16_lowering_pass(target, layout_policy="fused")(prefill)
+    assert prefill_fused.attrs["vortex.improve.reused_a_layouts"] == 3
+    assert prefill_alone_script.count("R.call_tir(cls.vortex_gemm_a_tiled") == 15
+    assert prefill_fused.script().count("R.call_tir(cls.vortex_gemm_a_tiled") == 12
+
+    packed = torch.empty((1, 2, 32, 16), dtype=torch.uint8)
+    scale = torch.empty((1, 2, 32, 1), dtype=torch.float16)
+    zero = torch.empty((1, 2, 32, 1), dtype=torch.int16)
+    length = torch.empty((), dtype=torch.int64)
+    decode_program = torch.export.export(
+        Llama3LayerDecode(config),
+        (
+            hidden,
+            positions,
+            parameters,
+            packed,
+            scale,
+            zero,
+            packed,
+            scale,
+            zero,
+            length,
+        ),
+        strict=True,
+    )
+    decode = from_exported_program(
+        decode_program,
+        run_ep_decomposition=False,
+        unwrap_unit_return_tuple=True,
+    )
+    decode_script = decode.script()
+    assert "@R.function(pure=False)" in decode_script
+    assert "R.assert_op" in decode_script
+    assert "allocated KV cache capacity" in decode_script
+    assert decode_script.index("R.assert_op") < decode_script.index("with R.dataflow()")
+    assert decode_script.count('R.call_pure_packed("relax.vortex.mm_w4a16"') == 9
+    assert decode_script.count(
+        'R.call_pure_packed("relax.vortex.kv_cache_update_dynamic"'
+    ) == 2
+    decode_alone = _w4a16_lowering_pass(target, layout_policy="alone")(decode)
+    decode_alone_script = decode_alone.script()
+    assert decode_alone.attrs["vortex.c4.layout_policy"] == "alone"
+    assert decode_alone.attrs["vortex.w4a16.lowered"] == 15
+    assert "vortex_kv_cache_update_dynamic" in decode_alone_script
+    assert (
+        'R.call_pure_packed("relax.vortex.kv_cache_update_dynamic"'
+        not in decode_alone_script
+    )
+    decode_fused = _w4a16_lowering_pass(target, layout_policy="fused")(decode)
+    assert decode_fused.attrs["vortex.improve.reused_a_layouts"] == 3
+    assert decode_alone_script.count("R.call_tir(cls.vortex_gemm_a_tiled") == 15
+    assert decode_fused.script().count("R.call_tir(cls.vortex_gemm_a_tiled") == 12
+    decode_inplace = _w4a16_lowering_pass(
+        target,
+        layout_policy="alone",
+        inplace_kv_cache=True,
+    )(decode)
+    assert decode_inplace.attrs["vortex.kv_cache_update_inplace"] == 1
+    assert decode_inplace.script().count("R.call_tir_inplace") == 2
+    assert "tile_input_a" not in decode_script
+    assert "mm_w4a16_gemm_core" not in decode_script
+
+
 def _import_packed_w4a16(
-    transpose_rhs=False, quant_axis=0, m=8, n=32, k=128
+    transpose_rhs=False, quant_axis=0, m=8, n=32, k=128, group_size=32
 ):
     _register_logical_ops()
     rhs_shape = (n, k) if transpose_rhs else (k, n)
     packed_shape = (rhs_shape[0], (rhs_shape[1] + 1) // 2)
     qparam_shape = list(rhs_shape)
-    qparam_shape[quant_axis] = (qparam_shape[quant_axis] + 31) // 32
+    qparam_shape[quant_axis] = (
+        qparam_shape[quant_axis] + group_size - 1
+    ) // group_size
     inputs = (
         torch.ones((m, k), dtype=torch.float16),
         torch.zeros(packed_shape, dtype=torch.uint8),
@@ -349,7 +510,10 @@ def _import_packed_w4a16(
     )
     return from_exported_program(
         torch.export.export(
-            _PackedW4A16(transpose_rhs, quant_axis, rhs_shape), inputs
+            _PackedW4A16(
+                transpose_rhs, quant_axis, rhs_shape, group_size=group_size
+            ),
+            inputs,
         ),
         run_ep_decomposition=False,
         unwrap_unit_return_tuple=True,
@@ -444,7 +608,193 @@ def _detile_improve_output(tiled, plan):
                 index += local_m * plan.profile.mxu_nt + inner_n
                 output[mt * plan.profile.dma_mt + local_m, logical_n] = tiled[index]
         c_base += slot_m * plan.execution_n
-    return output
+        return output
+
+
+class _PrepackedW4(torch.nn.Module):
+    def forward(self, lhs, weight, scale, zero):
+        return (
+            torch.ops.vortex.mm_w4a16_prepacked(
+                lhs,
+                weight,
+                scale,
+                zero,
+                [33, 31],
+                32,
+                0,
+                1,
+                "signed_asymmetric_int4",
+                False,
+            ),
+        )
+
+
+def test_prepacked_w4a16_skips_runtime_weight_layout_kernels():
+    _register_logical_ops()
+    target = tvm.target.Target(
+        {"kind": "vortex", "vortex_gemm_mode": "improve"}, host="llvm"
+    )
+    plan = plan_improve_layout(7, 31, 33, 32)
+    inputs = (
+        torch.empty((7, 33), dtype=torch.float16),
+        torch.empty((plan.weight_bytes,), dtype=torch.uint8),
+        torch.empty((plan.qparam_elements,), dtype=torch.float16),
+        torch.empty((plan.qparam_elements,), dtype=torch.int16),
+    )
+    mod = from_exported_program(
+        torch.export.export(_PrepackedW4(), inputs, strict=True),
+        run_ep_decomposition=False,
+        unwrap_unit_return_tuple=True,
+    )
+    assert "relax.vortex.mm_w4a16_prepacked" in mod.script()
+    lowered = _w4a16_lowering_pass(target, layout_policy="alone")(mod)
+    script = lowered.script()
+    assert "vortex_mm_w4a16_improve" in script
+    assert "vortex_gemm_a_tiled" in script
+    assert "vortex_gemm_w_tiled" not in script
+    assert "vortex_gemm_scale_tiled" not in script
+    assert "vortex_gemm_zero_point_tiled" not in script
+
+
+def test_two_layer_llama_stack_imports_external_prepacked_parameters():
+    config = Llama3ExportConfig(
+        batch_size=1,
+        query_length=1,
+        cache_capacity=8,
+        hidden_size=128,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        weight_group_size=32,
+        kv_group_size=32,
+    )
+    canonical_shapes = stack_parameter_shapes(config, 2)
+    parameters = {}
+    plans = {}
+    for name, (shape, dtype) in canonical_shapes.items():
+        if name.endswith("norm.weight"):
+            parameters[name] = torch.ones(shape, dtype=dtype)
+            continue
+        projection = name.rsplit(".", 1)[0]
+        if projection not in plans:
+            qweight_shape = canonical_shapes[f"{projection}.qweight"][0]
+            plans[projection] = plan_improve_layout(
+                1, qweight_shape[1] * 2, qweight_shape[0], 32
+            )
+        plan = plans[projection]
+        if name.endswith(".qweight"):
+            parameters[name] = torch.empty((plan.weight_bytes,), dtype=dtype)
+        else:
+            parameters[name] = torch.empty((plan.qparam_elements,), dtype=dtype)
+
+    model = Llama3StackPrefill(config, 2, prepacked_weights=True)
+    hidden = torch.zeros((1, 1, 128), dtype=torch.float16)
+    positions = torch.zeros((1, 1), dtype=torch.int64)
+    exported = torch.export.export(
+        model, (hidden, positions, parameters), strict=True
+    )
+    mod = from_exported_program(
+        exported,
+        run_ep_decomposition=False,
+        unwrap_unit_return_tuple=True,
+    )
+    assert mod.script().count("relax.vortex.mm_w4a16_prepacked") == 14
+    target = tvm.target.Target(
+        {"kind": "vortex", "vortex_gemm_mode": "improve"}, host="llvm"
+    )
+    lowered = _w4a16_lowering_pass(target, layout_policy="fused")(mod)
+    assert lowered.attrs["vortex.improve.external_prepacked_w4a16"] == 14
+    assert "relax.vortex.mm_w4a16_prepacked" not in lowered.script()
+
+    packed = torch.zeros((2, 1, 2, 8, 16), dtype=torch.uint8)
+    scale = torch.zeros((2, 1, 2, 8, 1), dtype=torch.float16)
+    zero = torch.zeros((2, 1, 2, 8, 1), dtype=torch.int16)
+    lengths = torch.zeros((2,), dtype=torch.int64)
+    decode = Llama3StackDecode(config, 2, prepacked_weights=True)
+    decode_exported = torch.export.export(
+        decode,
+        (
+            hidden,
+            positions,
+            parameters,
+            packed,
+            scale,
+            zero,
+            packed,
+            scale,
+            zero,
+            lengths,
+        ),
+        strict=True,
+    )
+    decode_mod = from_exported_program(
+        decode_exported,
+        run_ep_decomposition=False,
+        unwrap_unit_return_tuple=True,
+    )
+    decode_lowered = _w4a16_lowering_pass(
+        target,
+        layout_policy="fused",
+        inplace_kv_cache=True,
+    )(decode_mod)
+    assert decode_lowered.attrs["vortex.improve.external_prepacked_w4a16"] == 14
+    assert decode_lowered.attrs["vortex.kv_cache_update_inplace"] == 1
+    tvm.relax.analysis.well_formed(decode_lowered)
+
+
+@pytest.mark.skipif(
+    os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
+    reason="set TVM_VORTEX_RUN_HARDWARE=1 in the improved GEMM XRT environment",
+)
+def test_external_prepacked_w4a16_hardware():
+    _register_logical_ops()
+    assert Path(os.environ["XRT_XCLBIN_PATH"]).resolve() == IMPROVED_XCLBIN.resolve()
+    profile = load_vortex_accelerator_profile(
+        IMPROVED_XCLBIN.parent.parent / "manifest.json"
+    )
+    target = tvm.target.Target(profile.target, host="llvm")
+    plan = plan_improve_layout(
+        7, 31, 33, 32, profile=ImproveProfile.from_target(target)
+    )
+    rng = np.random.default_rng(20260830)
+    lhs = rng.uniform(-0.1, 0.1, (7, 33)).astype("float16")
+    weight = rng.integers(0, 256, (33, 16), dtype="uint8")
+    scale = rng.uniform(0.01, 0.04, (2, 31)).astype("float16")
+    zero = rng.integers(-2, 3, (2, 31), dtype="int16")
+    physical = (
+        prepack_improve_weight(weight, plan),
+        prepack_improve_qparam(scale, plan, "float16"),
+        prepack_improve_qparam(zero, plan, "int16"),
+    )
+    inputs = (
+        torch.from_numpy(lhs),
+        *(torch.from_numpy(value) for value in physical),
+    )
+    mod = from_exported_program(
+        torch.export.export(_PrepackedW4(), inputs, strict=True),
+        run_ep_decomposition=False,
+        unwrap_unit_return_tuple=True,
+    )
+    executable = relax.build(mod, target, exec_mode="bytecode")
+    expected = torch.ops.vortex.mm_w4a16(
+        torch.from_numpy(lhs),
+        torch.from_numpy(weight),
+        torch.from_numpy(scale),
+        torch.from_numpy(zero),
+        [33, 31],
+        32,
+        0,
+        1,
+        "signed_asymmetric_int4",
+        False,
+    ).numpy()
+    device = tvm.vortex(0)
+    vm = relax.VirtualMachine(executable, device=device, memory_cfg="naive")
+    actual = vm["main"](
+        *(tvm.runtime.tensor(value.numpy(), device=device) for value in inputs)
+    ).numpy()
+    np.testing.assert_allclose(actual, expected, rtol=3e-2, atol=3e-2)
 
 
 def _pack_int4_last_axis(source):
@@ -562,6 +912,37 @@ def test_prelegalization_layout_region_fuses_ffn_vector_chain_and_branches():
     ).script()
     assert branched.count("R.call_tir(cls.vortex_gemm_a_tiled") == 1
     assert branched.count("R.call_tir(cls.vortex_gemm_c_detile") == 2
+
+
+def test_fused_policy_reuses_shared_gemm_a_layout_across_projection_siblings():
+    _register_logical_ops()
+    rng = np.random.default_rng(20260828)
+    inputs = (
+        torch.from_numpy(rng.uniform(-0.1, 0.1, (7, 33)).astype("float16")),
+        torch.from_numpy(rng.integers(0, 256, (33, 16), dtype="uint8")),
+        torch.ones((2, 31), dtype=torch.float16),
+        torch.zeros((2, 31), dtype=torch.int16),
+        torch.from_numpy(rng.integers(0, 256, (33, 9), dtype="uint8")),
+        torch.ones((2, 17), dtype=torch.float16),
+        torch.zeros((2, 17), dtype=torch.int16),
+    )
+    mod = from_exported_program(
+        torch.export.export(_W4SharedInput(), inputs),
+        run_ep_decomposition=False,
+        unwrap_unit_return_tuple=True,
+    )
+    target = tvm.target.Target(
+        {"kind": "vortex", "vortex_gemm_mode": "improve"}, host="llvm"
+    )
+    fused = relax.transform.DeadCodeElimination()(
+        _w4a16_lowering_pass(target, layout_policy="fused")(mod)
+    )
+    alone = relax.transform.DeadCodeElimination()(
+        _w4a16_lowering_pass(target, layout_policy="alone")(mod)
+    )
+    assert fused.attrs["vortex.improve.reused_a_layouts"] == 1
+    assert fused.script().count("R.call_tir(cls.vortex_gemm_a_tiled") == 1
+    assert alone.script().count("R.call_tir(cls.vortex_gemm_a_tiled") == 2
 
 
 @pytest.mark.parametrize(
@@ -771,7 +1152,8 @@ def test_naive_w4a16_relax_vm_hardware(transpose_rhs, quant_axis):
     os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
     reason="set TVM_VORTEX_RUN_HARDWARE=1 inside the exact improved GEMM XRT environment",
 )
-def test_direct_improved_gemm_abi_v2_hardware():
+@pytest.mark.parametrize("qblock", [32, 128])
+def test_direct_improved_gemm_abi_v2_hardware(qblock):
     """Bypass Relax transforms and submit known-good physical buffers directly."""
 
     assert Path(os.environ["XRT_XCLBIN_PATH"]).resolve() == IMPROVED_XCLBIN.resolve()
@@ -779,7 +1161,7 @@ def test_direct_improved_gemm_abi_v2_hardware():
         IMPROVED_XCLBIN.parent.parent / "manifest.json"
     )
     target = tvm.target.Target(accelerator.target, host="llvm")
-    plan = plan_improve_layout(7, 31, 33, 32)
+    plan = plan_improve_layout(7, 31, 33, qblock)
     kernel = _make_w4a16_improve(
         plan.a_elements,
         plan.weight_bytes,
@@ -819,6 +1201,53 @@ def test_direct_improved_gemm_abi_v2_hardware():
     scale_by_k = np.repeat(scale.astype("float32"), plan.qblock, axis=0)
     dequantized = weight.astype("float32") * scale_by_k[: plan.logical_k]
     expected = (lhs.astype("float32") @ dequantized).astype("float16")
+    np.testing.assert_allclose(actual, expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(
+    os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
+    reason="set TVM_VORTEX_RUN_HARDWARE=1 inside the exact improved GEMM XRT environment",
+)
+def test_improved_qrow_qblock128_relax_vm_hardware():
+    """Exercise the Llama KV4 QDIR=1 contract through the full Relax layout path."""
+
+    assert Path(os.environ["XRT_XCLBIN_PATH"]).resolve() == IMPROVED_XCLBIN.resolve()
+    accelerator = load_vortex_accelerator_profile(
+        IMPROVED_XCLBIN.parent.parent / "manifest.json"
+    )
+    target = tvm.target.Target(accelerator.target, host="llvm")
+    executable = relax.build(
+        _import_packed_w4a16(
+            transpose_rhs=False,
+            quant_axis=1,
+            m=3,
+            n=33,
+            k=7,
+            group_size=128,
+        ),
+        target,
+        exec_mode="bytecode",
+    )
+
+    rng = np.random.default_rng(83)
+    lhs = rng.uniform(-0.5, 0.5, (3, 7)).astype("float16")
+    weight = rng.integers(-3, 4, size=(7, 33), dtype="int8")
+    packed = _pack_int4_last_axis(weight)
+    scale = rng.uniform(0.05, 0.15, (7, 1)).astype("float16")
+    zero_point = rng.integers(-2, 3, size=(7, 1), dtype="int16")
+    dequantized = (
+        weight.astype("float32") - zero_point.astype("float32")
+    ) * scale.astype("float32")
+    expected = (lhs.astype("float32") @ dequantized).astype("float16")
+
+    device = tvm.vortex(0)
+    vm = relax.VirtualMachine(executable, device=device, memory_cfg="naive")
+    actual = vm["main"](
+        *[
+            tvm.runtime.tensor(value, device=device)
+            for value in (lhs, packed, scale, zero_point)
+        ]
+    ).numpy()
     np.testing.assert_allclose(actual, expected, rtol=3e-2, atol=3e-2)
 
 
