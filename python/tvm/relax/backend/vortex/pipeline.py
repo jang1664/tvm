@@ -33,6 +33,133 @@ from .layout import (
 )
 
 
+def _make_hadamard(shape, base_size):
+    """Create one parallel mixed-radix FP32 Hadamard device kernel."""
+
+    rank = len(shape)
+    rows = math.prod(shape[:-1])
+    width = shape[-1]
+    factor = width // base_size
+    stages = factor.bit_length() - 1
+    thread_count = math.gcd(32, width // 2 if stages else width)
+    normalization = 1.0 / math.sqrt(width)
+
+    @T.macro
+    def load_source(
+        source: T.Buffer,
+        work: T.Buffer,
+        row: T.int64,
+        column: T.int64,
+    ):
+        if rank == 2:
+            work[column] = T.Cast("float32", source[row, column])
+        elif rank == 3:
+            work[column] = T.Cast(
+                "float32", source[row // shape[1], row % shape[1], column]
+            )
+        elif rank == 4:
+            work[column] = T.Cast(
+                "float32",
+                source[
+                    row // (shape[1] * shape[2]),
+                    row // shape[2] % shape[1],
+                    row % shape[2],
+                    column,
+                ],
+            )
+        else:
+            work[column] = T.Cast(
+                "float32",
+                source[
+                    row // (shape[1] * shape[2] * shape[3]),
+                    row // (shape[2] * shape[3]) % shape[1],
+                    row // shape[3] % shape[2],
+                    row % shape[3],
+                    column,
+                ],
+            )
+
+    @T.macro
+    def store_output(
+        output: T.Buffer,
+        row: T.int64,
+        column: T.int64,
+        value: T.float32,
+    ):
+        if rank == 2:
+            output[row, column] = T.Cast("float16", value)
+        elif rank == 3:
+            output[row // shape[1], row % shape[1], column] = T.Cast("float16", value)
+        elif rank == 4:
+            output[
+                row // (shape[1] * shape[2]),
+                row // shape[2] % shape[1],
+                row % shape[2],
+                column,
+            ] = T.Cast("float16", value)
+        else:
+            output[
+                row // (shape[1] * shape[2] * shape[3]),
+                row // (shape[2] * shape[3]) % shape[1],
+                row // shape[3] % shape[2],
+                row % shape[3],
+                column,
+            ] = T.Cast("float16", value)
+
+    @T.prim_func(private=True)
+    def hadamard(
+        source: T.Buffer(shape, "float16"),
+        base: T.Buffer((base_size, base_size), "float32"),
+        output: T.Buffer(shape, "float16"),
+    ):
+        T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
+        work = T.alloc_buffer((width,), "float32", scope="shared")
+        left = T.alloc_buffer((1,), "float32", scope="local")
+        right = T.alloc_buffer((1,), "float32", scope="local")
+        accumulator = T.alloc_buffer((1,), "float32", scope="local")
+        for bx in T.thread_binding(1, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                for row in T.serial(rows):
+                    for column_chunk in T.serial(width // thread_count):
+                        column = column_chunk * thread_count + tx
+                        load_source(source, work, row, column)
+                    T.tvm_storage_sync("shared")
+                    for stage in T.serial(stages):
+                        stride = T.shift_left(T.int64(1), stage)
+                        for pair_chunk in T.serial(
+                            base_size * factor // 2 // thread_count
+                        ):
+                            linear_pair = pair_chunk * thread_count + tx
+                            base_row = linear_pair // (factor // 2)
+                            pair = linear_pair % (factor // 2)
+                            group = pair // stride
+                            offset = pair % stride
+                            left_index = base_row * factor + group * stride * 2 + offset
+                            right_index = left_index + stride
+                            left[0] = work[left_index]
+                            right[0] = work[right_index]
+                            work[left_index] = left[0] + right[0]
+                            work[right_index] = left[0] - right[0]
+                        T.tvm_storage_sync("shared")
+                    for output_chunk in T.serial(width // thread_count):
+                        linear_output = output_chunk * thread_count + tx
+                        target_base = linear_output // factor
+                        column = linear_output % factor
+                        accumulator[0] = T.float32(0)
+                        for source_base in T.serial(base_size):
+                            accumulator[0] = accumulator[0] + base[
+                                target_base, source_base
+                            ] * work[source_base * factor + column]
+                        store_output(
+                            output,
+                            row,
+                            target_base * factor + column,
+                            accumulator[0] * T.float32(normalization),
+                        )
+
+    return hadamard
+
+
 def _make_quantize_int4_row_major(shape, group_size, scheme):
     """Create the canonical rank-2 FP16 -> signed INT4 tuple implementation."""
 
@@ -1011,6 +1138,7 @@ class _W4A16Lowerer(relax.PyExprMutator):
         self.tiled_inputs = {}
         self.prepacked_descriptors = []
         self.lowered_w4a16 = 0
+        self.lowered_hadamard = 0
         self.external_prepacked_w4a16 = 0
         self.reused_a_layouts = 0
         for _, function in mod.functions_items():
@@ -1299,6 +1427,38 @@ class _W4A16Lowerer(relax.PyExprMutator):
         ):
             return call
         symbol = call.args[0].global_symbol
+        if symbol == "relax.vortex.hadamard":
+            source, base = call.args[1:3]
+            base_size = int(_prim_value(call.args[3]))
+            source_shape = _static_tensor_shape(source, "float16")
+            base_shape = _static_tensor_shape(base, "float32")
+            output_shape = _static_tensor_shape(call, "float16")
+            if source_shape is None or len(source_shape) not in (2, 3, 4, 5):
+                raise ValueError(
+                    "Vortex hadamard requires static rank-2 through rank-5 FP16 input"
+                )
+            width = source_shape[-1]
+            if (
+                base_size <= 0
+                or width % base_size
+                or base_shape != (base_size, base_size)
+                or output_shape != source_shape
+            ):
+                raise ValueError("Vortex hadamard shapes are inconsistent")
+            factor = width // base_size
+            if factor & (factor - 1):
+                raise ValueError("Vortex hadamard factor must be a power of two")
+            key = ("hadamard", source_shape, base_size)
+            if key not in self.implementations:
+                self.implementations[key] = self.builder_.add_func(
+                    _make_hadamard(source_shape, base_size),
+                    f"vortex_hadamard_{width}",
+                )
+            self.lowered_hadamard += 1
+            return relax.call_tir(
+                self.implementations[key], [source, base], out_ty=call.ty
+            )
+
         if symbol == "relax.vortex.quantize_int4":
             if not self.lower_auxiliary_ops:
                 return call
@@ -1872,6 +2032,10 @@ def _w4a16_lowering_pass(
         if lowerer.lowered_w4a16:
             lowered = lowered.with_attr(
                 "vortex.w4a16.lowered", lowerer.lowered_w4a16
+            )
+        if lowerer.lowered_hadamard:
+            lowered = lowered.with_attr(
+                "vortex.hadamard.lowered", lowerer.lowered_hadamard
             )
         if lowerer.prepacked_descriptors:
             lowered = lowered.with_attr(

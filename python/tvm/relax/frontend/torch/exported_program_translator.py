@@ -2060,6 +2060,28 @@ class ExportedProgramImporter(BaseFXGraphImporter):
     def _vortex_mm_w4a16(self, node: fx.Node) -> relax.Var:
         return self._vortex_mm_w4a16_call(node, "relax.vortex.mm_w4a16")
 
+    def _vortex_hadamard(self, node: fx.Node) -> relax.Var:
+        hidden, base, base_size = self.retrieve_args(node)
+        hidden_shape = list(self.shape_of(hidden))
+        base_shape = list(self.shape_of(base))
+        if len(hidden_shape) < 2 or hidden.ty.dtype.dtype != "float16":
+            raise ValueError("vortex.hadamard input must be rank-2-or-higher FP16")
+        if base_shape != [base_size, base_size] or base.ty.dtype.dtype != "float32":
+            raise ValueError("vortex.hadamard base must be base_size-square FP32")
+        if base_size <= 0 or hidden_shape[-1] % base_size:
+            raise ValueError("vortex.hadamard base_size must divide the input width")
+        factor = hidden_shape[-1] // base_size
+        if factor & (factor - 1):
+            raise ValueError("vortex.hadamard factor must be a power of two")
+        call = relax.op.call_pure_packed(
+            "relax.vortex.hadamard",
+            hidden,
+            base,
+            relax.prim_value(base_size),
+            ty_args=relax.TensorType(hidden_shape, "float16"),
+        )
+        return self.block_builder.emit(call, name_hint="vortex_hadamard")
+
     def _vortex_mm_w4a16_prepacked(self, node: fx.Node) -> relax.Var:
         return self._vortex_mm_w4a16_call(
             node, "relax.vortex.mm_w4a16_prepacked"
@@ -2148,6 +2170,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             # selection happens only in the Vortex target pipeline.
             "quantize_int4.default": self._vortex_quantize_int4,
             "dequantize_int4.default": self._vortex_dequantize_int4,
+            "hadamard.default": self._vortex_hadamard,
             "mm_w4a16.default": self._vortex_mm_w4a16,
             "mm_w4a16_prepacked.default": self._vortex_mm_w4a16_prepacked,
             "kv_cache_update.default": self._vortex_kv_cache_update,

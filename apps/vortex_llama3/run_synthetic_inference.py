@@ -378,7 +378,7 @@ def prepare_package(args, rows: Sequence[Sequence[int]]) -> Path:
         "layout_policy": args.layout_policy,
         "exec_mode": args.exec_mode,
         "compiled_layers": COMPILED_LAYERS,
-        "decoder_storage_policy": "dense_mixed_radix_hadamard_v1",
+        "decoder_storage_policy": "single_kernel_mixed_radix_hadamard_v1",
         "profile_fingerprint": profile.fingerprint,
         "xclbin": str(args.xclbin.resolve()),
         "archive_manifest": persisted_archive_manifest,

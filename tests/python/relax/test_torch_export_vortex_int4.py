@@ -52,6 +52,7 @@ from spinquant_inference.llama3_c4_export import (  # noqa: E402
     make_meta_parameters,
     stack_parameter_shapes,
 )
+from spinquant_inference.utils.hadamard_utils import get_hadK  # noqa: E402
 NAIVE_XCLBIN = Path(
     "/opt/vortex_fpga_bins/fpint/"
     "xrt_hw_u55c_c_f100_fpint_9600db3a37/bin/vortex_afu.xclbin"
@@ -259,6 +260,17 @@ class _QuantizeDequantize(torch.nn.Module):
         )
 
 
+class _Hadamard(torch.nn.Module):
+    def __init__(self, width, base, base_size):
+        super().__init__()
+        self.register_buffer("base", base)
+        self.width = width
+        self.base_size = base_size
+
+    def forward(self, source):
+        return torch.ops.vortex.hadamard(source, self.base, self.base_size)
+
+
 class _KVCacheUpdate(torch.nn.Module):
     def forward(
         self,
@@ -413,6 +425,7 @@ def test_import_backend_neutral_llama3_prefill_and_decode_graphs():
     )
     prefill_script = prefill.script()
     assert prefill_script.count('R.call_pure_packed("relax.vortex.mm_w4a16"') == 9
+    assert prefill_script.count('R.call_pure_packed("relax.vortex.hadamard"') == 3
     assert prefill_script.count('R.call_pure_packed("relax.vortex.quantize_int4"') == 2
     assert prefill_script.count('R.call_pure_packed("relax.vortex.kv_cache_update"') == 2
     assert "tile_input_a" not in prefill_script
@@ -465,6 +478,7 @@ def test_import_backend_neutral_llama3_prefill_and_decode_graphs():
     assert "allocated KV cache capacity" in decode_script
     assert decode_script.index("R.assert_op") < decode_script.index("with R.dataflow()")
     assert decode_script.count('R.call_pure_packed("relax.vortex.mm_w4a16"') == 9
+    assert decode_script.count('R.call_pure_packed("relax.vortex.hadamard"') == 3
     assert decode_script.count(
         'R.call_pure_packed("relax.vortex.kv_cache_update_dynamic"'
     ) == 2
@@ -831,6 +845,58 @@ def test_vortex_logical_int4_ops_import_one_to_one():
     assert "vx_tvm_gemm_w4a16" in lowered_script
     assert 'R.call_pure_packed("relax.vortex.mm_w4a16"' not in lowered_script
     assert "transpose" not in lowered_script
+
+
+@pytest.mark.parametrize("width", [128, 14336])
+def test_hadamard_imports_and_compiles_as_exactly_one_vortex_kernel(width):
+    _register_logical_ops()
+    base, base_size = get_hadK(width)
+    base_size = int(base_size)
+    if base_size == 1:
+        base = torch.ones((1, 1), dtype=torch.float32)
+    model = _Hadamard(width, base.to(torch.float32), base_size).eval()
+    source = torch.linspace(-0.25, 0.25, width, dtype=torch.float16).reshape(
+        1, 1, width
+    )
+    eager = model(source)
+    assert eager.dtype == torch.float16
+    assert torch.isfinite(eager).all()
+
+    exported = torch.export.export(model, (source,), strict=True)
+    call_targets = [
+        node.target for node in exported.graph.nodes if node.op == "call_function"
+    ]
+    assert call_targets.count(torch.ops.vortex.hadamard.default) == 1
+    mod = from_exported_program(
+        exported,
+        run_ep_decomposition=False,
+        unwrap_unit_return_tuple=True,
+    )
+    assert mod.script().count('R.call_pure_packed("relax.vortex.hadamard"') == 1
+
+    target = tvm.target.Target("vortex", host="llvm")
+    callback_name = "tvm_callback_vortex_compile"
+    previous = tvm.get_global_func(callback_name)
+    captured = []
+
+    def capture(device_source, unused_target):
+        del unused_target
+        captured.append(device_source)
+        return bytearray(range(32))
+
+    tvm.register_global_func(callback_name, capture, override=True)
+    try:
+        relax.build(
+            mod,
+            target,
+            relax_pipeline=relax.backend.vortex.get_default_pipeline(target),
+            exec_mode="bytecode",
+        )
+    finally:
+        tvm.register_global_func(callback_name, previous, override=True)
+    assert len(captured) == 1
+    assert captured[0].count("// Vortex kernel") == 1
+    assert f"vortex_hadamard_{width}_kernel" in captured[0]
 
 
 def test_naive_target_compiles_logical_w4a16_to_gemm_job_source():
