@@ -550,6 +550,12 @@ def test_runtime_enabled_reports_vortex_sidecar():
     assert tvm.runtime.enabled("vortex")
 
 
+def test_device_address_rejects_non_vortex_tensor():
+    device_address = tvm.get_global_func("runtime.vortex_device_address")
+    with pytest.raises(ValueError, match="requires a Vortex tensor"):
+        device_address(tvm.runtime.empty((1,), "int32", tvm.cpu()))
+
+
 @pytest.mark.skipif(
     os.environ.get("TVM_VORTEX_RUN_HARDWARE") != "1",
     reason="set TVM_VORTEX_RUN_HARDWARE=1 inside an allocated XRT hardware environment",
@@ -557,8 +563,13 @@ def test_runtime_enabled_reports_vortex_sidecar():
 def test_hardware_allocation_and_copy_round_trip(vortex_hardware_environment):
     host = np.arange((1 << 20) // np.dtype("int32").itemsize + 17, dtype="int32")
     device_array = tvm.runtime.tensor(host, device=tvm.vortex(0))
+    device_address = tvm.get_global_func("runtime.vortex_device_address")
+    first_address = device_address(device_array)
+    assert first_address == device_address(device_array)
+    assert first_address % 512 == 0
     np.testing.assert_array_equal(device_array.numpy(), host)
     second_device_array = device_array.copyto(tvm.vortex(0))
+    assert device_address(second_device_array) != first_address
     np.testing.assert_array_equal(second_device_array.numpy(), host)
     assert device_array.device.max_shared_memory_per_block == 1 << 20
     assert device_array.device.max_thread_dimensions == [128, 128, 128]

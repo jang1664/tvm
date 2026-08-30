@@ -109,6 +109,7 @@ def prepare_c4_parameter_archive(
     target,
     profile_fingerprint: str,
     num_layers: int,
+    model_metadata: Mapping[str, object] | None = None,
 ) -> Path:
     """Prepack canonical W4 tensors and write a checked external archive."""
 
@@ -186,17 +187,12 @@ def prepare_c4_parameter_archive(
                 offset = aligned_offset + physical.nbytes
 
         for name in sorted(parameters):
-            if not (
-                name.endswith("_norm.weight")
-                or name == "token_embedding.weight"
-            ):
+            if not (name.endswith("_norm.weight") or name == "token_embedding.weight"):
                 continue
             physical = np.ascontiguousarray(parameters[name], dtype="float16")
             expected_rank = 2 if name == "token_embedding.weight" else 1
             if physical.ndim != expected_rank:
-                raise ValueError(
-                    f"Llama3 raw FP16 parameter has wrong rank: {name}"
-                )
+                raise ValueError(f"Llama3 raw FP16 parameter has wrong rank: {name}")
             aligned_offset = _align(offset)
             stream.write(bytes(aligned_offset - offset))
             stream.write(memoryview(physical))
@@ -229,6 +225,7 @@ def prepare_c4_parameter_archive(
         "data_nbytes": data_path.stat().st_size,
         "data_sha256": _sha256_file(data_path),
         "profile": asdict(profile),
+        "model_metadata": dict(model_metadata or {}),
         "records": records,
     }
     manifest_path.write_text(
@@ -245,6 +242,7 @@ class C4ParameterArchive:
         manifest_path: str | Path,
         expected_profile_fingerprint: str,
         expected_num_layers: int,
+        expected_model_metadata: Mapping[str, object] | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
@@ -256,6 +254,12 @@ class C4ParameterArchive:
             raise ValueError("C4 parameter archive profile fingerprint mismatch")
         if self.manifest.get("num_layers") != expected_num_layers:
             raise ValueError("C4 parameter archive layer count mismatch")
+        actual_model_metadata = self.manifest.get("model_metadata", {})
+        for name, expected in (expected_model_metadata or {}).items():
+            if actual_model_metadata.get(name) != expected:
+                raise ValueError(
+                    f"C4 parameter archive model metadata mismatch: {name}"
+                )
         self.data_path = self.manifest_path.parent / self.manifest["data_file"]
         actual_size = self.data_path.stat().st_size
         if actual_size != self.manifest["data_nbytes"]:
@@ -266,6 +270,24 @@ class C4ParameterArchive:
         if len(self.records) != len(self.manifest["records"]):
             raise ValueError("C4 parameter archive contains duplicate record names")
         self._resident = {}
+
+    def layer_parameter_names(
+        self, layer_index: int, local_layer_index: int = 0
+    ) -> Mapping[str, str]:
+        """Map local compiled-layer inputs to one global archive layer."""
+
+        if not 0 <= layer_index < self.manifest["num_layers"]:
+            raise IndexError(f"archive layer index out of range: {layer_index}")
+        global_prefix = f"layers.{layer_index}."
+        local_prefix = f"layers.{local_layer_index}."
+        mapping = {
+            f"{local_prefix}{name.removeprefix(global_prefix)}": name
+            for name in self.records
+            if name.startswith(global_prefix)
+        }
+        if not mapping:
+            raise ValueError(f"archive contains no parameters for layer {layer_index}")
+        return mapping
 
     def tensor(self, name: str) -> np.memmap:
         """Return one read-only physical tensor after validating its record hash."""
@@ -284,13 +306,19 @@ class C4ParameterArchive:
             raise ValueError(f"C4 parameter archive record hash mismatch: {name}")
         return tensor
 
-    def upload(self, device) -> Mapping[str, object]:
-        """Upload every physical tensor once per device and retain its handle."""
+    def upload(
+        self, device, names: Sequence[str] | None = None
+    ) -> Mapping[str, object]:
+        """Upload selected physical tensors once per device and retain their handles."""
 
         device_key = (str(device.type), int(device.index))
-        if device_key not in self._resident:
-            self._resident[device_key] = {
-                name: runtime_tensor(np.asarray(self.tensor(name)), device=device)
-                for name in self.records
-            }
-        return self._resident[device_key]
+        resident = self._resident.setdefault(device_key, {})
+        selected_names = tuple(self.records) if names is None else tuple(names)
+        for name in selected_names:
+            if name not in self.records:
+                raise KeyError(name)
+            if name not in resident:
+                resident[name] = runtime_tensor(
+                    np.asarray(self.tensor(name)), device=device
+                )
+        return resident

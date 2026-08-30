@@ -25,6 +25,7 @@
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/runtime/tensor.h>
 #include <vx_tvm_abi.h>
 
 #include <algorithm>
@@ -372,6 +373,23 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                   [](ffi::PackedArgs args, ffi::Any* rv) {
                     *rv = static_cast<void*>(VortexDeviceAPI::Global());
                   })
+      .def_packed("runtime.vortex_device_address", [](ffi::PackedArgs args, ffi::Any* rv) {
+        TVM_FFI_CHECK_EQ(args.size(), 1, ValueError)
+            << "runtime.vortex_device_address expects one tensor";
+        Tensor tensor = args[0].cast<Tensor>();
+        const DLTensor* dl_tensor = tensor.operator->();
+        TVM_FFI_CHECK_EQ(dl_tensor->device.device_type, kDLExtDev, ValueError)
+            << "Vortex device address requires a Vortex tensor";
+        uint64_t address = VortexDeviceAPI::Global()->ResolveAddress(dl_tensor->data);
+        TVM_FFI_CHECK_LE(dl_tensor->byte_offset,
+                         std::numeric_limits<uint64_t>::max() - address, ValueError)
+            << "Vortex tensor byte offset overflows its device address";
+        address += dl_tensor->byte_offset;
+        TVM_FFI_CHECK_LE(address, static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+                         ValueError)
+            << "Vortex device address does not fit a signed 64-bit diagnostic value";
+        *rv = static_cast<int64_t>(address);
+      })
       .def("runtime.vortex_abi_version", []() { return int64_t{VX_TVM_ABI_VERSION}; });
 }
 

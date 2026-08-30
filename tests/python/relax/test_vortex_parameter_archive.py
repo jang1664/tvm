@@ -53,9 +53,7 @@ def _test_parameters(specs):
         parameters[f"{spec.name}.zeros"] = generator.integers(
             -4, 5, size=(groups, spec.logical_n), dtype="int16"
         )
-    layer_prefixes = {
-        ".".join(spec.name.split(".", 2)[:2]) for spec in specs
-    }
+    layer_prefixes = {".".join(spec.name.split(".", 2)[:2]) for spec in specs}
     for prefix in layer_prefixes:
         parameters[f"{prefix}.input_norm.weight"] = np.ones((33,), dtype="float16")
         parameters[f"{prefix}.post_attention_norm.weight"] = np.ones(
@@ -80,8 +78,18 @@ def test_c4_parameter_archive_prepack_and_validation(tmp_path):
         target,
         profile_fingerprint="test-profile",
         num_layers=2,
+        model_metadata={
+            "model": "llama3-8b",
+            "hidden_size": 33,
+            "quantization_policy": "signed_all_asymmetric_wkv4_v1",
+        },
     )
-    archive = C4ParameterArchive(manifest_path, "test-profile", 2)
+    archive = C4ParameterArchive(
+        manifest_path,
+        "test-profile",
+        2,
+        expected_model_metadata={"model": "llama3-8b", "hidden_size": 33},
+    )
     assert len(archive.records) == 10
 
     plan = plan_improve_layout(
@@ -93,31 +101,46 @@ def test_c4_parameter_archive_prepack_and_validation(tmp_path):
     )
     np.testing.assert_array_equal(
         archive.tensor("layers.0.q_proj.scales"),
-        prepack_improve_qparam(
-            parameters["layers.0.q_proj.scales"], plan, "float16"
-        ),
+        prepack_improve_qparam(parameters["layers.0.q_proj.scales"], plan, "float16"),
     )
     np.testing.assert_array_equal(
         archive.tensor("layers.0.q_proj.zeros"),
-        prepack_improve_qparam(
-            parameters["layers.0.q_proj.zeros"], plan, "int16"
-        ),
+        prepack_improve_qparam(parameters["layers.0.q_proj.zeros"], plan, "int16"),
     )
+    first_upload = archive.upload(tvm.cpu(), ["layers.0.q_proj.qweight"])
+    assert tuple(first_upload) == ("layers.0.q_proj.qweight",)
+    first_tensor = first_upload["layers.0.q_proj.qweight"]
     first_upload = archive.upload(tvm.cpu())
     second_upload = archive.upload(tvm.cpu())
     assert first_upload is second_upload
-    assert first_upload["layers.0.q_proj.qweight"] is second_upload[
-        "layers.0.q_proj.qweight"
-    ]
+    assert first_upload["layers.0.q_proj.qweight"] is first_tensor
+    assert (
+        first_upload["layers.0.q_proj.qweight"]
+        is second_upload["layers.0.q_proj.qweight"]
+    )
     np.testing.assert_array_equal(
         archive.tensor("layers.1.post_attention_norm.weight"),
         np.ones((33,), dtype="float16"),
     )
+    assert archive.layer_parameter_names(1)["layers.0.q_proj.qweight"] == (
+        "layers.1.q_proj.qweight"
+    )
+    with pytest.raises(IndexError, match="layer index out of range"):
+        archive.layer_parameter_names(2)
+    with pytest.raises(KeyError, match="missing"):
+        archive.upload(tvm.cpu(), ["missing"])
 
     with pytest.raises(ValueError, match="profile fingerprint mismatch"):
         C4ParameterArchive(manifest_path, "other-profile", 2)
     with pytest.raises(ValueError, match="layer count mismatch"):
         C4ParameterArchive(manifest_path, "test-profile", 4)
+    with pytest.raises(ValueError, match="model metadata mismatch: model"):
+        C4ParameterArchive(
+            manifest_path,
+            "test-profile",
+            2,
+            expected_model_metadata={"model": "other"},
+        )
 
 
 def test_c4_parameter_archive_rejects_size_and_hash_corruption(tmp_path):
