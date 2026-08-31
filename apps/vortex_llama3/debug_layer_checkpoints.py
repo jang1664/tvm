@@ -115,16 +115,14 @@ def _build_module(args, package: dict, archive) -> None:
 
 def main() -> None:
     args = make_parser().parse_args()
-    if not 1 <= args.layer < 32 or not 1 <= args.alternate_layer < 32:
-        raise ValueError("layer indices must be between 1 and 31")
+    if not 0 <= args.layer < 32 or not 0 <= args.alternate_layer < 32:
+        raise ValueError("layer indices must be between 0 and 31")
     if args.layer == args.alternate_layer:
         raise ValueError("layer and alternate-layer must differ")
     if args.iterations <= 0 or args.retry_on_mismatch < 0:
         raise ValueError("iterations must be positive and retries nonnegative")
 
     package, archive = load_package(args.artifact_dir / "package.json", args.xclbin)
-    if package["shape"]["prompt_length"] != 1:
-        raise ValueError("checkpoint reproducer currently requires S1 prefill")
     if args.build:
         _build_module(args, package, archive)
     if not args.module.exists():
@@ -140,23 +138,28 @@ def main() -> None:
     reference = np.load(args.reference_artifact, allow_pickle=False)
     device = tvm.vortex(0)
     device_address = tvm.get_global_func("runtime.vortex_device_address")
+    local_names = tuple(package["layer_parameter_order"])
+    selected_layers = (args.layer, args.alternate_layer)
     decoder_names = tuple(
-        name for name in archive.records if name.startswith("layers.")
+        name
+        for layer in selected_layers
+        for name in _chunk_parameter_names(local_names, layer)
     )
     resident = archive.upload(device, decoder_names)
-    archive.upload(
-        device,
-        tuple(name for name in archive.records if not name.startswith("layers.")),
-    )
-    local_names = tuple(package["layer_parameter_order"])
+    embedding_weight = np.asarray(archive.tensor("token_embedding.weight"))
     contexts = []
-    for layer in (args.layer, args.alternate_layer):
+    for layer in selected_layers:
         global_names = _chunk_parameter_names(local_names, layer)
+        hidden_input = (
+            embedding_weight[reference["p0_token_ids"]]
+            if layer == 0
+            else reference[f"p0_l{layer - 1}_o0"]
+        )
         contexts.append(
             {
                 "layer": layer,
                 "hidden": tvm.runtime.tensor(
-                    reference[f"p0_l{layer - 1}_o0"], device=device
+                    hidden_input, device=device
                 ),
                 "expected": reference[f"p0_l{layer}_o0"].astype("float32"),
                 "parameters": [resident[name] for name in global_names],
