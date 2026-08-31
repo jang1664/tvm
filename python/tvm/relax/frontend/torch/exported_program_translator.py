@@ -2082,6 +2082,43 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         )
         return self.block_builder.emit(call, name_hint="vortex_hadamard")
 
+    def _vortex_causal_softmax(self, node: fx.Node) -> relax.Var:
+        scores, position_ids, valid_length, head_dim = self.retrieve_args(node)
+        scores_shape = list(self.shape_of(scores))
+        position_shape = list(self.shape_of(position_ids))
+        valid_length_shape = list(self.shape_of(valid_length))
+        if len(scores_shape) != 5 or scores.ty.dtype.dtype != "float16":
+            raise ValueError("vortex.causal_softmax scores must be rank-5 FP16")
+        if position_ids.ty.dtype.dtype != "int64" or position_shape != [
+            scores_shape[0],
+            scores_shape[-2],
+        ]:
+            raise ValueError(
+                "vortex.causal_softmax position_ids must be rank-2 INT64 and "
+                "match the batch/query extents"
+            )
+        if valid_length.ty.dtype.dtype != "int64" or valid_length_shape != []:
+            raise ValueError(
+                "vortex.causal_softmax valid_length must be a scalar INT64"
+            )
+        if head_dim <= 0:
+            raise ValueError("vortex.causal_softmax head_dim must be positive")
+        output_type = relax.TupleType(
+            [
+                relax.TensorType(scores_shape, "float32"),
+                relax.TensorType(scores_shape, "float16"),
+            ]
+        )
+        call = relax.op.call_pure_packed(
+            "relax.vortex.causal_softmax",
+            scores,
+            position_ids,
+            valid_length,
+            relax.prim_value(head_dim),
+            ty_args=output_type,
+        )
+        return self.block_builder.emit(call, name_hint="vortex_causal_softmax")
+
     def _vortex_mm_w4a16_prepacked(self, node: fx.Node) -> relax.Var:
         return self._vortex_mm_w4a16_call(
             node, "relax.vortex.mm_w4a16_prepacked"
@@ -2171,6 +2208,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "quantize_int4.default": self._vortex_quantize_int4,
             "dequantize_int4.default": self._vortex_dequantize_int4,
             "hadamard.default": self._vortex_hadamard,
+            "causal_softmax.default": self._vortex_causal_softmax,
             "mm_w4a16.default": self._vortex_mm_w4a16,
             "mm_w4a16_prepacked.default": self._vortex_mm_w4a16_prepacked,
             "kv_cache_update.default": self._vortex_kv_cache_update,

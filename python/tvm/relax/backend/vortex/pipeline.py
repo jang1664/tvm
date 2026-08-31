@@ -156,8 +156,86 @@ def _make_hadamard(shape, base_size):
                             target_base * factor + column,
                             accumulator[0] * T.float32(normalization),
                         )
+                    # Every thread must finish reading the current row from the
+                    # shared work buffer before any thread starts loading the
+                    # next row into the same storage.
+                    T.tvm_storage_sync("shared")
 
     return hadamard
+
+
+def _make_causal_softmax(shape, position_shape, valid_length_shape, head_dim):
+    """Create one rank-5 scaled causal-mask/softmax device kernel."""
+
+    rows = math.prod(shape[:-1])
+    capacity = shape[-1]
+    inverse_scale = 1.0 / math.sqrt(head_dim)
+
+    @T.prim_func(private=True)
+    def causal_softmax(
+        scores: T.Buffer(shape, "float16"),
+        position_ids: T.Buffer(position_shape, "int64"),
+        valid_length: T.Buffer(valid_length_shape, "int64"),
+        masked_scores: T.Buffer(shape, "float32"),
+        probabilities: T.Buffer(shape, "float16"),
+    ):
+        T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
+        maximum = T.alloc_buffer((1,), "float32", scope="local")
+        denominator = T.alloc_buffer((1,), "float32", scope="local")
+        for bx in T.thread_binding((rows + 127) // 128, thread="blockIdx.x"):
+            for tx in T.thread_binding(128, thread="threadIdx.x"):
+                row = bx * 128 + tx
+                if row < rows:
+                    batch = row // (shape[1] * shape[2] * shape[3])
+                    kv_head = row // (shape[2] * shape[3]) % shape[1]
+                    group = row // shape[3] % shape[2]
+                    query = row % shape[3]
+                    maximum[0] = T.float32(-3.4028234663852886e38)
+                    for key in T.serial(capacity):
+                        is_valid = T.And(
+                            T.Cast("int64", key) < valid_length[()],
+                            T.Cast("int64", key) <= position_ids[batch, query],
+                        )
+                        scaled = T.Cast(
+                            "float32", scores[batch, kv_head, group, query, key]
+                        ) * T.float32(inverse_scale)
+                        masked_scores[batch, kv_head, group, query, key] = T.Select(
+                            is_valid, scaled, T.float32(float("-inf"))
+                        )
+                        if is_valid:
+                            maximum[0] = T.max(maximum[0], scaled)
+                    denominator[0] = T.float32(0)
+                    for key in T.serial(capacity):
+                        is_valid = T.And(
+                            T.Cast("int64", key) < valid_length[()],
+                            T.Cast("int64", key) <= position_ids[batch, query],
+                        )
+                        if is_valid:
+                            denominator[0] = denominator[0] + T.exp(
+                                masked_scores[batch, kv_head, group, query, key]
+                                - maximum[0]
+                            )
+                    for key in T.serial(capacity):
+                        is_valid = T.And(
+                            T.Cast("int64", key) < valid_length[()],
+                            T.Cast("int64", key) <= position_ids[batch, query],
+                        )
+                        probabilities[batch, kv_head, group, query, key] = T.Select(
+                            is_valid,
+                            T.Cast(
+                                "float16",
+                                T.exp(
+                                    masked_scores[
+                                        batch, kv_head, group, query, key
+                                    ]
+                                    - maximum[0]
+                                )
+                                / denominator[0],
+                            ),
+                            T.float16(0),
+                        )
+
+    return causal_softmax
 
 
 def _make_quantize_int4_row_major(shape, group_size, scheme):
@@ -1139,6 +1217,7 @@ class _W4A16Lowerer(relax.PyExprMutator):
         self.prepacked_descriptors = []
         self.lowered_w4a16 = 0
         self.lowered_hadamard = 0
+        self.lowered_causal_softmax = 0
         self.external_prepacked_w4a16 = 0
         self.reused_a_layouts = 0
         for _, function in mod.functions_items():
@@ -1457,6 +1536,47 @@ class _W4A16Lowerer(relax.PyExprMutator):
             self.lowered_hadamard += 1
             return relax.call_tir(
                 self.implementations[key], [source, base], out_ty=call.ty
+            )
+
+        if symbol == "relax.vortex.causal_softmax":
+            scores, position_ids, valid_length = call.args[1:4]
+            head_dim = int(_prim_value(call.args[4]))
+            scores_shape = _static_tensor_shape(scores, "float16")
+            position_shape = _static_tensor_shape(position_ids, "int64")
+            valid_length_shape = _static_tensor_shape(valid_length, "int64")
+            if scores_shape is None or len(scores_shape) != 5:
+                raise ValueError(
+                    "Vortex causal_softmax requires static rank-5 FP16 scores"
+                )
+            if position_shape != (scores_shape[0], scores_shape[-2]):
+                raise ValueError(
+                    "Vortex causal_softmax position shape must match batch/query"
+                )
+            if valid_length_shape != ():
+                raise ValueError(
+                    "Vortex causal_softmax valid_length must be scalar"
+                )
+            if head_dim <= 0:
+                raise ValueError("Vortex causal_softmax head_dim must be positive")
+            key = (
+                "causal_softmax",
+                scores_shape,
+                position_shape,
+                valid_length_shape,
+                head_dim,
+            )
+            if key not in self.implementations:
+                self.implementations[key] = self.builder_.add_func(
+                    _make_causal_softmax(
+                        scores_shape, position_shape, valid_length_shape, head_dim
+                    ),
+                    "vortex_causal_softmax",
+                )
+            self.lowered_causal_softmax += 1
+            return relax.call_tir(
+                self.implementations[key],
+                [scores, position_ids, valid_length],
+                out_ty=list(call.ty.fields),
             )
 
         if symbol == "relax.vortex.quantize_int4":
@@ -2036,6 +2156,10 @@ def _w4a16_lowering_pass(
         if lowerer.lowered_hadamard:
             lowered = lowered.with_attr(
                 "vortex.hadamard.lowered", lowerer.lowered_hadamard
+            )
+        if lowerer.lowered_causal_softmax:
+            lowered = lowered.with_attr(
+                "vortex.causal_softmax.lowered", lowerer.lowered_causal_softmax
             )
         if lowerer.prepacked_descriptors:
             lowered = lowered.with_attr(

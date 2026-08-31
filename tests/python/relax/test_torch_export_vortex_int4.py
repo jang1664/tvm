@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import importlib.util
+import math
 import os
 import sys
 import tempfile
@@ -426,6 +427,9 @@ def test_import_backend_neutral_llama3_prefill_and_decode_graphs():
     prefill_script = prefill.script()
     assert prefill_script.count('R.call_pure_packed("relax.vortex.mm_w4a16"') == 9
     assert prefill_script.count('R.call_pure_packed("relax.vortex.hadamard"') == 3
+    assert prefill_script.count(
+        'R.call_pure_packed("relax.vortex.causal_softmax"'
+    ) == 1
     assert prefill_script.count('R.call_pure_packed("relax.vortex.quantize_int4"') == 2
     assert prefill_script.count('R.call_pure_packed("relax.vortex.kv_cache_update"') == 2
     assert "tile_input_a" not in prefill_script
@@ -444,8 +448,15 @@ def test_import_backend_neutral_llama3_prefill_and_decode_graphs():
     assert 'R.call_pure_packed("relax.vortex.mm_w4a16"' not in prefill_alone_script
     prefill_fused = _w4a16_lowering_pass(target, layout_policy="fused")(prefill)
     assert prefill_fused.attrs["vortex.improve.reused_a_layouts"] == 3
+    prefill_fused_script = prefill_fused.script()
+    assert prefill_fused.attrs["vortex.hadamard.lowered"] == 3
+    assert prefill_fused.attrs["vortex.causal_softmax.lowered"] == 1
     assert prefill_alone_script.count("R.call_tir(cls.vortex_gemm_a_tiled") == 15
-    assert prefill_fused.script().count("R.call_tir(cls.vortex_gemm_a_tiled") == 12
+    assert prefill_fused_script.count("R.call_tir(cls.vortex_gemm_a_tiled") == 12
+    assert prefill_fused_script.count("R.call_tir(cls.vortex_hadamard_") == 3
+    assert prefill_fused_script.count(
+        "R.call_tir(cls.vortex_causal_softmax"
+    ) == 1
 
     packed = torch.empty((1, 2, 32, 16), dtype=torch.uint8)
     scale = torch.empty((1, 2, 32, 1), dtype=torch.float16)
@@ -480,6 +491,9 @@ def test_import_backend_neutral_llama3_prefill_and_decode_graphs():
     assert decode_script.count('R.call_pure_packed("relax.vortex.mm_w4a16"') == 9
     assert decode_script.count('R.call_pure_packed("relax.vortex.hadamard"') == 3
     assert decode_script.count(
+        'R.call_pure_packed("relax.vortex.causal_softmax"'
+    ) == 1
+    assert decode_script.count(
         'R.call_pure_packed("relax.vortex.kv_cache_update_dynamic"'
     ) == 2
     decode_alone = _w4a16_lowering_pass(target, layout_policy="alone")(decode)
@@ -493,8 +507,15 @@ def test_import_backend_neutral_llama3_prefill_and_decode_graphs():
     )
     decode_fused = _w4a16_lowering_pass(target, layout_policy="fused")(decode)
     assert decode_fused.attrs["vortex.improve.reused_a_layouts"] == 3
+    decode_fused_script = decode_fused.script()
+    assert decode_fused.attrs["vortex.hadamard.lowered"] == 3
+    assert decode_fused.attrs["vortex.causal_softmax.lowered"] == 1
     assert decode_alone_script.count("R.call_tir(cls.vortex_gemm_a_tiled") == 15
-    assert decode_fused.script().count("R.call_tir(cls.vortex_gemm_a_tiled") == 12
+    assert decode_fused_script.count("R.call_tir(cls.vortex_gemm_a_tiled") == 12
+    assert decode_fused_script.count("R.call_tir(cls.vortex_hadamard_") == 3
+    assert decode_fused_script.count(
+        "R.call_tir(cls.vortex_causal_softmax"
+    ) == 1
     decode_inplace = _w4a16_lowering_pass(
         target,
         layout_policy="alone",
@@ -847,17 +868,23 @@ def test_vortex_logical_int4_ops_import_one_to_one():
     assert "transpose" not in lowered_script
 
 
-@pytest.mark.parametrize("width", [128, 14336])
-def test_hadamard_imports_and_compiles_as_exactly_one_vortex_kernel(width):
+@pytest.mark.parametrize("layout_policy", ["alone", "fused"])
+@pytest.mark.parametrize(
+    ("width", "source_shape"),
+    [(128, (1, 1, 128)), (14336, (1, 1, 14336)), (14336, (1, 7, 14336))],
+)
+def test_hadamard_imports_and_compiles_as_exactly_one_vortex_kernel(
+    width, source_shape, layout_policy
+):
     _register_logical_ops()
     base, base_size = get_hadK(width)
     base_size = int(base_size)
     if base_size == 1:
         base = torch.ones((1, 1), dtype=torch.float32)
     model = _Hadamard(width, base.to(torch.float32), base_size).eval()
-    source = torch.linspace(-0.25, 0.25, width, dtype=torch.float16).reshape(
-        1, 1, width
-    )
+    source = torch.linspace(
+        -0.25, 0.25, math.prod(source_shape), dtype=torch.float16
+    ).reshape(source_shape)
     eager = model(source)
     assert eager.dtype == torch.float16
     assert torch.isfinite(eager).all()
@@ -889,7 +916,9 @@ def test_hadamard_imports_and_compiles_as_exactly_one_vortex_kernel(width):
         relax.build(
             mod,
             target,
-            relax_pipeline=relax.backend.vortex.get_default_pipeline(target),
+            relax_pipeline=relax.backend.vortex.get_default_pipeline(
+                target, layout_policy=layout_policy
+            ),
             exec_mode="bytecode",
         )
     finally:
