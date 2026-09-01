@@ -16,6 +16,7 @@
 # under the License.
 """Host-only tests for the directly runnable Vortex Llama3 utility."""
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -44,6 +45,52 @@ from vortex_llama3.run_synthetic_inference import (  # noqa: E402
     make_parser,
     parse_prompt_token_ids,
 )
+from vortex_llama3.debug_canonical_layer_range import (  # noqa: E402
+    EventTrace,
+    make_parser as make_canonical_parser,
+    parse_layer_range,
+    parse_phases,
+    required_reference_keys,
+    validate_reference_keys,
+)
+
+
+def test_canonical_layer_range_parsing_and_required_reference_keys():
+    phases = parse_phases("prefill,decode_2", decode_steps=3)
+    layers = parse_layer_range("8:9")
+
+    assert phases == (0, 2)
+    assert layers == (8, 9)
+    keys = required_reference_keys(phases, layers)
+    assert "p0_l7_o0" in keys
+    assert "p2_l8_o7" in keys
+    assert "p1_l9_o6" in keys
+
+    with pytest.raises(ValueError, match="invalid diagnostic phase"):
+        parse_phases("decode_x", decode_steps=3)
+    with pytest.raises(ValueError, match="outside decode-steps"):
+        parse_phases("decode_4", decode_steps=3)
+    with pytest.raises(ValueError, match="0 <= START"):
+        parse_layer_range("9:8")
+
+
+def test_canonical_layer_range_rejects_missing_reference_arrays():
+    with pytest.raises(ValueError, match="missing"):
+        validate_reference_keys({}, (3,), (10, 10))
+
+
+def test_event_trace_flushes_one_json_object_per_line(tmp_path):
+    path = tmp_path / "events.jsonl"
+    with EventTrace(path, {"run_uuid": "test-run"}) as trace:
+        trace.write("before", layer=2)
+        assert path.read_text(encoding="utf-8").count("\n") == 1
+        trace.write("after", healthy=True)
+
+    records = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["event"] for record in records] == ["before", "after"]
+    assert all(record["run_uuid"] == "test-run" for record in records)
 
 
 def test_preallocated_state_persistence_reuses_destination():
@@ -54,7 +101,9 @@ def test_preallocated_state_persistence_reuses_destination():
     reused = _persist_layer_state((second,), device, "preallocated", persisted)
 
     assert reused[0].same_as(persisted[0])
-    np.testing.assert_array_equal(reused[0].numpy(), np.array([3.0, 4.0], dtype="float16"))
+    np.testing.assert_array_equal(
+        reused[0].numpy(), np.array([3.0, 4.0], dtype="float16")
+    )
 
 
 def test_persistent_repetition_cli_and_trace_paths():
@@ -105,6 +154,22 @@ def test_persistent_repetition_cli_and_trace_paths():
     assert _repetition_trace_path(Path("trace.json"), 2) == Path(
         "trace.repetition-2.json"
     )
+
+    canonical_args = make_canonical_parser().parse_args(
+        [
+            "--artifact-dir",
+            "artifact",
+            "--reference-artifact",
+            "reference.npz",
+            "--xclbin",
+            "image.xclbin",
+            "--trace-output",
+            "events.jsonl",
+            "--repetitions",
+            "3",
+        ]
+    )
+    assert canonical_args.repetitions == 3
 
 
 def test_parse_prompt_token_ids_supports_single_and_batched_prompts():

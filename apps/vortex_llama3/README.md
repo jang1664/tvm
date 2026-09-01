@@ -106,5 +106,28 @@ Start with fixed input and pooled output reuse:
   --trace-output "$TVM_HOME/build/llama3-address-fixed.jsonl"
 ```
 
+For long canonical checkpoint stability tests, use `debug_canonical_layer_range.py`. It validates
+that every requested reference array exists before opening XRT, accepts inclusive layer ranges,
+and flushes a JSONL event before and after each layer launch and D2H boundary. The trace includes
+the Slurm allocation, BDF, current/package revisions, xclbin/package/reference hashes, tensor
+addresses and sizes, internal launch names/counts, output hashes, finite/magnitude summaries, and
+the first runtime error. `--copy-mode none|hidden|full`, `--allocator pooled|naive`, and
+`--repetitions N` isolate copy volume, allocation policy, and persistent-process call count without
+using retries. The embedding probe runs only at explicit diagnostic boundaries and never resets or
+reprograms a failed device.
+
+```bash
+/home/jaeyongjang/.conda/envs/py310/bin/python \
+  apps/vortex_llama3/debug_canonical_layer_range.py \
+  --artifact-dir "$TVM_HOME/build/llama3-s2-fused" \
+  --reference-artifact "$TVM_HOME/build/llama3-s2-fused/reference.npz" \
+  --xclbin "$XRT_XCLBIN_PATH" \
+  --phases prefill,decode_1,decode_2,decode_3 \
+  --layer-range 0:31 --repetitions 3 \
+  --copy-mode full --allocator pooled --vm-scope shared \
+  --health-probe phase --expected-bdf 0000:3d:00.1 \
+  --trace-output "$TVM_HOME/build/llama3-s2-fused/device-events.jsonl"
+```
+
 The generated tokens are deterministic interface evidence only. They have no language meaning
 until a real checkpoint is converted and loaded.
