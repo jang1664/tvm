@@ -23,6 +23,34 @@ export XRT_XCLBIN_PATH=/opt/vortex_fpga_bins/fpint/xrt_hw_u55c_c_f100_fpint_6430
 
 ## Package and run
 
+### Host-only C1/C3 compile matrix
+
+`compile_backend_matrix.py` exports the same backend-neutral Llama3-8B graph for the exact C1 and
+C3 aliases, materializes profile-bound parameters, compiles S1-S4, and reloads every generated VM
+module. S1 includes both bytecode and compiled VM modes; S2-S4 use bytecode mode. No FPGA is opened
+by this command.
+
+```bash
+source "$VORTEX_HOME/configs/tcu_th32_c1_rev2.sh"
+export TVM_VORTEX_HOME="$VORTEX_HOME"
+export TVM_VORTEX_BUILD_DIR="$VORTEX_HOME/build"
+export TVM_VORTEX_LLVM_ROOT=/opt/vortex/llvm-vortex
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+
+/home/jaeyongjang/.conda/envs/vortex/bin/python \
+  apps/vortex_llama3/compile_backend_matrix.py \
+  --artifact-root "$TVM_HOME/build/llama3_c1_c3_compile_matrix" \
+  --aliases C1,C3 \
+  --cases S1,S2,S3,S4
+```
+
+The runner resolves each alias through `ci/fpga_bin_alias_map.yaml` and records the exact config,
+manifest, xclbin hashes, normalized target, profile fingerprint, logical archive hash, physical
+materialization hash, artifact hash, kernel inventory, compile time, and size. It fails closed when
+any of those identities change. C2 policy and lowering have synthetic fixture coverage, but its
+profile-bound compile remains deferred until the mapped C2 image directory contains the intended
+binary and sibling manifest; another config or xclbin must not be substituted.
+
 The initial S1/alone compile, package, eager-reference generation, and run is:
 
 ```bash

@@ -2060,6 +2060,42 @@ class ExportedProgramImporter(BaseFXGraphImporter):
     def _vortex_mm_w4a16(self, node: fx.Node) -> relax.Var:
         return self._vortex_mm_w4a16_call(node, "relax.vortex.mm_w4a16")
 
+    def _vortex_fp16_matmul(self, node: fx.Node) -> relax.Var:
+        lhs, rhs, role = self.retrieve_args(node)
+        lhs_shape = list(self.shape_of(lhs))
+        rhs_shape = list(self.shape_of(rhs))
+        if len(lhs_shape) < 2 or len(rhs_shape) < 2:
+            raise ValueError("vortex.fp16_matmul operands must have rank at least two")
+        if lhs.ty.dtype.dtype != "float16" or rhs.ty.dtype.dtype != "float16":
+            raise ValueError("vortex.fp16_matmul operands must both be FP16")
+        if lhs_shape[-1] != rhs_shape[-2]:
+            raise ValueError(
+                f"vortex.fp16_matmul K mismatch: lhs={lhs_shape[-1]}, rhs={rhs_shape[-2]}"
+            )
+        allowed_roles = {
+            "linear.q_proj",
+            "linear.k_proj",
+            "linear.v_proj",
+            "linear.o_proj",
+            "linear.gate_proj",
+            "linear.up_proj",
+            "linear.down_proj",
+            "linear.lm_head",
+            "attention.qk",
+            "attention.pv",
+        }
+        if role not in allowed_roles:
+            raise ValueError(f"unsupported vortex.fp16_matmul operation role: {role!r}")
+        output_shape = tuple(int(value) for value in node.meta["val"].shape)
+        call = relax.op.call_pure_packed(
+            "relax.vortex.fp16_matmul",
+            lhs,
+            rhs,
+            relax.StringImm(role),
+            ty_args=relax.TensorType(output_shape, "float16"),
+        )
+        return self.block_builder.emit(call, name_hint="vortex_fp16_matmul")
+
     def _vortex_hadamard(self, node: fx.Node) -> relax.Var:
         hidden, base, base_size = self.retrieve_args(node)
         hidden_shape = list(self.shape_of(hidden))
@@ -2207,6 +2243,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             # selection happens only in the Vortex target pipeline.
             "quantize_int4.default": self._vortex_quantize_int4,
             "dequantize_int4.default": self._vortex_dequantize_int4,
+            "fp16_matmul.default": self._vortex_fp16_matmul,
             "hadamard.default": self._vortex_hadamard,
             "causal_softmax.default": self._vortex_causal_softmax,
             "mm_w4a16.default": self._vortex_mm_w4a16,

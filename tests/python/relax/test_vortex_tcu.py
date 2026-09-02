@@ -47,6 +47,16 @@ class TailTCUMatmul:
         return R.matmul(lhs, rhs)
 
 
+@I.ir_module
+class BatchedGQATCUMatmul:
+    @R.function
+    def main(
+        lhs: R.Tensor((2, 2, 2, 7, 33), "float16"),
+        rhs: R.Tensor((2, 2, 1, 33, 9), "float16"),
+    ) -> R.Tensor((2, 2, 2, 7, 9), "float16"):
+        return R.matmul(lhs, rhs)
+
+
 def _target(tcu=True):
     attrs = {"kind": "vortex"}
     if tcu:
@@ -69,11 +79,41 @@ def test_exact_fp16_matmul_uses_versioned_tcu_call():
     assert 'T.thread_binding(32, thread="threadIdx.x")' in script
 
 
-def test_tcu_tensorization_falls_back_for_tail_or_disabled_target():
+def test_tcu_tensorization_pads_tail_and_slices_logical_output():
+    lowered = _tcu_tensorize_pass(_target())(TailTCUMatmul)
+    script = lowered.script()
+
+    assert "vx_tvm_tcu_fp16_tile" in script
+    assert "tcu_lhs_padded" in script
+    assert "tcu_rhs_padded" in script
+    assert "tcu_logical_output" in script
+    assert script.count("T.Select(") == 2
+    assert script.count("T.float16(0.0)") == 2
+    assert 'out_ty=R.Tensor((17, 19), dtype="float16")' in script
+    assert "output.data, 32, 32, 64" in script
+    assert lowered.attrs["vortex.tcu.fp16.lowered_matmuls"] == 1
+    assert lowered.attrs["vortex.tcu.fp16.padded_matmuls"] == 1
+
+
+def test_tcu_tensorization_enumerates_batched_gqa_without_cross_batch_flattening():
+    lowered = _tcu_tensorize_pass(_target(), require_all=True)(BatchedGQATCUMatmul)
+    script = lowered.script()
+
+    assert lowered.attrs["vortex.tcu.fp16.lowered_matmuls"] == 1
+    assert lowered.attrs["vortex.tcu.fp16.physical_jobs"] == 8
+    assert script.count("R.call_tir(cls.vortex_tcu_fp16_matmul_16_16_64") == 8
+    assert script.count("= R.strided_slice(lhs") == 8
+    assert script.count("= R.strided_slice(rhs") == 8
+    assert "R.matmul" not in script
+
+
+def test_tcu_tensorization_falls_back_for_disabled_target():
     assert (
         "vx_tvm_tcu_fp16_tile"
-        not in _tcu_tensorize_pass(_target())(TailTCUMatmul).script()
+        not in _tcu_tensorize_pass(_target(False))(ExactTCUMatmul).script()
     )
+    with pytest.raises(ValueError, match="target without FP16 TCU"):
+        _tcu_tensorize_pass(_target(False), require_all=True)(ExactTCUMatmul)
 
 
 def test_default_relax_build_emits_tcu_helper_without_scalar_reduction():
@@ -128,10 +168,6 @@ def test_fp16_tcu_relax_vm_hardware():
         "float16"
     )
     np.testing.assert_allclose(actual, expected, rtol=2e-2, atol=2e-2)
-    assert (
-        "vx_tvm_tcu_fp16_tile"
-        not in _tcu_tensorize_pass(_target(False))(ExactTCUMatmul).script()
-    )
 
 
 if __name__ == "__main__":

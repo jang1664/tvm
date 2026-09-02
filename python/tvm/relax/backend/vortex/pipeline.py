@@ -31,6 +31,7 @@ from .layout import (
     prepack_improve_qparam,
     prepack_improve_weight,
 )
+from .policy import validate_vortex_backend_policy
 
 
 def _make_hadamard(shape, base_size):
@@ -731,6 +732,52 @@ def _make_fp16_tcu_matmul(m: int, n: int, k: int):
                     )
 
     return tcu_matmul
+
+
+def _make_pad_fp16_matrix(rows: int, columns: int, padded_rows: int, padded_columns: int):
+    """Zero-pad one FP16 matrix without exposing a fusible generic pad."""
+
+    total = padded_rows * padded_columns
+
+    @T.prim_func(private=True)
+    def pad_fp16_matrix(
+        source: T.Buffer((rows, columns), "float16"),
+        output: T.Buffer((padded_rows, padded_columns), "float16"),
+    ):
+        T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
+        for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
+            for tx in T.thread_binding(128, thread="threadIdx.x"):
+                if bx * 128 + tx < total:
+                    row = (bx * 128 + tx) // padded_columns
+                    column = (bx * 128 + tx) % padded_columns
+                    output[row, column] = T.Select(
+                        T.And(row < rows, column < columns),
+                        source[row, column],
+                        T.float16(0),
+                    )
+
+    return pad_fp16_matrix
+
+
+def _make_slice_fp16_matrix(rows: int, columns: int, logical_rows: int, logical_columns: int):
+    """Slice the logical top-left matrix region after a padded TCU job."""
+
+    total = logical_rows * logical_columns
+
+    @T.prim_func(private=True)
+    def slice_fp16_matrix(
+        source: T.Buffer((rows, columns), "float16"),
+        output: T.Buffer((logical_rows, logical_columns), "float16"),
+    ):
+        T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
+        for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
+            for tx in T.thread_binding(128, thread="threadIdx.x"):
+                if bx * 128 + tx < total:
+                    row = (bx * 128 + tx) // logical_columns
+                    column = (bx * 128 + tx) % logical_columns
+                    output[row, column] = source[row, column]
+
+    return slice_fp16_matrix
 
 
 def _make_w4a16_naive(
@@ -1640,10 +1687,15 @@ class _W4A16Lowerer(relax.PyExprMutator):
             group_size = int(_prim_value(call.args[6]))
             pack_axis = int(_prim_value(call.args[7]))
             scheme = _prim_value(call.args[8])
-            if len(shape) != 2 or quant_axis not in (1, -1) or pack_axis not in (1, -1):
+            rank = len(shape)
+            if quant_axis < 0:
+                quant_axis += rank
+            if pack_axis < 0:
+                pack_axis += rank
+            if rank < 2 or quant_axis != rank - 1 or pack_axis != rank - 1:
                 raise ValueError(
-                    "Vortex dequantize_int4 backend initially supports static rank-2 "
-                    "quant_axis=pack_axis=1"
+                    "Vortex dequantize_int4 backend requires a static rank-2-or-higher "
+                    "tensor with quant_axis=pack_axis=-1"
                 )
             if group_size <= 0 or scheme not in (
                 "signed_symmetric_int4",
@@ -1652,9 +1704,13 @@ class _W4A16Lowerer(relax.PyExprMutator):
                 raise ValueError(
                     "unsupported Vortex dequantize_int4 quantization contract"
                 )
-            rows, columns = shape
-            expected_packed = (rows, (columns + 1) // 2)
-            expected_qparams = (rows, (columns + group_size - 1) // group_size)
+            columns = shape[-1]
+            rows = math.prod(shape[:-1])
+            expected_packed = (*shape[:-1], (columns + 1) // 2)
+            expected_qparams = (
+                *shape[:-1],
+                (columns + group_size - 1) // group_size,
+            )
             if (
                 _static_tensor_shape(packed, "uint8") != expected_packed
                 or _static_tensor_shape(scale, "float16") != expected_qparams
@@ -1663,17 +1719,39 @@ class _W4A16Lowerer(relax.PyExprMutator):
                 raise ValueError(
                     "Vortex dequantize_int4 tuple shapes or dtypes are inconsistent"
                 )
-            key = ("dequantize", shape, group_size)
+            matrix_shape = (rows, columns)
+            matrix_packed_shape = (rows, (columns + 1) // 2)
+            matrix_qparam_shape = (
+                rows,
+                (columns + group_size - 1) // group_size,
+            )
+            packed = self.builder_.emit(
+                relax.op.reshape(packed, matrix_packed_shape),
+                name_hint="dequantize_packed_matrix",
+            )
+            scale = self.builder_.emit(
+                relax.op.reshape(scale, matrix_qparam_shape),
+                name_hint="dequantize_scale_matrix",
+            )
+            zero_point = self.builder_.emit(
+                relax.op.reshape(zero_point, matrix_qparam_shape),
+                name_hint="dequantize_zero_matrix",
+            )
+            key = ("dequantize", matrix_shape, group_size)
             if key not in self.implementations:
                 self.implementations[key] = self.builder_.add_func(
-                    _make_dequantize_int4_row_major(shape, group_size),
+                    _make_dequantize_int4_row_major(matrix_shape, group_size),
                     "vortex_dequantize_int4_row_major",
                 )
-            return relax.call_tir(
-                self.implementations[key],
-                [packed, scale, zero_point],
-                out_ty=relax.TensorType(shape, "float16"),
+            output = self.builder_.emit(
+                relax.call_tir(
+                    self.implementations[key],
+                    [packed, scale, zero_point],
+                    out_ty=relax.TensorType(matrix_shape, "float16"),
+                ),
+                name_hint="dequantized_matrix",
             )
+            return relax.op.reshape(output, shape)
 
         if symbol == "relax.vortex.kv_cache_update_dynamic":
             if not self.lower_auxiliary_ops:
@@ -2126,6 +2204,7 @@ def _w4a16_lowering_pass(
     layout_policy=None,
     inplace_kv_cache=False,
 ):
+    gemm_mode = str(target.attrs.get("vortex_gemm_mode", "none"))
     if layout_policy is not None:
         if layout_policy not in ("alone", "fused"):
             raise ValueError(
@@ -2149,6 +2228,12 @@ def _w4a16_lowering_pass(
             if isinstance(func, relax.Function):
                 lowerer.builder_.update_func(global_var, lowerer.visit_expr(func))
         lowered = lowerer.builder_.get()
+        if (
+            layout_policy is not None
+            and gemm_mode != "improve"
+            and lowerer.lowered_w4a16
+        ):
+            raise ValueError("Vortex C4 layout policy requires GEMM_IMPROVE target mode")
         if lowerer.lowered_w4a16:
             lowered = lowered.with_attr(
                 "vortex.w4a16.lowered", lowerer.lowered_w4a16
@@ -2175,9 +2260,12 @@ def _w4a16_lowering_pass(
                 "vortex.improve.external_prepacked_w4a16",
                 lowerer.external_prepacked_w4a16,
             )
-        lowered = lowered.with_attr(
-            "vortex.c4.layout_policy", effective_layout_policy
-        )
+        if gemm_mode == "improve":
+            lowered = lowered.with_attr(
+                "vortex.c4.layout_policy", effective_layout_policy
+            )
+        elif gemm_mode == "naive" and lowerer.lowered_w4a16:
+            lowered = lowered.with_attr("vortex.w4a16.physical_layout", "row_major")
         if inplace_kv_cache:
             lowered = lowered.with_attr("vortex.kv_cache_update_inplace", 1)
         return lowered
@@ -2197,21 +2285,210 @@ def _rewrite_dataflow_reshape_before_vortex():
     return rewrite
 
 
-def _static_rank2_fp16_shape(expr):
+def _static_fp16_shape(expr):
     tensor_type = expr.ty
     shape = getattr(tensor_type, "shape", None)
     if str(getattr(tensor_type, "dtype", "")) != "float16" or shape is None:
         return None
     values = list(shape.values)
-    if len(values) != 2 or not all(
-        isinstance(value, tvm.tirx.IntImm) for value in values
-    ):
+    if len(values) < 2 or not all(isinstance(value, tvm.tirx.IntImm) for value in values):
         return None
     return tuple(int(value) for value in values)
 
 
-def _tcu_tensorize_pass(target: tvm.target.Target):
-    """Rewrite eligible logical matmul calls to the versioned Vortex TCU ABI."""
+def _static_rank2_fp16_shape(expr):
+    shape = _static_fp16_shape(expr)
+    return shape if shape is not None and len(shape) == 2 else None
+
+
+@expr_functor.mutator
+class _PaddedFP16TCULowerer(relax.PyExprMutator):
+    """Lower static FP16 matmul to isolated, padded rank-2 TCU jobs."""
+
+    def __init__(self, mod, require_all=False):
+        super().__init__(mod)
+        self.require_all = require_all
+        self.implementations = {}
+        self.lowered_matmuls = 0
+        self.physical_jobs = 0
+        self.padded_matmuls = 0
+        self.role_matmuls = {}
+        self.role_jobs = {}
+
+    @staticmethod
+    def _round_up(value, alignment):
+        return (value + alignment - 1) // alignment * alignment
+
+    def _matrix_slice(self, expr, shape, batch_index, name_hint):
+        leading_rank = len(shape) - 2
+        if leading_rank == 0:
+            return expr
+        begin = [
+            0 if shape[axis] == 1 else batch_index[axis]
+            for axis in range(leading_rank)
+        ]
+        sliced = self.builder_.emit(
+            relax.op.strided_slice(
+                expr,
+                axes=list(range(leading_rank)),
+                begin=begin,
+                end=[value + 1 for value in begin],
+                assume_inbound=True,
+            ),
+            name_hint=f"{name_hint}_slice",
+        )
+        return self.builder_.emit(
+            relax.op.reshape(sliced, shape[-2:]),
+            name_hint=f"{name_hint}_matrix",
+        )
+
+    def _lower_matrix(self, lhs, rhs, m, n, k, role):
+        physical_m = self._round_up(m, 16)
+        physical_n = self._round_up(n, 16)
+        physical_k = self._round_up(k, 32)
+        if (physical_m, physical_n, physical_k) != (m, n, k):
+            self.padded_matmuls += 1
+            lhs_pad_key = ("tcu_pad", m, k, physical_m, physical_k)
+            if lhs_pad_key not in self.implementations:
+                self.implementations[lhs_pad_key] = self.builder_.add_func(
+                    _make_pad_fp16_matrix(m, k, physical_m, physical_k),
+                    f"vortex_tcu_pad_fp16_{m}_{k}_{physical_m}_{physical_k}",
+                )
+            lhs = self.builder_.emit(
+                relax.call_tir(
+                    self.implementations[lhs_pad_key],
+                    [lhs],
+                    out_ty=relax.TensorType((physical_m, physical_k), "float16"),
+                ),
+                name_hint="tcu_lhs_padded",
+            )
+            rhs_pad_key = ("tcu_pad", k, n, physical_k, physical_n)
+            if rhs_pad_key not in self.implementations:
+                self.implementations[rhs_pad_key] = self.builder_.add_func(
+                    _make_pad_fp16_matrix(k, n, physical_k, physical_n),
+                    f"vortex_tcu_pad_fp16_{k}_{n}_{physical_k}_{physical_n}",
+                )
+            rhs = self.builder_.emit(
+                relax.call_tir(
+                    self.implementations[rhs_pad_key],
+                    [rhs],
+                    out_ty=relax.TensorType((physical_k, physical_n), "float16"),
+                ),
+                name_hint="tcu_rhs_padded",
+            )
+        shape_key = (physical_m, physical_n, physical_k)
+        if shape_key not in self.implementations:
+            self.implementations[shape_key] = self.builder_.add_func(
+                _make_fp16_tcu_matmul(physical_m, physical_n, physical_k),
+                f"vortex_tcu_fp16_matmul_{physical_m}_{physical_n}_{physical_k}",
+            )
+        output = self.builder_.emit(
+            relax.call_tir(
+                self.implementations[shape_key],
+                [lhs, rhs],
+                out_ty=relax.TensorType((physical_m, physical_n), "float16"),
+            ),
+            name_hint="tcu_physical_output",
+        )
+        self.physical_jobs += 1
+        self.role_jobs[role] = self.role_jobs.get(role, 0) + 1
+        if (physical_m, physical_n) != (m, n):
+            slice_key = ("tcu_slice", physical_m, physical_n, m, n)
+            if slice_key not in self.implementations:
+                self.implementations[slice_key] = self.builder_.add_func(
+                    _make_slice_fp16_matrix(physical_m, physical_n, m, n),
+                    f"vortex_tcu_slice_fp16_{physical_m}_{physical_n}_{m}_{n}",
+                )
+            output = self.builder_.emit(
+                relax.call_tir(
+                    self.implementations[slice_key],
+                    [output],
+                    out_ty=relax.TensorType((m, n), "float16"),
+                ),
+                name_hint="tcu_logical_output",
+            )
+        return output
+
+    def visit_call_(self, call):
+        call = super().visit_call_(call)
+        role = "unattributed"
+        if isinstance(call.op, tvm.ir.Op) and call.op.name == "relax.matmul":
+            lhs, rhs = call.args[:2]
+        elif (
+            isinstance(call.op, tvm.ir.Op)
+            and call.op.name == "relax.call_pure_packed"
+            and isinstance(call.args[0], relax.ExternFunc)
+            and call.args[0].global_symbol == "relax.vortex.fp16_matmul"
+        ):
+            lhs, rhs = call.args[1:3]
+            role = _prim_value(call.args[3])
+            if not (role.startswith("linear.") or role in ("attention.qk", "attention.pv")):
+                raise ValueError(f"unsupported Vortex FP16 TCU operation role: {role!r}")
+        else:
+            return call
+        lhs_shape = _static_fp16_shape(lhs)
+        rhs_shape = _static_fp16_shape(rhs)
+        output_shape = _static_fp16_shape(call)
+        if lhs_shape is None or rhs_shape is None or output_shape is None:
+            if self.require_all:
+                raise ValueError(
+                    "Vortex FP16 TCU policy requires every matmul to have static FP16 shapes"
+                )
+            return call
+        if not (len(lhs_shape) == len(rhs_shape) == len(output_shape)):
+            if self.require_all:
+                raise ValueError(
+                    "Vortex FP16 TCU policy requires equal-rank explicit batched operands"
+                )
+            return call
+
+        m, k = lhs_shape[-2:]
+        rhs_k, n = rhs_shape[-2:]
+        batch_shape = output_shape[:-2]
+        if rhs_k != k or output_shape[-2:] != (m, n):
+            raise ValueError("Vortex FP16 TCU matmul matrix shapes are inconsistent")
+        for operand_name, operand_shape in (("lhs", lhs_shape), ("rhs", rhs_shape)):
+            for axis, (operand_extent, output_extent) in enumerate(
+                zip(operand_shape[:-2], batch_shape)
+            ):
+                if operand_extent not in (1, output_extent):
+                    raise ValueError(
+                        "Vortex FP16 TCU broadcast mismatch for "
+                        f"{operand_name} axis {axis}: {operand_extent} versus {output_extent}"
+                    )
+
+        batch_indices = tuple(itertools.product(*(range(value) for value in batch_shape)))
+        if not batch_indices:
+            batch_indices = ((),)
+        outputs = []
+        for batch_index in batch_indices:
+            matrix_lhs = self._matrix_slice(lhs, lhs_shape, batch_index, "tcu_lhs")
+            matrix_rhs = self._matrix_slice(rhs, rhs_shape, batch_index, "tcu_rhs")
+            matrix_output = self._lower_matrix(
+                matrix_lhs, matrix_rhs, m, n, k, role
+            )
+            if batch_shape:
+                matrix_output = self.builder_.emit(
+                    relax.op.reshape(matrix_output, (1, m, n)),
+                    name_hint="tcu_output_matrix",
+                )
+            outputs.append(matrix_output)
+        self.lowered_matmuls += 1
+        self.role_matmuls[role] = self.role_matmuls.get(role, 0) + 1
+        if not batch_shape:
+            return outputs[0]
+        concatenated = (
+            outputs[0]
+            if len(outputs) == 1
+            else self.builder_.emit(
+                relax.op.concat(outputs, axis=0), name_hint="tcu_batched_output"
+            )
+        )
+        return relax.op.reshape(concatenated, output_shape)
+
+
+def _tcu_tensorize_pass(target: tvm.target.Target, require_all=False):
+    """Rewrite static FP16 matmul to the versioned, padded Vortex TCU ABI."""
 
     mode = str(target.attrs.get("vortex_tcu_mode", "none"))
     formats = str(target.attrs.get("vortex_tcu_fp_formats", ""))
@@ -2220,53 +2497,34 @@ def _tcu_tensorize_pass(target: tvm.target.Target):
     @tvm.transform.module_pass(opt_level=0, name="VortexTensorizeTCU")
     def tensorize(mod: tvm.ir.IRModule, _ctx: tvm.transform.PassContext):
         if not enabled:
+            if require_all:
+                raise ValueError("Vortex FP16 TCU policy selected for a target without FP16 TCU")
             return mod
-
-        lhs_pattern = relax.dpl.wildcard()
-        rhs_pattern = relax.dpl.wildcard()
-        matmul_pattern = relax.dpl.is_op("relax.matmul")(lhs_pattern, rhs_pattern)
-        builder = relax.BlockBuilder(mod)
-        implementations = {}
-
-        def rewriter(original, matches):
-            lhs = matches[lhs_pattern]
-            rhs = matches[rhs_pattern]
-            lhs_shape = _static_rank2_fp16_shape(lhs)
-            rhs_shape = _static_rank2_fp16_shape(rhs)
-            output_shape = _static_rank2_fp16_shape(original)
-            if lhs_shape is None or rhs_shape is None or output_shape is None:
-                return original
-
-            m, k = lhs_shape
-            rhs_k, n = rhs_shape
-            if (
-                rhs_k != k
-                or output_shape != (m, n)
-                or m % 16 != 0
-                or n % 16 != 0
-                or k % 32 != 0
-            ):
-                return original
-
-            shape_key = (m, n, k)
-            if shape_key not in implementations:
-                implementations[shape_key] = builder.add_func(
-                    _make_fp16_tcu_matmul(m, n, k),
-                    f"vortex_tcu_fp16_matmul_{m}_{n}_{k}",
-                )
-            return relax.call_tir(
-                implementations[shape_key],
-                [lhs, rhs],
-                out_ty=original.ty,
-            )
-
+        lowerer = _PaddedFP16TCULowerer(mod, require_all=require_all)
         for global_var, func in list(mod.functions_items()):
             if isinstance(func, relax.Function):
-                builder.update_func(
-                    global_var,
-                    relax.dpl.rewrite_call(matmul_pattern, rewriter, func),
+                lowerer.builder_.update_func(global_var, lowerer.visit_expr(func))
+        lowered = lowerer.builder_.get()
+        if lowerer.lowered_matmuls:
+            lowered = lowered.with_attr(
+                "vortex.tcu.fp16.lowered_matmuls", lowerer.lowered_matmuls
+            )
+            lowered = lowered.with_attr(
+                "vortex.tcu.fp16.physical_jobs", lowerer.physical_jobs
+            )
+            lowered = lowered.with_attr(
+                "vortex.tcu.fp16.padded_matmuls", lowerer.padded_matmuls
+            )
+            for role, count in sorted(lowerer.role_matmuls.items()):
+                attr_role = role.replace(".", "_")
+                lowered = lowered.with_attr(
+                    f"vortex.tcu.fp16.role.{attr_role}.matmuls", count
                 )
-        return builder.finalize()
+                lowered = lowered.with_attr(
+                    f"vortex.tcu.fp16.role.{attr_role}.jobs",
+                    lowerer.role_jobs[role],
+                )
+        return lowered
 
     return tensorize
 
@@ -2277,7 +2535,10 @@ def library_dispatch_passes(target: tvm.target.Target):
 
 
 def legalize_passes(
-    target: tvm.target.Target, layout_policy=None, inplace_kv_cache=False
+    target: tvm.target.Target,
+    layout_policy=None,
+    inplace_kv_cache=False,
+    backend_policy=None,
 ):  # pylint: disable=unused-argument
     """Legalize Relax and schedule kernels for Vortex."""
     from tvm.s_tir import dlight as dl  # pylint: disable=import-outside-toplevel
@@ -2296,7 +2557,14 @@ def legalize_passes(
             layout_policy=layout_policy,
             inplace_kv_cache=inplace_kv_cache,
         ),
-        _tcu_tensorize_pass(target),
+        _tcu_tensorize_pass(
+            target,
+            require_all=(
+                backend_policy is not None
+                and "fp16_tcu"
+                in (backend_policy.linear_compute, backend_policy.attention_compute)
+            ),
+        ),
         relax.transform.LegalizeOps(),
         relax.transform.AnnotateTIROpPattern(),
         relax.transform.FoldConstant(),
@@ -2324,6 +2592,12 @@ def dataflow_lower_passes(
             layout_policy=layout_policy,
             inplace_kv_cache=inplace_kv_cache,
         ),
+        # Naive W4A16 lowering happens after the pipeline's main LegalizeOps
+        # pass because the logical packed GEMM must survive until target
+        # selection.  Batched/GQA expansion introduces static slices and
+        # concats at this point, so legalize those newly-created Relax ops
+        # before VM code generation.
+        relax.transform.LegalizeOps(),
         *passes[1:],
     ]
 
@@ -2334,19 +2608,34 @@ def finalize_passes(target: tvm.target.Target):
 
 
 def get_default_pipeline(
-    target: tvm.target.Target, layout_policy=None, inplace_kv_cache=False
+    target: tvm.target.Target,
+    layout_policy=None,
+    inplace_kv_cache=False,
+    backend_policy=None,
 ):
     """Return the default Relax compilation pipeline for Vortex."""
+
+    policy = (
+        None
+        if backend_policy is None
+        else validate_vortex_backend_policy(target, backend_policy)
+    )
+    if policy is not None and policy.layout_policy != "alone_or_fused" and layout_policy:
+        raise ValueError(
+            f"Vortex policy {policy.name!r} does not accept C4 layout policy "
+            f"{layout_policy!r}"
+        )
 
     @tvm.transform.module_pass(opt_level=0)
     def _pipeline(mod: tvm.ir.IRModule, _ctx: tvm.transform.PassContext):
         with target:
-            return tvm.transform.Sequential(
+            lowered = tvm.transform.Sequential(
                 library_dispatch_passes(target)
                 + legalize_passes(
                     target,
                     layout_policy=layout_policy,
                     inplace_kv_cache=inplace_kv_cache,
+                    backend_policy=policy,
                 )
                 + dataflow_lower_passes(
                     target,
@@ -2355,5 +2644,11 @@ def get_default_pipeline(
                 )
                 + finalize_passes(target)
             )(mod)
+            if policy is not None:
+                lowered = lowered.with_attr("vortex.backend_policy", policy.name)
+                lowered = lowered.with_attr(
+                    "vortex.backend_workload_variant", policy.workload_variant
+                )
+            return lowered
 
     return _pipeline
