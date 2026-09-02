@@ -199,6 +199,38 @@ def test_accelerator_profile_from_tcu_manifest(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("extra_configs", "expected_march"),
+    [
+        ("-DFPU_DSP", "rv64imaf"),
+        ("-DFPU_DSP -DEXT_ZFH_ENABLE", "rv64imaf_zfh"),
+    ],
+)
+def test_accelerator_profile_uses_single_float_abi_for_dsp_fpu(
+    tmp_path, extra_configs, expected_march
+):
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "name": "dsp-fpu",
+                "params": {
+                    "CONFIGS": (
+                        "-DNUM_THREADS=32 -DEXT_TCU_ENABLE -DDISABLE_BF16 "
+                        f"-DDISABLE_TCU_INT {extra_configs}"
+                    )
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    target = vortex.load_vortex_accelerator_profile(manifest_path).target
+
+    assert target.attrs["vortex_march"] == expected_march
+    assert target.attrs["vortex_mabi"] == "lp64f"
+
+
+@pytest.mark.parametrize(
     ("configs", "message"),
     [
         (

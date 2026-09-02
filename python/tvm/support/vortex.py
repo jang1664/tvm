@@ -188,7 +188,18 @@ def _normalize_accelerator_profile(macros):
     else:
         gemm_mode = "non_naive"
 
-    double_enabled = "EXT_D_DISABLE" not in macros
+    # VX_config.vh only defines EXT_D_ENABLE when XLEN=64, EXT_D_DISABLE is
+    # absent, and the DSP FPU is not selected.  FPU_DSP implements the scalar
+    # single-precision path but does not expose the architectural D extension.
+    # Keep the compiler ABI aligned with that effective RTL configuration.
+    double_enabled = "EXT_D_DISABLE" not in macros and "FPU_DSP" not in macros
+    half_enabled = "EXT_ZFH_ENABLE" in macros
+    if double_enabled:
+        vortex_march = "rv64imafd"
+    elif half_enabled:
+        vortex_march = "rv64imaf_zfh"
+    else:
+        vortex_march = "rv64imaf"
     return {
         "thread_warp_size": _macro_int(macros, "NUM_THREADS", 4),
         "num_warps": _macro_int(macros, "NUM_WARPS", 4),
@@ -213,7 +224,7 @@ def _normalize_accelerator_profile(macros):
         "vortex_gemm_job_entries": 4,
         "vortex_num_cores": _macro_int(macros, "NUM_CORES", 1),
         "vortex_platform": "vivado" if "VIVADO" in macros else "generic",
-        "vortex_march": "rv64imafd" if double_enabled else "rv64imaf_zfh",
+        "vortex_march": vortex_march,
         "vortex_mabi": "lp64d" if double_enabled else "lp64f",
     }
 
