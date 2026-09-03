@@ -51,6 +51,89 @@ any of those identities change. C2 policy and lowering have synthetic fixture co
 profile-bound compile remains deferred until the mapped C2 image directory contains the intended
 binary and sibling manifest; another config or xclbin must not be substituted.
 
+### C1/C3 GPU-versus-U55C numerical validation
+
+Acceptance uses a CUDA reference only. CPU execution is available solely through the explicit
+`--diagnostic-cpu` reference-generator option, is labelled `diagnostic_cpu`, and is rejected by the
+physical U55C runner. Generate one reference for each package after compilation, for example:
+
+```bash
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+/home/jaeyongjang/.conda/envs/hw_autogen/bin/python \
+  apps/vortex_llama3/generate_backend_reference.py \
+  --package build/llama3_c1_c3_compile_matrix/packages/C3/S4/package.json \
+  --output build/llama3_c1_c3_numerical_validation/references/C3/S4.npz \
+  --alias C3 --case S4 --determinism-replays 2
+```
+
+For a physical run, source the alias-matched Vortex config, select its exact mapped xclbin, and keep
+one process for canonical prefill/decode plus free-running inference:
+
+```bash
+source "$VORTEX_HOME/configs/naive_gemm_th32_tcol32_hwexp_dcache.sh"
+export VORTEX_DRIVER=xrt XRT_INI_PATH=/dev/null
+export XRT_XCLBIN_PATH=/opt/vortex_fpga_bins/fpint/xrt_hw_u55c_c_f100_fpint_9600db3a37/bin/vortex_afu.xclbin
+/home/jaeyongjang/.conda/envs/hw_autogen/bin/python \
+  apps/vortex_llama3/run_backend_validation.py \
+  --package build/llama3_c1_c3_compile_matrix/packages/C3/S4/package.json \
+  --reference build/llama3_c1_c3_numerical_validation/references/C3/S4.npz \
+  --alias C3 --case S4 --exec-mode bytecode --mode both \
+  --trace-output build/llama3_c1_c3_numerical_validation/runs/C3/S4-bytecode-both.json \
+  --mismatch-dir build/llama3_c1_c3_numerical_validation/mismatches/C3/S4
+```
+
+`run_backend_validation.py` validates package, profile, xclbin, reference, prompt, and tensor
+inventory before opening XRT. Canonical mode compares all 32 layer states, asymmetric K4/V4 cache
+state, normalized hidden, logits, and top-1 against GPU-recorded inputs. Free-running mode enforces
+finite outputs and exact cache lengths. For S1, use `--mode free-running --free-repetitions 2` to
+prove stable hashes in one process and one device open.
+
+Canonical validation defaults to fixed device buffers for hidden/KV inputs and performs an exact
+device readback before every layer invocation. Use `--canonical-input-staging fresh` or
+`--no-verify-canonical-input-readback` only for diagnosis; acceptance traces retain the defaults.
+The runner also assigns a process-unique `VORTEX_SHM_PATH` when one is not supplied and records the
+actual opened U55C BDF, resolving it from the DRM render node when Slurm did not export a BDF.
+
+Generate a compact, fail-closed coverage artifact from the finished traces with:
+
+```bash
+/home/jaeyongjang/.conda/envs/hw_autogen/bin/python \
+  apps/vortex_llama3/collect_backend_validation_evidence.py \
+  --package-root build/llama3_c1_c3_compile_matrix/packages \
+  --reference-root build/llama3_c1_c3_numerical_validation/references \
+  --run-root build/llama3_c1_c3_numerical_validation/runs \
+  --failure-manifest /absolute/path/to/backend_failure_evidence.json \
+  --output build/llama3_c1_c3_numerical_validation/evidence.json \
+  --require-complete
+```
+
+The collector rejects CPU-labelled or stale references, cross-profile traces, non-finite metrics,
+invalid cache lengths, changed persistent hashes, CUDA initialization in the XRT process, and any
+missing C1/C3 S1-S4 coverage. A failure manifest can retain hash-verified failed attempts and
+diagnostic counterexamples even when a successful trace cannot be produced. Such evidence makes
+the affected backend verdict `FAIL`; it does not fill the missing successful-coverage slot, so
+`--require-complete` still exits unsuccessfully.
+
+For production failures that disappear in a fresh full-layer replay, compile and run the exact
+stage probes. The runner can first execute repeated production prefill layers, or replay the full
+32-layer canonical prefill chain, before repeating a decode checkpoint graph in the same process:
+
+```bash
+/home/jaeyongjang/.conda/envs/hw_autogen/bin/python \
+  apps/vortex_llama3/run_backend_stage_probe.py \
+  --package build/llama3_c1_c3_compile_matrix/packages/C1/S3/package.json \
+  --reference build/llama3_c1_c3_numerical_validation/references/C1/S3.npz \
+  --stage-package \
+    build/llama3_c1_c3_numerical_validation/stage_packages/C1/S3-decode-checkpoints/package.json \
+  --alias C1 --case S3 --probe layer_checkpoints_decode \
+  --warmup-prefill-chain-repetitions 1 --full-resident-archive \
+  --repetitions 32 \
+  --trace-output build/llama3_c1_c3_numerical_validation/probes/C1/S3-stage.json
+```
+
+These options are diagnostic only: a passing reduced or stage-localized graph cannot replace a
+failed end-to-end acceptance trace.
+
 The initial S1/alone compile, package, eager-reference generation, and run is:
 
 ```bash

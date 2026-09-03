@@ -53,6 +53,29 @@ from vortex_llama3.debug_canonical_layer_range import (  # noqa: E402
     required_reference_keys,
     validate_reference_keys,
 )
+from vortex_llama3.backend_numerical_validation import (  # noqa: E402
+    compare_replays,
+    deterministic_prompt,
+)
+from vortex_llama3.run_backend_validation import (  # noqa: E402
+    FINAL_THRESHOLDS,
+    LOCAL_THRESHOLDS,
+    _configure_xrt_environment,
+    _detect_open_xrt_bdf,
+    _runtime_tensor,
+    compare_layer_state as compare_backend_layer_state,
+    hybrid_metrics,
+    make_parser as make_backend_validation_parser,
+)
+from vortex_llama3.run_backend_probe import (  # noqa: E402
+    make_parser as make_backend_probe_parser,
+)
+from vortex_llama3.run_backend_residual_probe import (  # noqa: E402
+    make_parser as make_residual_probe_parser,
+)
+from vortex_llama3.run_backend_stage_probe import (  # noqa: E402
+    make_parser as make_stage_probe_parser,
+)
 
 
 def test_canonical_layer_range_parsing_and_required_reference_keys():
@@ -179,6 +202,213 @@ def test_parse_prompt_token_ids_supports_single_and_batched_prompts():
         parse_prompt_token_ids("1;2,3")
     with pytest.raises(ValueError, match="must not be empty"):
         parse_prompt_token_ids("1;")
+
+
+def test_backend_validation_uses_frozen_s1_s4_prompts():
+    assert deterministic_prompt("S1") == [[1]]
+    assert deterministic_prompt("S2") == [[1, 2, 3, 4, 5, 6, 7]]
+    assert deterministic_prompt("S3") == [[1], [2]]
+    assert deterministic_prompt("S4") == [
+        [1, 2, 3, 4, 5, 6, 7],
+        [8, 9, 10, 11, 12, 13, 14],
+    ]
+    with pytest.raises(ValueError, match="unknown validation shape"):
+        deterministic_prompt("S5")
+
+
+def test_backend_reference_replay_requires_exact_tensor_hashes():
+    first = {"hidden": np.array([1.0, 2.0], dtype="float16")}
+    compare_replays(first, {"hidden": first["hidden"].copy()})
+    with pytest.raises(AssertionError, match="nondeterministic"):
+        compare_replays(first, {"hidden": np.array([1.0, 2.1], dtype="float16")})
+    with pytest.raises(AssertionError, match="inventory"):
+        compare_replays(first, {"logits": first["hidden"]})
+
+
+def test_backend_hybrid_metrics_split_small_absolute_and_large_relative():
+    expected = np.array([0.1, 1.0], dtype="float16")
+    actual = np.array([0.101, 1.001], dtype="float16")
+    metrics = hybrid_metrics(actual, expected, LOCAL_THRESHOLDS, name="test")
+    assert metrics["pass"] == 1
+    assert metrics["max_small_absolute_error"] > 0
+    assert metrics["max_large_relative_error"] > 0
+    with pytest.raises(AssertionError, match="numerical limits"):
+        hybrid_metrics(
+            np.array([0.2, 2.0], dtype="float16"),
+            expected,
+            FINAL_THRESHOLDS,
+            name="bad",
+        )
+
+
+def test_backend_layer_comparison_checks_cache_suffix_and_length():
+    hidden = np.zeros((1, 1, 4), dtype="float16")
+    payload = np.zeros((1, 1, 1, 2, 2), dtype="uint8")
+    scale = np.ones((1, 1, 1, 2, 1), dtype="float16")
+    zero = np.zeros((1, 1, 1, 2, 1), dtype="int16")
+    state = (hidden, payload, scale, zero, payload, scale, zero, np.array([1]))
+    summary = compare_backend_layer_state(state, state, 1)
+    assert summary["hidden"]["pass"] == 1
+    assert summary["cache"]["key"]["code_mismatch_rate"] == 0.0
+
+    bad = list(state)
+    bad[1] = payload.copy()
+    bad[1][..., 1:, :] = 1
+    with pytest.raises(AssertionError):
+        compare_backend_layer_state(tuple(bad), state, 1)
+
+
+def test_backend_layer_comparison_rejects_rewritten_decode_prefix():
+    hidden = np.zeros((1, 1, 4), dtype="float16")
+    payload = np.zeros((1, 1, 1, 3, 2), dtype="uint8")
+    scale = np.ones((1, 1, 1, 3, 1), dtype="float16")
+    zero = np.zeros((1, 1, 1, 3, 1), dtype="int16")
+    input_cache = (payload, scale, zero, payload, scale, zero, np.array([1]))
+    rewritten_payload = payload.copy()
+    rewritten_payload[..., 0, :] = 1
+    output_state = (
+        hidden,
+        rewritten_payload,
+        scale,
+        zero,
+        rewritten_payload,
+        scale,
+        zero,
+        np.array([2]),
+    )
+
+    with pytest.raises(AssertionError, match="changed its valid prefix"):
+        compare_backend_layer_state(
+            output_state, output_state, 2, input_cache=input_cache
+        )
+
+
+def test_backend_runtime_tensor_preserves_scalar_rank():
+    scalar = _runtime_tensor(np.array(1, dtype="int64"), tvm.cpu(0))
+    vector = _runtime_tensor(np.array([1], dtype="int64"), tvm.cpu(0))
+
+    assert scalar.shape == ()
+    assert vector.shape == (1,)
+
+
+def test_backend_probe_accepts_repeated_layer_execution():
+    args = make_backend_probe_parser().parse_args(
+        [
+            "--package",
+            "package.json",
+            "--reference",
+            "reference.npz",
+            "--alias",
+            "C1",
+            "--case",
+            "S3",
+            "--probe",
+            "layer",
+            "--repetitions",
+            "16",
+            "--trace-output",
+            "trace.json",
+        ]
+    )
+    assert args.repetitions == 16
+
+
+def test_residual_probe_accepts_long_repetition_count():
+    args = make_residual_probe_parser().parse_args(
+        [
+            "--package",
+            "package.json",
+            "--reference",
+            "reference.npz",
+            "--probe-package",
+            "probe.json",
+            "--repetitions",
+            "100000",
+            "--trace-output",
+            "trace.json",
+        ]
+    )
+    assert args.repetitions == 100000
+
+
+def test_stage_probe_accepts_s3_repetition_count():
+    args = make_stage_probe_parser().parse_args(
+        [
+            "--package",
+            "package.json",
+            "--reference",
+            "reference.npz",
+            "--stage-package",
+            "stage.json",
+            "--alias",
+            "C1",
+            "--case",
+            "S3",
+            "--probe",
+            "layer_checkpoints_decode",
+            "--repetitions",
+            "64",
+            "--warmup-prefill-repetitions",
+            "32",
+            "--warmup-prefill-chain-repetitions",
+            "2",
+            "--full-resident-archive",
+            "--trace-output",
+            "trace.json",
+        ]
+    )
+    assert args.case == "S3"
+    assert args.repetitions == 64
+    assert args.warmup_prefill_repetitions == 32
+    assert args.warmup_prefill_chain_repetitions == 2
+    assert args.full_resident_archive
+
+
+def test_backend_validation_defaults_to_fixed_verified_canonical_inputs():
+    args = make_backend_validation_parser().parse_args(
+        [
+            "--package",
+            "package.json",
+            "--reference",
+            "reference.npz",
+            "--alias",
+            "C1",
+            "--case",
+            "S3",
+            "--trace-output",
+            "trace.json",
+            "--mismatch-dir",
+            "mismatches",
+        ]
+    )
+    assert args.canonical_input_staging == "fixed"
+    assert args.verify_canonical_input_readback
+
+
+def test_xrt_configuration_assigns_process_unique_status_path(monkeypatch):
+    for name in ("FPGA_BIN_DIR", "XRT_XCLBIN_PATH", "XRT_INI_PATH", "VORTEX_SHM_PATH"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SLURM_JOB_ID", "1234")
+
+    _configure_xrt_environment({"profile": {"xclbin": "/tmp/c1/bin/image.xclbin"}})
+
+    assert Path(__import__("os").environ["VORTEX_SHM_PATH"]).name.startswith(
+        "vortex_status_llama3_1234_"
+    )
+
+
+def test_backend_validation_detects_open_xrt_bdf(tmp_path):
+    proc_fd = tmp_path / "fd"
+    drm_class = tmp_path / "drm"
+    pci_device = tmp_path / "pci" / "0000:3d:00.1"
+    proc_fd.mkdir()
+    pci_device.mkdir(parents=True)
+    (proc_fd / "17").symlink_to("/dev/dri/renderD130")
+    render_class = drm_class / "renderD130"
+    render_class.mkdir(parents=True)
+    (render_class / "device").symlink_to(pci_device)
+
+    assert _detect_open_xrt_bdf(proc_fd, drm_class) == "0000:3d:00.1"
 
 
 def test_partitioned_package_has_phase_specific_boundaries():
