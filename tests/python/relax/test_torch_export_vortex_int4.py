@@ -54,6 +54,7 @@ from spinquant_inference.llama3_c4_export import (  # noqa: E402
     stack_parameter_shapes,
 )
 from spinquant_inference.utils.hadamard_utils import get_hadK  # noqa: E402
+
 NAIVE_XCLBIN = Path(
     "/opt/vortex_fpga_bins/fpint/"
     "xrt_hw_u55c_c_f100_fpint_9600db3a37/bin/vortex_afu.xclbin"
@@ -100,9 +101,7 @@ class _PackedW4A16(torch.nn.Module):
         self.transpose_rhs = transpose_rhs
         self.quant_axis = quant_axis
         self.group_size = group_size
-        self.rhs_shape = rhs_shape or (
-            (32, 128) if self.transpose_rhs else (128, 32)
-        )
+        self.rhs_shape = rhs_shape or ((32, 128) if self.transpose_rhs else (128, 32))
 
     def forward(self, lhs, packed, scale, zero_point):
         return torch.ops.vortex.mm_w4a16(
@@ -427,11 +426,11 @@ def test_import_backend_neutral_llama3_prefill_and_decode_graphs():
     prefill_script = prefill.script()
     assert prefill_script.count('R.call_pure_packed("relax.vortex.mm_w4a16"') == 9
     assert prefill_script.count('R.call_pure_packed("relax.vortex.hadamard"') == 3
-    assert prefill_script.count(
-        'R.call_pure_packed("relax.vortex.causal_softmax"'
-    ) == 1
+    assert prefill_script.count('R.call_pure_packed("relax.vortex.causal_softmax"') == 1
     assert prefill_script.count('R.call_pure_packed("relax.vortex.quantize_int4"') == 2
-    assert prefill_script.count('R.call_pure_packed("relax.vortex.kv_cache_update"') == 2
+    assert (
+        prefill_script.count('R.call_pure_packed("relax.vortex.kv_cache_update"') == 2
+    )
     assert "tile_input_a" not in prefill_script
     assert "mm_w4a16_gemm_core" not in prefill_script
 
@@ -443,8 +442,8 @@ def test_import_backend_neutral_llama3_prefill_and_decode_graphs():
     assert prefill_alone.attrs["vortex.c4.layout_policy"] == "alone"
     assert prefill_alone.attrs["vortex.w4a16.lowered"] == 15
     assert "vortex_kv_cache_update" in prefill_alone_script
-    assert "batched_lhs_slice" in prefill_alone_script
-    assert "vortex_batched_output_barrier" in prefill_alone_script
+    assert "vortex_batched_lhs_matrix" in prefill_alone_script
+    assert "vortex_batched_output_rank5" in prefill_alone_script
     assert 'R.call_pure_packed("relax.vortex.mm_w4a16"' not in prefill_alone_script
     prefill_fused = _w4a16_lowering_pass(target, layout_policy="fused")(prefill)
     assert prefill_fused.attrs["vortex.improve.reused_a_layouts"] == 3
@@ -454,9 +453,7 @@ def test_import_backend_neutral_llama3_prefill_and_decode_graphs():
     assert prefill_alone_script.count("R.call_tir(cls.vortex_gemm_a_tiled") == 15
     assert prefill_fused_script.count("R.call_tir(cls.vortex_gemm_a_tiled") == 12
     assert prefill_fused_script.count("R.call_tir(cls.vortex_hadamard_") == 3
-    assert prefill_fused_script.count(
-        "R.call_tir(cls.vortex_causal_softmax"
-    ) == 1
+    assert prefill_fused_script.count("R.call_tir(cls.vortex_causal_softmax") == 1
 
     packed = torch.empty((1, 2, 32, 16), dtype=torch.uint8)
     scale = torch.empty((1, 2, 32, 1), dtype=torch.float16)
@@ -490,12 +487,11 @@ def test_import_backend_neutral_llama3_prefill_and_decode_graphs():
     assert decode_script.index("R.assert_op") < decode_script.index("with R.dataflow()")
     assert decode_script.count('R.call_pure_packed("relax.vortex.mm_w4a16"') == 9
     assert decode_script.count('R.call_pure_packed("relax.vortex.hadamard"') == 3
-    assert decode_script.count(
-        'R.call_pure_packed("relax.vortex.causal_softmax"'
-    ) == 1
-    assert decode_script.count(
-        'R.call_pure_packed("relax.vortex.kv_cache_update_dynamic"'
-    ) == 2
+    assert decode_script.count('R.call_pure_packed("relax.vortex.causal_softmax"') == 1
+    assert (
+        decode_script.count('R.call_pure_packed("relax.vortex.kv_cache_update_dynamic"')
+        == 2
+    )
     decode_alone = _w4a16_lowering_pass(target, layout_policy="alone")(decode)
     decode_alone_script = decode_alone.script()
     assert decode_alone.attrs["vortex.c4.layout_policy"] == "alone"
@@ -513,9 +509,7 @@ def test_import_backend_neutral_llama3_prefill_and_decode_graphs():
     assert decode_alone_script.count("R.call_tir(cls.vortex_gemm_a_tiled") == 15
     assert decode_fused_script.count("R.call_tir(cls.vortex_gemm_a_tiled") == 12
     assert decode_fused_script.count("R.call_tir(cls.vortex_hadamard_") == 3
-    assert decode_fused_script.count(
-        "R.call_tir(cls.vortex_causal_softmax"
-    ) == 1
+    assert decode_fused_script.count("R.call_tir(cls.vortex_causal_softmax") == 1
     decode_inplace = _w4a16_lowering_pass(
         target,
         layout_policy="alone",
@@ -534,9 +528,7 @@ def _import_packed_w4a16(
     rhs_shape = (n, k) if transpose_rhs else (k, n)
     packed_shape = (rhs_shape[0], (rhs_shape[1] + 1) // 2)
     qparam_shape = list(rhs_shape)
-    qparam_shape[quant_axis] = (
-        qparam_shape[quant_axis] + group_size - 1
-    ) // group_size
+    qparam_shape[quant_axis] = (qparam_shape[quant_axis] + group_size - 1) // group_size
     inputs = (
         torch.ones((m, k), dtype=torch.float16),
         torch.zeros(packed_shape, dtype=torch.uint8),
@@ -545,9 +537,7 @@ def _import_packed_w4a16(
     )
     return from_exported_program(
         torch.export.export(
-            _PackedW4A16(
-                transpose_rhs, quant_axis, rhs_shape, group_size=group_size
-            ),
+            _PackedW4A16(transpose_rhs, quant_axis, rhs_shape, group_size=group_size),
             inputs,
         ),
         run_ep_decomposition=False,
@@ -568,6 +558,8 @@ def _ffn_inputs(seed=71):
         torch.from_numpy(rng.uniform(-0.05, 0.05, (31,)).astype("float16")),
         torch.from_numpy(rng.uniform(-0.05, 0.05, (7, 31)).astype("float16")),
     )
+
+
 def _pack_improve_physical(lhs, weight, scale, zero_point, plan):
     """Independently pack logical QCOL/WTRANS=0 tensors for a direct ABI test."""
 
@@ -584,9 +576,7 @@ def _pack_improve_physical(lhs, weight, scale, zero_point, plan):
                 for local_m in range(cur_m):
                     for inner_k in range(profile.mxu_kt):
                         logical_k = (
-                            kt * profile.dma_kt
-                            + micro_k * profile.mxu_kt
-                            + inner_k
+                            kt * profile.dma_kt + micro_k * profile.mxu_kt + inner_k
                         )
                         if logical_k < plan.logical_k:
                             index = kt_base + micro_k * cur_m * profile.mxu_kt
@@ -633,7 +623,7 @@ def _detile_improve_output(tiled, plan):
     output = np.empty((plan.logical_m, plan.logical_n), dtype="float16")
     c_base = 0
     for mt, cur_m in enumerate(plan.m_tiles):
-        slot_m = (cur_m + plan.profile.num_dma_channels - 1)
+        slot_m = cur_m + plan.profile.num_dma_channels - 1
         slot_m //= plan.profile.num_dma_channels
         slot_m *= plan.profile.num_dma_channels
         for local_m in range(cur_m):
@@ -726,9 +716,7 @@ def test_two_layer_llama_stack_imports_external_prepacked_parameters():
     model = Llama3StackPrefill(config, 2, prepacked_weights=True)
     hidden = torch.zeros((1, 1, 128), dtype=torch.float16)
     positions = torch.zeros((1, 1), dtype=torch.int64)
-    exported = torch.export.export(
-        model, (hidden, positions, parameters), strict=True
-    )
+    exported = torch.export.export(model, (hidden, positions, parameters), strict=True)
     mod = from_exported_program(
         exported,
         run_ep_decomposition=False,
@@ -1082,9 +1070,9 @@ def test_constant_w4a16_parameters_are_prepacked_before_runtime_lowering(
     )
     if not transpose_rhs and quant_axis == 0:
         pipelined = relax.backend.vortex.get_default_pipeline(target)(mod)
-        assert tuple(
-            pipelined.attrs["vortex.improve.prepacked_constants"]
-        ) == descriptors
+        assert (
+            tuple(pipelined.attrs["vortex.improve.prepacked_constants"]) == descriptors
+        )
 
 
 def test_quantize_and_dequantize_lower_to_vortex_tir():
@@ -1119,6 +1107,9 @@ def test_quantize_and_dequantize_lower_to_vortex_tir():
     assert "vortex_quantize_int4_row_major" in round_trip_script
     assert "vortex_dequantize_int4_row_major" in round_trip_script
     assert 'R.call_pure_packed("relax.vortex.dequantize_int4"' not in round_trip_script
+    assert "dequantize_packed_matrix" not in round_trip_script
+    assert "dequantize_scale_matrix" not in round_trip_script
+    assert "dequantize_zero_matrix" not in round_trip_script
 
 
 def test_kv_cache_update_and_attention_lower_from_logical_ops():
@@ -1276,9 +1267,7 @@ def test_direct_improved_gemm_abi_v2_hardware(qblock):
 
     rng = np.random.default_rng(59)
     lhs = rng.uniform(-0.5, 0.5, (plan.logical_m, plan.logical_k)).astype("float16")
-    weight = rng.integers(
-        -3, 4, size=(plan.logical_k, plan.logical_n), dtype="int8"
-    )
+    weight = rng.integers(-3, 4, size=(plan.logical_k, plan.logical_n), dtype="int8")
     scale = np.full(
         ((plan.logical_k + plan.qblock - 1) // plan.qblock, plan.logical_n),
         0.125,
@@ -1416,9 +1405,7 @@ def test_improved_w4a16_arbitrary_shape_hardware(
     source_k_axis = 1 if transpose_rhs else 0
     quant_axis = source_k_axis if quant_direction == 0 else 1 - source_k_axis
     executable = relax.build(
-        _import_packed_w4a16(
-            transpose_rhs, quant_axis, m=m, n=n, k=k
-        ),
+        _import_packed_w4a16(transpose_rhs, quant_axis, m=m, n=n, k=k),
         target,
         exec_mode="bytecode",
     )
@@ -1552,9 +1539,7 @@ def test_layout_fused_ffn_matches_unfused_export_reload_hardware(exec_mode):
         unwrap_unit_return_tuple=True,
     )
     fused = relax.build(logical, target, exec_mode=exec_mode)
-    unfused_mod = _w4a16_lowering_pass(
-        target, enable_layout_fusion=False
-    )(logical)
+    unfused_mod = _w4a16_lowering_pass(target, enable_layout_fusion=False)(logical)
     unfused = relax.build(unfused_mod, target, exec_mode=exec_mode)
 
     with tempfile.TemporaryDirectory(prefix="tvm-vortex-w4-ffn-") as directory:
@@ -1581,12 +1566,8 @@ def test_layout_fused_ffn_matches_unfused_export_reload_hardware(exec_mode):
             ]
             actual_fused = fused_vm["main"](*device_values).numpy()
             actual_unfused = unfused_vm["main"](*device_values).numpy()
-            np.testing.assert_allclose(
-                actual_fused, expected, rtol=7e-2, atol=7e-2
-            )
-            np.testing.assert_allclose(
-                actual_unfused, expected, rtol=7e-2, atol=7e-2
-            )
+            np.testing.assert_allclose(actual_fused, expected, rtol=7e-2, atol=7e-2)
+            np.testing.assert_allclose(actual_unfused, expected, rtol=7e-2, atol=7e-2)
             np.testing.assert_allclose(
                 actual_fused, actual_unfused, rtol=7e-2, atol=7e-2
             )
@@ -1616,13 +1597,9 @@ def test_constant_prepacked_w4a16_repeated_export_reload_hardware(
     qparam_shape = list(rhs_shape)
     qparam_shape[quant_axis] = (qparam_shape[quant_axis] + 31) // 32
     packed = torch.from_numpy(rng.integers(0, 256, packed_shape, dtype="uint8"))
-    scale = torch.from_numpy(
-        rng.uniform(0.01, 0.04, qparam_shape).astype("float16")
-    )
+    scale = torch.from_numpy(rng.uniform(0.01, 0.04, qparam_shape).astype("float16"))
     zero = torch.zeros(qparam_shape, dtype=torch.int16)
-    model = _ConstantPackedW4A16(
-        packed, scale, zero, transpose_rhs, quant_axis
-    )
+    model = _ConstantPackedW4A16(packed, scale, zero, transpose_rhs, quant_axis)
     example_lhs = torch.ones((7, 33), dtype=torch.float16)
     logical = from_exported_program(
         torch.export.export(model, (example_lhs,)),
@@ -1801,9 +1778,7 @@ def test_w4_attention_fragment_export_reload_hardware(exec_mode):
     # tolerance aligned with the existing per-GEMM 3e-2 budget.
     np.testing.assert_allclose(actual_fused, expected, rtol=7e-2, atol=7e-2)
     np.testing.assert_allclose(actual_unfused, expected, rtol=7e-2, atol=7e-2)
-    np.testing.assert_allclose(
-        actual_fused, actual_unfused, rtol=7e-2, atol=7e-2
-    )
+    np.testing.assert_allclose(actual_fused, actual_unfused, rtol=7e-2, atol=7e-2)
 
 
 @pytest.mark.skipif(

@@ -40,18 +40,18 @@ from spinquant_inference.llama3_c4_export import (  # noqa: E402
 )
 
 
-def _config(query_length):
+def _config(query_length, head_dim=32):
     return Llama3ExportConfig(
         batch_size=2,
         query_length=query_length,
         cache_capacity=8,
-        hidden_size=128,
+        hidden_size=4 * head_dim,
         intermediate_size=128,
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=32,
+        head_dim=head_dim,
         weight_group_size=32,
-        kv_group_size=32,
+        kv_group_size=head_dim,
         vocabulary_size=128,
     )
 
@@ -65,10 +65,10 @@ def _parameters(config, linear_compute):
     }
 
 
-def _import_layer(phase, linear_compute, attention_compute):
+def _import_layer(phase, linear_compute, attention_compute, head_dim=32):
     query_length = 7 if phase == "prefill" else 1
-    config = _config(query_length)
-    hidden = torch.zeros((2, query_length, 128), dtype=torch.float16)
+    config = _config(query_length, head_dim=head_dim)
+    hidden = torch.zeros((2, query_length, config.hidden_size), dtype=torch.float16)
     positions = torch.arange(query_length, dtype=torch.int64).repeat(2, 1)
     parameters = _parameters(config, linear_compute)
     if phase == "prefill":
@@ -84,7 +84,7 @@ def _import_layer(phase, linear_compute, attention_compute):
             linear_compute=linear_compute,
             attention_compute=attention_compute,
         )
-        payload = torch.zeros((2, 2, 8, 16), dtype=torch.uint8)
+        payload = torch.zeros((2, 2, 8, (head_dim + 1) // 2), dtype=torch.uint8)
         scale = torch.zeros((2, 2, 8, 1), dtype=torch.float16)
         zero = torch.zeros_like(scale, dtype=torch.int16)
         inputs = (
@@ -168,6 +168,9 @@ def test_role_routing_consumes_every_logical_gemm(
     assert int(mod.attrs.get("vortex.w4a16.lowered", 0)) == naive_lowered
     if tcu_matmuls:
         assert "vx_tvm_tcu_fp16_tile" in script
+        assert script.count("def vortex_dequantize_int4_rank5") == 1
+        assert script.count("R.call_tir(cls.vortex_dequantize_int4_rank5") == 2
+        assert "dequantized_matrix" not in script
     if naive_lowered:
         assert "vx_tvm_gemm_w4a16" in script
         assert str(mod.attrs["vortex.w4a16.physical_layout"]) == "row_major"
@@ -185,7 +188,7 @@ def test_c2_fixture_routes_by_role_not_by_matrix_shape():
 
 
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
-def test_c3_default_pipeline_legalizes_late_batched_w4_slices(phase):
+def test_c3_default_pipeline_keeps_rank5_gqa_abi(phase):
     mod = _import_layer(phase, "w4", "w4")
     target = _target(gemm="naive")
 
@@ -195,3 +198,21 @@ def test_c3_default_pipeline_legalizes_late_batched_w4_slices(phase):
     assert 'R.call_pure_packed("relax.vortex.mm_w4a16"' not in script
     assert "R.strided_slice" not in script
     assert "vx_tvm_gemm_w4a16" in script
+    assert int(lowered.attrs.get("vortex.w4a16.fused_kv_expands", 0)) == 0
+    assert script.count("def vortex_mm_w4a16_naive_batched") == 2
+    assert "def vortex_gqa_context_reshape" not in script
+
+
+def test_c3_production_head_dim_tiles_quant_direction_n_to_32_columns():
+    mod = _import_layer("decode", "w4", "w4", head_dim=128)
+    target = _target(gemm="naive")
+
+    lowered = get_default_pipeline(target, backend_policy=C3_ALL_W4_NAIVE)(mod)
+    script = lowered.script()
+
+    assert int(lowered.attrs["vortex.w4a16.naive_n_tiled_calls"]) == 1
+    assert script.count("def vortex_mm_w4a16_naive_batched_n_tiled") == 1
+    assert script.count("def vortex_naive_n_tile_packed") == 1
+    assert script.count("def vortex_naive_n_tile_scale") == 1
+    assert script.count("def vortex_naive_n_tile_zero") == 1
+    assert "def vortex_gqa_context_reshape" not in script
