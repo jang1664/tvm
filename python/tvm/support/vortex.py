@@ -71,6 +71,9 @@ class VortexCompileConfig:
     mxu_col: int
     mxu_col_tile: int
     tmem_bank_size: int
+    num_tmem_banks: int
+    local_mem_size: int
+    gemm_naive_use_acc_mem: bool
     num_dma_channels: int
     gemm_acc_mem_depth: int
     platform: str
@@ -203,7 +206,7 @@ def _normalize_accelerator_profile(macros):
     return {
         "thread_warp_size": _macro_int(macros, "NUM_THREADS", 4),
         "num_warps": _macro_int(macros, "NUM_WARPS", 4),
-        "local_mem_size": 1 << _macro_int(macros, "LMEM_LOG_SIZE", 16),
+        "local_mem_size": _macro_int(macros, "LMEM_SIZE", 1 << _macro_int(macros, "LMEM_LOG_SIZE", 16)),
         "vortex_tcu_mode": tcu_mode,
         "vortex_tcu_fp_formats": ",".join(fp_formats),
         "vortex_gemm_mode": gemm_mode,
@@ -211,6 +214,8 @@ def _normalize_accelerator_profile(macros):
         "vortex_mxu_col": _macro_int(macros, "MXU_COL", 32),
         "vortex_mxu_col_tile": _macro_int(macros, "MXU_COL_TILE", 1),
         "vortex_tmem_bank_size": _macro_int(macros, "TMEM_BANK_SIZE", 64 << 10),
+        "vortex_num_tmem_banks": _macro_int(macros, "NUM_TMEM_BANKS", 8),
+        "vortex_gemm_naive_use_acc_mem": int("GEMM_NAIVE_USE_ACC_MEM" in macros),
         "vortex_num_dma_channels": _macro_int(macros, "NUM_DMA_CHANNELS", 8),
         "vortex_gemm_acc_mem_depth": _macro_int(macros, "GEMM_ACC_MEM_DEPTH", 1024),
         "vortex_gemm_dma_mt": 128,
@@ -247,22 +252,34 @@ def load_vortex_accelerator_profile(manifest_path):
             f"Vortex manifest params.CONFIGS must be a string: {manifest_path}"
         )
     macros = parse_vortex_configs(configs)
+    layout_abi = manifest.get("vortex_layout_abi_version", 2)
+    if type(layout_abi) is not int or layout_abi not in (2, 3):
+        raise ValueError("Vortex manifest vortex_layout_abi_version must be integer 2 or 3")
+    gemm_abi = manifest.get("vortex_gemm_abi_version", 2)
+    if type(gemm_abi) is not int or gemm_abi not in (2, 3):
+        raise ValueError("Vortex manifest vortex_gemm_abi_version must be integer 2 or 3")
     canonical_macros = json.dumps(
         sorted(macros.items()), ensure_ascii=True, separators=(",", ":")
     )
+    # Preserve legacy fingerprints, but distinguish a new physical layout
+    # even when the PnR CONFIGS string is identical.
+    if layout_abi != 2:
+        canonical_macros += f"|layout_abi={layout_abi}"
+    if gemm_abi != 2:
+        canonical_macros += f"|gemm_abi={gemm_abi}"
     fingerprint = hashlib.sha256(canonical_macros.encode("utf-8")).hexdigest()
     target_config = {
         "kind": "vortex",
         **_normalize_accelerator_profile(macros),
-        "vortex_accelerator_profile_version": 1,
+        "vortex_accelerator_profile_version": 2,
         "vortex_accelerator_profile_fingerprint": fingerprint,
         # Keep the authoritative legacy capability contract in the target so
         # it can be serialized into the runtime module.  Newer images may
         # replace this with capability registers, but legacy XRT launches must
         # prove that the loaded sibling manifest describes the same image.
         "vortex_accelerator_profile_configs": configs,
-        "vortex_gemm_abi_version": 2,
-        "vortex_layout_abi_version": 2,
+        "vortex_gemm_abi_version": gemm_abi,
+        "vortex_layout_abi_version": layout_abi,
     }
     target = Target(target_config)
     return VortexAcceleratorProfile(
@@ -438,6 +455,9 @@ def resolve_vortex_compile_config(
         mxu_col=int(getattr(target, "vortex_mxu_col", 32)),
         mxu_col_tile=int(getattr(target, "vortex_mxu_col_tile", 1)),
         tmem_bank_size=int(getattr(target, "vortex_tmem_bank_size", 64 << 10)),
+        num_tmem_banks=int(getattr(target, "vortex_num_tmem_banks", 8)),
+        local_mem_size=int(getattr(target, "local_mem_size", 1 << 20)),
+        gemm_naive_use_acc_mem=bool(getattr(target, "vortex_gemm_naive_use_acc_mem", 0)),
         num_dma_channels=int(getattr(target, "vortex_num_dma_channels", 8)),
         gemm_acc_mem_depth=int(getattr(target, "vortex_gemm_acc_mem_depth", 1024)),
         platform=str(getattr(target, "vortex_platform", "generic")),
@@ -594,6 +614,8 @@ def _compile_command(config, source_path, elf_path):
         f"-DXLEN_{config.xlen}",
         f"-DNUM_WARPS={config.num_warps}",
         f"-DNUM_THREADS={config.thread_warp_size}",
+        f"-DLMEM_SIZE={config.local_mem_size}",
+        f"-DLMEM_LOG_SIZE={(config.local_mem_size - 1).bit_length()}",
         "-DNDEBUG",
     ]
     if config.mcpu:
@@ -625,12 +647,15 @@ def _compile_command(config, source_path, elf_path):
                 f"-DMXU_COL={config.mxu_col}",
                 f"-DMXU_COL_TILE={config.mxu_col_tile}",
                 f"-DTMEM_BANK_SIZE={config.tmem_bank_size}",
+                f"-DNUM_TMEM_BANKS={config.num_tmem_banks}",
                 f"-DNUM_DMA_CHANNELS={config.num_dma_channels}",
                 f"-DGEMM_ACC_MEM_DEPTH={config.gemm_acc_mem_depth}",
             ]
         )
         if config.gemm_mode == "naive":
             command.append("-DGEMM_NAIVE")
+            if config.gemm_naive_use_acc_mem:
+                command.append("-DGEMM_NAIVE_USE_ACC_MEM")
         elif config.gemm_mode == "improve":
             command.append("-DGEMM_IMPROVE")
     command.extend(

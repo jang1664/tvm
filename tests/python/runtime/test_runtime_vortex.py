@@ -210,7 +210,7 @@ def test_module_serialization_preserves_accelerator_profile(vortex_module, tmp_p
     vortex_module.write_to_file(str(module_path))
     restored = tvm.runtime.load_module(str(module_path))
     metadata = restored["vortex.get_accelerator_profile_metadata"]()
-    assert metadata["profile_version"] == "1"
+    assert metadata["profile_version"] == "2"
     assert metadata["tcu_mode"] == "none"
     assert metadata["gemm_mode"] == "none"
     assert metadata["configs"] == ""
@@ -218,6 +218,8 @@ def test_module_serialization_preserves_accelerator_profile(vortex_module, tmp_p
     assert metadata["mxu_col"] == "32"
     assert metadata["mxu_col_tile"] == "1"
     assert metadata["tmem_bank_size"] == str(64 << 10)
+    assert metadata["num_tmem_banks"] == "8"
+    assert metadata["gemm_naive_use_acc_mem"] == "0"
     assert metadata["num_dma_channels"] == "8"
     assert metadata["gemm_acc_mem_depth"] == "1024"
     assert metadata["dma_mt"] == "128"
@@ -251,9 +253,32 @@ def test_accelerator_profile_validation_uses_exact_sibling_manifest(tmp_path):
         "gemm_mode": "improve",
         "platform": "generic",
         "gemm_abi_version": "1",
-        "layout_abi_version": "1",
+        "layout_abi_version": "2",
     }
     validate = tvm.get_global_func("runtime.vortex.validate_accelerator_profile")
+    validate(metadata, "xrt", str(xclbin))
+
+    metadata["layout_abi_version"] = "3"
+    with pytest.raises(RuntimeError, match="layout ABI does not match"):
+        validate(metadata, "xrt", str(xclbin))
+    (profile_dir / "manifest.json").write_text(json.dumps({
+        "params": {"CONFIGS": configs}, "vortex_layout_abi_version": 3,
+    }))
+    validate(metadata, "xrt", str(xclbin))
+    metadata["layout_abi_version"] = "2"
+    with pytest.raises(RuntimeError, match="layout ABI does not match"):
+        validate(metadata, "xrt", str(xclbin))
+    metadata["layout_abi_version"] = "3"
+
+    metadata["gemm_abi_version"] = "3"
+    with pytest.raises(RuntimeError, match="GEMM submission ABI"):
+        validate(metadata, "xrt", str(xclbin))
+    (profile_dir / "manifest.json").write_text(json.dumps({
+        "params": {"CONFIGS": configs}, "vortex_layout_abi_version": 3,
+        "vortex_gemm_abi_version": 3,
+    }))
+    validate(metadata, "xrt", str(xclbin))
+    metadata["gemm_abi_version"] = "2"
     validate(metadata, "xrt", str(xclbin))
 
     metadata["configs"] += " -DMXU_COL_TILE=32"

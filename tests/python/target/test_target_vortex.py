@@ -43,7 +43,7 @@ def test_vortex_target_defaults():
     assert target.attrs["max_local_memory_per_thread"] == 4 << 10
     assert target.attrs["xlen"] == 64
     assert target.attrs["mtriple"] == "riscv64-unknown-elf"
-    assert target.attrs["vortex_accelerator_profile_version"] == 1
+    assert target.attrs["vortex_accelerator_profile_version"] == 2
     assert target.attrs["vortex_accelerator_profile_configs"] == ""
     assert target.attrs["vortex_tcu_mode"] == "none"
     assert target.attrs["vortex_tcu_fp_formats"] == ""
@@ -102,6 +102,38 @@ def test_vortex_target_rejects_invalid_tcu_formats(formats):
 def test_vortex_target_rejects_invalid_gemm_mode(mode):
     with pytest.raises(ValueError, match="vortex_gemm_mode"):
         Target({"kind": "vortex", "vortex_gemm_mode": mode})
+
+
+@pytest.mark.parametrize("width", [8, 16, 32, 64])
+def test_vortex_mxu_accepts_square_power_of_two_geometry(width):
+    target = Target({
+        "kind": "vortex", "vortex_gemm_mode": "naive",
+        "thread_warp_size": width, "vortex_mxu_row": width,
+        "vortex_mxu_col": width, "vortex_mxu_col_tile": width,
+    })
+    assert target.attrs["vortex_mxu_row"] == width
+
+
+@pytest.mark.parametrize("updates,diagnostic", [
+    ({"vortex_mxu_row": 0}, "positive"),
+    ({"vortex_mxu_row": 24, "vortex_mxu_col": 24}, "power of two"),
+    ({"vortex_mxu_col": 16}, "square"),
+    ({"thread_warp_size": 16}, "NUM_THREADS must equal"),
+    ({"vortex_gemm_dma_kt": 16}, "divisible by vortex_mxu_row"),
+    ({"vortex_accelerator_profile_version": 1}, "recompile older packages"),
+    ({"vortex_layout_abi_version": 4}, "must be 2 or 3"),
+])
+def test_vortex_mxu_rejects_invalid_geometry_and_old_profiles(updates, diagnostic):
+    with pytest.raises(ValueError, match=diagnostic):
+        Target({"kind": "vortex", "vortex_gemm_mode": "naive", **updates})
+
+
+def test_vortex_tcu_only_ignores_unused_mxu_geometry():
+    target = Target({
+        "kind": "vortex", "vortex_tcu_mode": "fp", "vortex_tcu_fp_formats": "fp16",
+        "thread_warp_size": 16, "vortex_mxu_row": 24, "vortex_mxu_col": 8,
+    })
+    assert target.attrs["vortex_gemm_mode"] == "none"
 
 
 def test_vortex_accelerator_target_round_trip():

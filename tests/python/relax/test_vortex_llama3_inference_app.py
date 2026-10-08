@@ -19,6 +19,7 @@
 import json
 import math
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -76,6 +77,35 @@ from vortex_llama3.run_backend_residual_probe import (  # noqa: E402
 from vortex_llama3.run_backend_stage_probe import (  # noqa: E402
     make_parser as make_stage_probe_parser,
 )
+
+
+def test_candidate_resolution_uses_capabilities_and_rejects_config_drift(tmp_path):
+    from vortex_llama3.compile_backend_matrix import resolve_backend
+    from tvm.relax.backend.vortex import C2_LINEAR_W4_NAIVE_ATTENTION_FP16_TCU
+
+    configs = (
+        "-DNUM_THREADS=16 -DMXU_ROW=16 -DMXU_COL=16 "
+        "-DENABLE_GEMM_ACCEL -DGEMM_NAIVE -DEXT_TCU_ENABLE "
+        "-DDISABLE_TCU_INT -DDISABLE_BF16"
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"params": {"CONFIGS": configs}}))
+    config = tmp_path / "candidate.sh"
+    config.write_text(f"CONFIGS='{configs}'\n")
+    requested = []
+
+    def resolve(alias, **kwargs):
+        requested.append(alias)
+        return SimpleNamespace(manifest=manifest, config=config)
+
+    dependencies = {"resolve_alias": resolve, "candidate_map": {"unrelated-name": "exact-image"}}
+    _, _, target, policy = resolve_backend("unrelated-name", tmp_path / "aliases.yaml", dependencies)
+    assert requested == ["exact-image"]
+    assert policy.name == C2_LINEAR_W4_NAIVE_ATTENTION_FP16_TCU
+    assert target.attrs["thread_warp_size"] == 16
+    config.write_text(f"CONFIGS='{configs} -DLMEM_SIZE=1048576'\n")
+    with pytest.raises(ValueError, match="source config conflicts with FPGA manifest"):
+        resolve_backend("unrelated-name", tmp_path / "aliases.yaml", dependencies)
 
 
 def test_canonical_layer_range_parsing_and_required_reference_keys():

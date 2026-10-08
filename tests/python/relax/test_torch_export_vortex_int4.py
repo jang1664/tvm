@@ -40,7 +40,7 @@ from tvm.relax.backend.vortex.pipeline import (
 from tvm.relax.frontend.torch import from_exported_program
 from tvm.support.vortex import load_vortex_accelerator_profile
 
-VORTEX_HOME = Path("/home/jaeyongjang/project.local/vortex_base")
+VORTEX_HOME = Path(os.environ.get("TVM_VORTEX_HOME", str(Path(__file__).resolve().parents[4] / "vortex_fpint-feat-gemv")))
 OPS_PATH = VORTEX_HOME / "pytorch/spinquant/spinquant_inference/vortex_export_ops.py"
 sys.path.insert(0, str(VORTEX_HOME / "pytorch/spinquant"))
 
@@ -268,7 +268,7 @@ class _Hadamard(torch.nn.Module):
         self.base_size = base_size
 
     def forward(self, source):
-        return torch.ops.vortex.hadamard(source, self.base, self.base_size)
+        return (torch.ops.vortex.hadamard(source, self.base, self.base_size),)
 
 
 class _KVCacheUpdate(torch.nn.Module):
@@ -545,10 +545,10 @@ def _import_packed_w4a16(
     )
 
 
-def _ffn_inputs(seed=71):
+def _ffn_inputs(seed=71, rows=7):
     rng = np.random.default_rng(seed)
     return (
-        torch.from_numpy(rng.uniform(-0.1, 0.1, (7, 33)).astype("float16")),
+        torch.from_numpy(rng.uniform(-0.1, 0.1, (rows, 33)).astype("float16")),
         torch.from_numpy(rng.integers(0, 256, (33, 16), dtype="uint8")),
         torch.from_numpy(rng.uniform(0.01, 0.04, (2, 31)).astype("float16")),
         torch.zeros((2, 31), dtype=torch.int16),
@@ -556,7 +556,7 @@ def _ffn_inputs(seed=71):
         torch.from_numpy(rng.uniform(0.01, 0.04, (1, 17)).astype("float16")),
         torch.zeros((1, 17), dtype=torch.int16),
         torch.from_numpy(rng.uniform(-0.05, 0.05, (31,)).astype("float16")),
-        torch.from_numpy(rng.uniform(-0.05, 0.05, (7, 31)).astype("float16")),
+        torch.from_numpy(rng.uniform(-0.05, 0.05, (rows, 31)).astype("float16")),
     )
 
 
@@ -873,7 +873,7 @@ def test_hadamard_imports_and_compiles_as_exactly_one_vortex_kernel(
     source = torch.linspace(
         -0.25, 0.25, math.prod(source_shape), dtype=torch.float16
     ).reshape(source_shape)
-    eager = model(source)
+    eager = model(source)[0]
     assert eager.dtype == torch.float16
     assert torch.isfinite(eager).all()
 
@@ -960,12 +960,16 @@ def test_improved_target_inserts_named_hierarchical_layout_pipeline():
     assert 'R.call_pure_packed("relax.vortex.mm_w4a16"' not in script
 
 
-def test_prelegalization_layout_region_fuses_ffn_vector_chain_and_branches():
+@pytest.mark.parametrize("rows", [1, 4, 8, 9, 132, 256])
+@pytest.mark.parametrize("layout_abi", [2, 3])
+def test_prelegalization_layout_region_fuses_ffn_vector_chain_and_branches(rows, layout_abi):
     _register_logical_ops()
     target = tvm.target.Target(
-        {"kind": "vortex", "vortex_gemm_mode": "improve"}, host="llvm"
+        {"kind": "vortex", "vortex_gemm_mode": "improve",
+         "vortex_layout_abi_version": layout_abi,
+         "thread_warp_size": 16, "vortex_mxu_row": 16, "vortex_mxu_col": 16}, host="llvm"
     )
-    inputs = _ffn_inputs()
+    inputs = _ffn_inputs(rows=rows)
     mod = from_exported_program(
         torch.export.export(_W4FFN(), inputs),
         run_ep_decomposition=False,
@@ -977,8 +981,9 @@ def test_prelegalization_layout_region_fuses_ffn_vector_chain_and_branches():
     )
     fused_script = fused.script()
     unfused_script = unfused.script()
-    assert fused_script.count("R.call_tir(cls.vortex_gemm_a_tiled") == 1
-    assert fused_script.count("R.call_tir(cls.vortex_gemm_c_detile") == 1
+    reused = layout_abi == 3 or rows % 8 == 0
+    assert fused_script.count("R.call_tir(cls.vortex_gemm_a_tiled") == (1 if reused else 2)
+    assert fused_script.count("R.call_tir(cls.vortex_gemm_c_detile") == (1 if reused else 2)
     assert fused_script.count("R.call_tir(cls.vortex_gemm_tiled_add") == 2
     assert fused_script.count("R.call_tir(cls.vortex_gemm_tiled_relu") == 1
     assert unfused_script.count("R.call_tir(cls.vortex_gemm_a_tiled") == 2
@@ -993,8 +998,51 @@ def test_prelegalization_layout_region_fuses_ffn_vector_chain_and_branches():
     branched = relax.transform.DeadCodeElimination()(
         _w4a16_lowering_pass(target)(branch_mod)
     ).script()
-    assert branched.count("R.call_tir(cls.vortex_gemm_a_tiled") == 1
+    assert branched.count("R.call_tir(cls.vortex_gemm_a_tiled") == (1 if reused else 2)
     assert branched.count("R.call_tir(cls.vortex_gemm_c_detile") == 2
+
+
+@pytest.mark.parametrize("rows", [1, 4, 256])
+def test_packed_c_gemm_chain_passes_producer_buffer_directly(rows):
+    _register_logical_ops()
+
+    class GemmChain(torch.nn.Module):
+        def forward(self, a, w1, s1, z1, w2, s2, z2):
+            c = torch.ops.vortex.mm_w4a16(
+                a, w1, s1, z1, [256, 256], 32, 0, 1, "signed_asymmetric_int4", False
+            )
+            return torch.ops.vortex.mm_w4a16(
+                c, w2, s2, z2, [256, 256], 32, 0, 1, "signed_asymmetric_int4", False
+            )
+
+    inputs = (torch.ones((rows, 256), dtype=torch.float16),) + tuple(
+        value for _ in range(2) for value in (
+            torch.ones((256, 128), dtype=torch.uint8),
+            torch.ones((8, 256), dtype=torch.float16),
+            torch.zeros((8, 256), dtype=torch.int16),
+        )
+    )
+    mod = from_exported_program(
+        torch.export.export(GemmChain(), inputs),
+        run_ep_decomposition=False, unwrap_unit_return_tuple=True,
+    )
+    target = tvm.target.Target({
+        "kind": "vortex", "vortex_gemm_mode": "improve", "vortex_layout_abi_version": 3,
+        "thread_warp_size": 16, "vortex_mxu_row": 16, "vortex_mxu_col": 16,
+    }, host="llvm")
+    lowered = relax.transform.DeadCodeElimination()(_w4a16_lowering_pass(target)(mod))
+    gemms = []
+    for block in lowered["main"].body.blocks:
+        for binding in block.bindings:
+            call = binding.value
+            if (isinstance(call, relax.Call) and isinstance(call.op, tvm.ir.Op)
+                    and call.op.name == "relax.call_tir"
+                    and call.args[0].name_hint.startswith("vortex_mm_w4a16_improve")):
+                gemms.append((binding.var, call))
+    assert len(gemms) == 2
+    assert gemms[1][1].args[1][0].same_as(gemms[0][0])
+    assert lowered.script().count("R.call_tir(cls.vortex_gemm_a_tiled") == 1
+    assert lowered.script().count("R.call_tir(cls.vortex_gemm_c_detile") == 1
 
 
 def test_fused_policy_reuses_shared_gemm_a_layout_across_projection_siblings():
@@ -1161,7 +1209,7 @@ def test_kv_cache_update_and_attention_lower_from_logical_ops():
     assert unfused_script.count("def vortex_gemm_c_detile") == 2
 
 
-def test_cached_decode_lowers_quantize_update_qkt_and_pv_without_round_trip():
+def test_cached_decode_lowers_quantize_update_qkt_and_pv_without_weight_dequantization():
     _register_logical_ops()
     example = (
         torch.ones((7, 33), dtype=torch.float16),
@@ -1185,7 +1233,10 @@ def test_cached_decode_lowers_quantize_update_qkt_and_pv_without_round_trip():
     script = _w4a16_lowering_pass(target)(mod).script()
     assert script.count("def vortex_kv_cache_update") == 2
     assert script.count("def vortex_mm_w4a16_improve") == 2
-    assert script.count("def vortex_gemm_a_tiled") == 1
+    # The seven-row QKT output has microtile row padding; PV's input uses
+    # DMA-tile padding, so that boundary must detile and repack.
+    assert script.count("def vortex_gemm_a_tiled") == 2
+    assert not int(_w4a16_lowering_pass(target)(mod).attrs.get("vortex.improve.reused_c_layouts", 0))
     assert "dequantize" not in script
     assert "transpose(" not in script
 

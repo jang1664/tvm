@@ -204,17 +204,28 @@ def _chunk_parameter_names(
     return tuple(names)
 
 
-def _build(model, inputs, target, layout_policy: str, exec_mode: str):
+def _build(
+    model, inputs, target, layout_policy: str, exec_mode: str,
+    dynamic_kv_length=False, packed_kv_metadata=None,
+):
     exported = torch.export.export(model, inputs, strict=True)
     mod = from_exported_program(
         exported, run_ep_decomposition=False, unwrap_unit_return_tuple=True
     )
+    if packed_kv_metadata is not None:
+        if layout_policy != "fused":
+            raise ValueError("packed KV requires fused layout policy")
+        from tvm.relax.backend.vortex.packed_kv import prepare_packed_kv_cache
+
+        mod, descriptors = prepare_packed_kv_cache(mod, target)
+        packed_kv_metadata.extend(descriptors)
+        dynamic_kv_length = False  # Already lowered, including dynamic softmax.
     start = time.perf_counter()
     executable = relax.build(
         mod,
         target,
         relax_pipeline=relax.backend.vortex.get_default_pipeline(
-            target, layout_policy=layout_policy
+            target, layout_policy=layout_policy, dynamic_kv_length=dynamic_kv_length
         ),
         exec_mode=exec_mode,
     )
@@ -354,8 +365,12 @@ def prepare_package(args, rows: Sequence[Sequence[int]]) -> Path:
     artifact_records = {}
     build_seconds = {}
     for name, (model, sample_inputs) in builds.items():
+        packed_descriptors = (
+            [] if args.packed_kv_cache and name in ("prefill_layer", "decode_layer") else None
+        )
         executable, seconds = _build(
-            model, sample_inputs, target, args.layout_policy, args.exec_mode
+            model, sample_inputs, target, args.layout_policy, args.exec_mode,
+            args.dynamic_kv_length, packed_descriptors,
         )
         artifact_path = args.artifact_dir / f"{name}.so"
         executable.export_library(str(artifact_path))
@@ -363,6 +378,7 @@ def prepare_package(args, rows: Sequence[Sequence[int]]) -> Path:
             "file": artifact_path.name,
             "sha256": _sha256_file(artifact_path),
             "nbytes": artifact_path.stat().st_size,
+            "packed_kv": packed_descriptors,
         }
         build_seconds[name] = seconds
 
@@ -375,6 +391,8 @@ def prepare_package(args, rows: Sequence[Sequence[int]]) -> Path:
             "prompt_length": config.query_length,
             "cache_capacity": config.cache_capacity,
         },
+        "dynamic_kv_length": args.dynamic_kv_length,
+        "packed_kv_cache": args.packed_kv_cache,
         "layout_policy": args.layout_policy,
         "exec_mode": args.exec_mode,
         "compiled_layers": COMPILED_LAYERS,
@@ -990,6 +1008,21 @@ def run_package(args, rows: Sequence[Sequence[int]]) -> dict:
         next_states = []
         next_host_states = []
         layer_name = "prefill_layer" if phase_index == 0 else "decode_layer"
+        if package.get("packed_kv_cache"):
+            if args.diagnostic_reference_decode_inputs:
+                raise ValueError("packed KV cannot reuse state with substituted reference cache inputs")
+            descriptors = package["artifacts"][layer_name]["packed_kv"]
+            if phase_index == 0:
+                packed_layer_states = [
+                    tuple(
+                        tvm.runtime.tensor(np.zeros(buf["shape"], dtype=buf["dtype"]), device=device)
+                        for desc in descriptors for buf in desc["buffers"]
+                    )
+                    for _ in chunk_offsets
+                ]
+            elif descriptors != package["artifacts"]["prefill_layer"]["packed_kv"]:
+                raise ValueError("prefill/decode packed KV layouts differ")
+
         phase_allocator = (
             args.allocator
             if phase_index == 0 or args.decode_allocator is None
@@ -1061,11 +1094,13 @@ def run_package(args, rows: Sequence[Sequence[int]]) -> dict:
                     address_record["cache_inputs"] = [
                         device_address(tensor) for tensor in call_cache_inputs
                     ]
+            packed_inputs = packed_layer_states[chunk_index] if package.get("packed_kv_cache") else ()
+
             def invoke_current_layer():
                 nonlocal lifetime_guards
                 if phase_index == 0:
                     current_state = layer_vm["main"](
-                        call_hidden, position_device, *parameter_inputs
+                        call_hidden, position_device, *parameter_inputs, *packed_inputs
                     )
                 else:
                     current_state = layer_vm["main"](
@@ -1073,6 +1108,7 @@ def run_package(args, rows: Sequence[Sequence[int]]) -> dict:
                         position_device,
                         *parameter_inputs,
                         *call_cache_inputs,
+                        *packed_inputs,
                     )
                 # Retained-Hadamard artifacts append debug-only lifetime guards.
                 # Keep them alive through VM completion, then preserve the stable
@@ -1544,6 +1580,10 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-token-ids", required=True)
     parser.add_argument("--decode-steps", type=int, default=3)
     parser.add_argument("--cache-capacity", type=int, required=True)
+    parser.add_argument(
+        "--packed-kv-cache", action="store_true",
+        help="Fuse quantization into persistent C4 packed KV stores (implies dynamic KV length)",
+    )
     parser.add_argument("--sampling", choices=("argmax",), default="argmax")
     parser.add_argument(
         "--reference",
@@ -1669,6 +1709,8 @@ def make_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="continue persistent repetitions after a numerical assertion for diagnosis",
     )
+    parser.add_argument("--dynamic-kv-length", action="store_true",
+                        help="compile QK/PV runtime prefix extents (GEMM submission ABI 3)")
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument(
         "--archive-manifest",
@@ -1693,6 +1735,8 @@ def _repetition_trace_path(path: Path, repetition: int) -> Path:
 
 def main() -> None:
     args = make_parser().parse_args()
+    if args.packed_kv_cache:
+        args.dynamic_kv_length = True
     rows = parse_prompt_token_ids(args.prompt_token_ids)
     if args.decode_steps < 0:
         raise ValueError("decode steps must not be negative")

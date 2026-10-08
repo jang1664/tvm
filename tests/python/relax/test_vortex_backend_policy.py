@@ -49,6 +49,7 @@ def _target(*, tcu=False, gemm="none"):
 )
 def test_backend_policy_accepts_exact_capability_contract(name, target):
     assert validate_vortex_backend_policy(target, name).name == name
+    assert validate_vortex_backend_policy(target, "auto").name == name
 
 
 @pytest.mark.parametrize(
@@ -87,3 +88,9 @@ def test_backend_policy_has_explicit_role_routing():
 def test_backend_policy_rejects_unknown_name():
     with pytest.raises(ValueError, match="unsupported Vortex backend policy"):
         get_vortex_backend_policy("automatic_fallback")
+
+
+@pytest.mark.parametrize("target", [_target(), _target(tcu=True, gemm="improve")])
+def test_auto_policy_rejects_unassigned_capability_combinations(target):
+    with pytest.raises(ValueError, match="cannot resolve Vortex auto policy"):
+        validate_vortex_backend_policy(target, "auto")

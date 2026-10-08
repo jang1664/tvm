@@ -69,7 +69,14 @@ struct KernelResourceMetadata {
   bool uses_shared_barrier;
 };
 
-std::pair<std::filesystem::path, std::string> ReadAuthoritativeXrtManifestConfigs(
+struct XrtManifestContract {
+  std::filesystem::path path;
+  std::string configs;
+  int64_t layout_abi_version;
+  int64_t gemm_abi_version;
+};
+
+XrtManifestContract ReadAuthoritativeXrtManifestConfigs(
     const std::string& xclbin_path) {
   TVM_FFI_CHECK(!xclbin_path.empty(), RuntimeError)
       << "Vortex XRT manifest validation requires a non-empty XRT_XCLBIN_PATH";
@@ -83,11 +90,19 @@ std::pair<std::filesystem::path, std::string> ReadAuthoritativeXrtManifestConfig
   json::Object root = json::Parse(content).cast<json::Object>();
   json::Object params = root.at("params").cast<json::Object>();
   std::string configs = params.at("CONFIGS").cast<ffi::String>();
-  return {manifest_path, configs};
+  auto layout = root.Get("vortex_layout_abi_version");
+  int64_t layout_abi = layout.has_value() ? layout.value().cast<int64_t>() : 2;
+  TVM_FFI_CHECK(layout_abi == 2 || layout_abi == 3, RuntimeError)
+      << "Vortex manifest vortex_layout_abi_version must be integer 2 or 3";
+  auto gemm = root.Get("vortex_gemm_abi_version");
+  int64_t gemm_abi = gemm.has_value() ? gemm.value().cast<int64_t>() : 2;
+  TVM_FFI_CHECK(gemm_abi == 2 || gemm_abi == 3, RuntimeError)
+      << "Vortex manifest vortex_gemm_abi_version must be integer 2 or 3";
+  return {manifest_path, configs, layout_abi, gemm_abi};
 }
 
 uint64_t ReadLegacyXrtBarrierCount(const std::string& xclbin_path, uint64_t default_count) {
-  auto [manifest_path, configs] = ReadAuthoritativeXrtManifestConfigs(xclbin_path);
+  auto [manifest_path, configs, layout_abi, gemm_abi] = ReadAuthoritativeXrtManifestConfigs(xclbin_path);
   std::regex override_pattern(R"((^|\s)-DNUM_BARRIERS(?:=([0-9]+))?(?=\s|$))");
   std::smatch match;
   if (!std::regex_search(configs, match, override_pattern)) return default_count;
@@ -122,11 +137,18 @@ void ValidateAcceleratorProfile(const SerializedAcceleratorProfile& expected,
   TVM_FFI_CHECK(!expected_configs.empty(), RuntimeError)
       << "Accelerated Vortex modules require exact manifest CONFIGS metadata; rebuild the target "
          "with load_vortex_accelerator_profile";
-  auto [manifest_path, actual_configs] = ReadAuthoritativeXrtManifestConfigs(xclbin_path);
+  auto [manifest_path, actual_configs, layout_abi, gemm_abi] =
+      ReadAuthoritativeXrtManifestConfigs(xclbin_path);
   TVM_FFI_CHECK_EQ(actual_configs, expected_configs, RuntimeError)
       << "Loaded Vortex xclbin accelerator profile does not match the module compiled profile; "
          "module fingerprint="
       << fingerprint << ", manifest=" << manifest_path.string();
+  TVM_FFI_CHECK_LE(std::stoll(required("gemm_abi_version")), gemm_abi, RuntimeError)
+      << "Loaded Vortex xclbin does not support the compiled GEMM submission ABI; "
+      << "manifest=" << manifest_path.string();
+  TVM_FFI_CHECK_EQ(required("layout_abi_version"), std::to_string(layout_abi), RuntimeError)
+      << "Loaded Vortex xclbin layout ABI does not match the module compiled layout ABI; "
+      << "manifest=" << manifest_path.string();
 }
 
 void ValidateBarrierConfiguration(uint64_t num_warps, uint64_t reported_num_barriers,
@@ -274,7 +296,7 @@ class VortexModuleNode final : public ffi::ModuleObj {
     for (const char* field :
          {"profile_version", "fingerprint", "configs", "tcu_mode", "tcu_fp_formats", "gemm_mode",
           "platform", "gemm_abi_version", "layout_abi_version", "mxu_row", "mxu_col",
-          "mxu_col_tile", "tmem_bank_size", "num_dma_channels", "gemm_acc_mem_depth",
+          "mxu_col_tile", "tmem_bank_size", "num_tmem_banks", "gemm_naive_use_acc_mem", "num_dma_channels", "gemm_acc_mem_depth",
           "dma_mt", "dma_nt", "dma_kt", "qparam_slot_alignment", "tmem_alignment",
           "dimension_bits", "device_address_bits", "tile_counter_bits", "job_entries",
           "num_cores"}) {
@@ -284,7 +306,7 @@ class VortexModuleNode final : public ffi::ModuleObj {
     auto profile_value = [this](const char* field) {
       return std::string(accelerator_profile_.at(ffi::String(field)));
     };
-    TVM_FFI_CHECK_EQ(profile_value("profile_version"), "1", ValueError)
+    TVM_FFI_CHECK_EQ(profile_value("profile_version"), "2", ValueError)
         << "Unsupported Vortex accelerator profile metadata version";
     std::string fingerprint = profile_value("fingerprint");
     std::string configs = profile_value("configs");
@@ -537,7 +559,8 @@ static ffi::Module VortexModuleCreate(
     ffi::String accelerator_profile_fingerprint, ffi::String accelerator_profile_configs,
     ffi::String tcu_mode, ffi::String tcu_fp_formats, ffi::String gemm_mode, ffi::String platform,
     uint32_t gemm_abi_version, uint32_t layout_abi_version, uint32_t mxu_row, uint32_t mxu_col,
-    uint32_t mxu_col_tile, uint32_t tmem_bank_size, uint32_t num_dma_channels,
+    uint32_t mxu_col_tile, uint32_t tmem_bank_size, uint32_t num_tmem_banks,
+    uint32_t gemm_naive_use_acc_mem, uint32_t num_dma_channels,
     uint32_t gemm_acc_mem_depth, uint32_t dma_mt, uint32_t dma_nt, uint32_t dma_kt,
     uint32_t qparam_slot_alignment, uint32_t tmem_alignment, uint32_t dimension_bits,
     uint32_t device_address_bits, uint32_t tile_counter_bits, uint32_t job_entries,
@@ -556,6 +579,8 @@ static ffi::Module VortexModuleCreate(
       {"mxu_col", ffi::String(std::to_string(mxu_col))},
       {"mxu_col_tile", ffi::String(std::to_string(mxu_col_tile))},
       {"tmem_bank_size", ffi::String(std::to_string(tmem_bank_size))},
+      {"num_tmem_banks", ffi::String(std::to_string(num_tmem_banks))},
+      {"gemm_naive_use_acc_mem", ffi::String(std::to_string(gemm_naive_use_acc_mem))},
       {"num_dma_channels", ffi::String(std::to_string(num_dma_channels))},
       {"gemm_acc_mem_depth", ffi::String(std::to_string(gemm_acc_mem_depth))},
       {"dma_mt", ffi::String(std::to_string(dma_mt))},

@@ -150,12 +150,14 @@ def _torch_archive_parameters(archive, names):
     }
 
 
-def _build(model, inputs, target, policy):
+def _build(model, inputs, target, policy, layout_policy=None):
     exported = torch.export.export(model, inputs, strict=True)
     mod = from_exported_program(
         exported, run_ep_decomposition=False, unwrap_unit_return_tuple=True
     )
-    lowered = relax.backend.vortex.get_default_pipeline(target, backend_policy=policy)(
+    lowered = relax.backend.vortex.get_default_pipeline(
+        target, backend_policy=policy, layout_policy=layout_policy
+    )(
         mod
     )
     executable = relax.build(

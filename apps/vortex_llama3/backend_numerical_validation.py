@@ -49,7 +49,7 @@ REFERENCE_SCHEMA_VERSION = 1
 REFERENCE_FORMAT = "vortex-llama3-backend-gpu-reference"
 REFERENCE_SEED = 20260831
 DECODE_STEPS = 3
-SUPPORTED_ALIASES = ("C1", "C3")
+SUPPORTED_ALIASES = ("C1", "C2", "C3", "C4")
 EXPECTED_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 
 
@@ -117,8 +117,6 @@ def load_backend_package(
     package = load_compile_package(package_path, alias_map, dependencies)
     alias = package["alias"]
     shape_case = package["shape_case"]
-    if alias not in SUPPORTED_ALIASES:
-        raise ValueError(f"numerical validation does not support alias {alias!r}")
     if expected_alias is not None and alias != expected_alias:
         raise ValueError(
             f"backend package alias mismatch: expected {expected_alias}, got {alias}"

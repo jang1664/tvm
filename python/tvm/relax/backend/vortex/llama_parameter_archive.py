@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import asdict
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -27,10 +28,17 @@ import numpy as np
 
 from tvm.runtime import tensor as runtime_tensor
 
+from .layout import (
+    ImproveProfile,
+    plan_improve_layout,
+    prepack_improve_qparam,
+    prepack_improve_weight,
+)
 from .policy import (
     C1_ALL_FP16_TCU,
     C2_LINEAR_W4_NAIVE_ATTENTION_FP16_TCU,
     C3_ALL_W4_NAIVE,
+    C4_ALL_W4_IMPROVE,
     validate_vortex_backend_policy,
 )
 
@@ -266,13 +274,16 @@ def prepare_backend_parameter_archive(
         C1_ALL_FP16_TCU,
         C2_LINEAR_W4_NAIVE_ATTENTION_FP16_TCU,
         C3_ALL_W4_NAIVE,
+        C4_ALL_W4_IMPROVE,
     ):
         raise ValueError(f"unsupported logical archive materialization policy: {policy.name}")
 
     tensors = []
     consumed = set()
     group_size = int(logical_archive.manifest["model_metadata"].get("weight_group_size", 32))
-    if policy.name == C1_ALL_FP16_TCU:
+    if policy.name == C4_ALL_W4_IMPROVE:
+        tensors = _improve_materialization_records(logical_archive, target, group_size)
+    elif policy.name == C1_ALL_FP16_TCU:
         for name in sorted(logical_archive.records):
             if name in consumed:
                 continue
@@ -353,11 +364,67 @@ def prepare_backend_parameter_archive(
         "data_sha256": _sha256_file(data_path),
         "records": records,
     }
+    if policy.name == C4_ALL_W4_IMPROVE:
+        manifest["improve_profile"] = asdict(ImproveProfile.from_target(target))
     manifest_path = directory / "manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     return manifest_path
+
+
+def _improve_materialization_records(logical_archive, target, group_size):
+    """Stream profile-specific records using the existing improve packing primitives."""
+    profile = ImproveProfile.from_target(target)
+    consumed = set()
+    for name in sorted(logical_archive.records):
+        if not name.endswith(".qweight"):
+            continue
+        projection = name.removesuffix(".qweight")
+        names = (name, f"{projection}.scales", f"{projection}.zeros")
+        if any(value not in logical_archive.records for value in names):
+            raise ValueError(f"incomplete logical W4 projection: {projection}")
+        record = logical_archive.records[name]
+        if (
+            record.get("quant_axis") != 0
+            or record.get("pack_axis") != 1
+            or record.get("quantization_scheme") != "signed_asymmetric_int4"
+        ):
+            raise ValueError(f"unsupported logical W4 projection contract: {projection}")
+        logical_k, logical_n = record["logical_shape"]
+        plan = plan_improve_layout(
+            1, logical_n, logical_k, group_size, profile=profile
+        )
+        metadata = {
+            "layout": "improve_prepacked_w4",
+            "descriptor_version": _DESCRIPTOR_VERSION,
+            "source_records": list(names),
+            "source_hashes": [logical_archive.records[value]["sha256"] for value in names],
+            "logical_k": logical_k,
+            "logical_n": logical_n,
+            "execution_k": plan.execution_k,
+            "execution_n": plan.execution_n,
+            "qblock": group_size,
+            "weight_transpose": False,
+            "quant_direction": 0,
+            "layout_abi_version": profile.layout_abi_version,
+            "gemm_abi_version": profile.gemm_abi_version,
+        }
+        yield name, prepack_improve_weight(logical_archive.tensor(name), plan), metadata
+        for qname, dtype in zip(names[1:], ("float16", "int16")):
+            yield qname, prepack_improve_qparam(logical_archive.tensor(qname), plan, dtype), metadata
+        consumed.update(names)
+    for name in sorted(logical_archive.records):
+        if name in consumed:
+            continue
+        if name.endswith((".scales", ".zeros")):
+            raise ValueError(f"orphan logical W4 qparam: {name}")
+        yield name, logical_archive.tensor(name), {
+            "layout": "canonical_fp16",
+            "descriptor_version": _DESCRIPTOR_VERSION,
+            "source_records": [name],
+            "source_hashes": [logical_archive.records[name]["sha256"]],
+        }
 
 
 class BackendParameterArchive(_CheckedTensorArchive):

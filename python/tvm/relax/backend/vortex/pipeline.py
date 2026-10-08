@@ -32,6 +32,7 @@ from .layout import (
     prepack_improve_weight,
 )
 from .policy import validate_vortex_backend_policy
+from .packed_kv import PackedKVLowering
 
 
 def _make_hadamard(shape, base_size):
@@ -167,8 +168,21 @@ def _make_hadamard(shape, base_size):
     return hadamard
 
 
-def _make_causal_softmax(shape, position_shape, valid_length_shape, head_dim):
+def _helper_block_size():
+    """Keep independent per-thread helpers within the target's launch capacity."""
+    target = tvm.target.Target.current(allow_none=True)
+    if target is None:
+        return 128
+    return min(
+        128,
+        int(target.attrs.get("max_block_size_x", 128)),
+        int(target.attrs.get("max_threads_per_block", 128)),
+    )
+
+
+def _make_causal_softmax(shape, position_shape, valid_length_shape, head_dim, dynamic=False):
     """Create one rank-5 scaled causal-mask/softmax device kernel."""
+    thread_count = _helper_block_size()
 
     rows = math.prod(shape[:-1])
     capacity = shape[-1]
@@ -185,16 +199,24 @@ def _make_causal_softmax(shape, position_shape, valid_length_shape, head_dim):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
         maximum = T.alloc_buffer((1,), "float32", scope="local")
         denominator = T.alloc_buffer((1,), "float32", scope="local")
-        for bx in T.thread_binding((rows + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                row = bx * 128 + tx
+        for bx in T.thread_binding((rows + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                row = bx * thread_count + tx
                 if row < rows:
                     batch = row // (shape[1] * shape[2] * shape[3])
                     kv_head = row // (shape[2] * shape[3]) % shape[1]
                     group = row // shape[3] % shape[2]
                     query = row % shape[3]
+                    limit = (
+                        T.min(
+                            T.int64(capacity),
+                            T.max(T.int64(0), T.min(
+                                valid_length[()], position_ids[batch, query] + T.int64(1)
+                            )),
+                        ) if dynamic else capacity
+                    )
                     maximum[0] = T.float32(-3.4028234663852886e38)
-                    for key in T.serial(capacity):
+                    for key in T.serial(limit):
                         is_valid = T.And(
                             T.Cast("int64", key) < valid_length[()],
                             T.Cast("int64", key) <= position_ids[batch, query],
@@ -208,7 +230,7 @@ def _make_causal_softmax(shape, position_shape, valid_length_shape, head_dim):
                         if is_valid:
                             maximum[0] = T.max(maximum[0], scaled)
                     denominator[0] = T.float32(0)
-                    for key in T.serial(capacity):
+                    for key in T.serial(limit):
                         is_valid = T.And(
                             T.Cast("int64", key) < valid_length[()],
                             T.Cast("int64", key) <= position_ids[batch, query],
@@ -218,7 +240,7 @@ def _make_causal_softmax(shape, position_shape, valid_length_shape, head_dim):
                                 masked_scores[batch, kv_head, group, query, key]
                                 - maximum[0]
                             )
-                    for key in T.serial(capacity):
+                    for key in T.serial(limit):
                         is_valid = T.And(
                             T.Cast("int64", key) < valid_length[()],
                             T.Cast("int64", key) <= position_ids[batch, query],
@@ -235,6 +257,9 @@ def _make_causal_softmax(shape, position_shape, valid_length_shape, head_dim):
                             ),
                             T.float16(0),
                         )
+                    for key in T.serial(limit, capacity):
+                        masked_scores[batch, kv_head, group, query, key] = T.float32(float("-inf"))
+                        probabilities[batch, kv_head, group, query, key] = T.float16(0)
 
     return causal_softmax
 
@@ -352,6 +377,7 @@ def _make_quantize_int4_row_major(shape, group_size, scheme):
 
 def _make_dequantize_int4_row_major(shape, group_size):
     """Create the canonical signed INT4 tuple -> rank-2 FP16 implementation."""
+    thread_count = _helper_block_size()
 
     rows, columns = shape
     groups = (columns + group_size - 1) // group_size
@@ -366,11 +392,11 @@ def _make_dequantize_int4_row_major(shape, group_size):
         output: T.Buffer((rows, columns), "float16"),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
-        for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                if bx * 128 + tx < total:
-                    row = (bx * 128 + tx) // columns
-                    column = (bx * 128 + tx) % columns
+        for bx in T.thread_binding((total + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                if bx * thread_count + tx < total:
+                    row = (bx * thread_count + tx) // columns
+                    column = (bx * thread_count + tx) % columns
                     nibble = T.Cast(
                         "int32",
                         (packed[row, column // 2] >> T.Cast("uint8", (column % 2) * 4))
@@ -391,6 +417,7 @@ def _make_dequantize_int4_row_major(shape, group_size):
 
 def _make_dequantize_int4_rank5(shape, group_size):
     """Create a direct rank-5 signed INT4 tuple -> FP16 implementation."""
+    thread_count = _helper_block_size()
 
     d0, d1, d2, d3, columns = shape
     groups = (columns + group_size - 1) // group_size
@@ -407,9 +434,9 @@ def _make_dequantize_int4_rank5(shape, group_size):
         output: T.Buffer(shape, "float16"),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
-        for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                index = bx * 128 + tx
+        for bx in T.thread_binding((total + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                index = bx * thread_count + tx
                 if index < total:
                     i0 = index // (d1 * d2 * d3 * columns)
                     i1 = index // (d2 * d3 * columns) % d1
@@ -443,6 +470,7 @@ def _make_dequantize_int4_rank5(shape, group_size):
 
 def _make_batched_matrix_slice(shape, dtype, batch_index):
     """Copy one rank-5 batch coordinate directly into a rank-2 matrix."""
+    thread_count = _helper_block_size()
 
     rows, columns = shape[-2:]
     b0, b1, b2 = batch_index
@@ -454,9 +482,9 @@ def _make_batched_matrix_slice(shape, dtype, batch_index):
         output: T.Buffer((rows, columns), dtype),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8})
-        for bx in T.thread_binding((elements + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                index = bx * 128 + tx
+        for bx in T.thread_binding((elements + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                index = bx * thread_count + tx
                 if index < elements:
                     row = index // columns
                     column = index % columns
@@ -467,6 +495,7 @@ def _make_batched_matrix_slice(shape, dtype, batch_index):
 
 def _make_batched_output_rank5(shape):
     """Copy concatenated rank-2 matrices directly into their rank-5 result."""
+    thread_count = _helper_block_size()
 
     d0, d1, d2, rows, columns = shape
     matrices = d0 * d1 * d2
@@ -479,9 +508,9 @@ def _make_batched_output_rank5(shape):
         output: T.Buffer(shape, "float16"),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8})
-        for bx in T.thread_binding((elements + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                index = bx * 128 + tx
+        for bx in T.thread_binding((elements + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                index = bx * thread_count + tx
                 if index < elements:
                     matrix = index // (rows * columns)
                     row = index // columns % rows
@@ -498,6 +527,7 @@ def _make_batched_output_rank5(shape):
 
 def _make_kv_cache_update(cache_shapes, update_shapes, position):
     """Create a functional rank-2/3/4 cache update for the coupled INT4 tuple."""
+    thread_count = _helper_block_size()
 
     payload_shape, scale_shape, zero_shape = cache_shapes
     payload_update_shape, scale_update_shape, zero_update_shape = update_shapes
@@ -523,10 +553,10 @@ def _make_kv_cache_update(cache_shapes, update_shapes, position):
         ):
             T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
             for bx in T.thread_binding(
-                (max_elements + 127) // 128, thread="blockIdx.x"
+                (max_elements + thread_count - 1) // thread_count, thread="blockIdx.x"
             ):
-                for tx in T.thread_binding(128, thread="threadIdx.x"):
-                    index = bx * 128 + tx
+                for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                    index = bx * thread_count + tx
                     if index < payload_shape[0] * payload_shape[1]:
                         row = index // payload_shape[1]
                         column = index % payload_shape[1]
@@ -570,10 +600,10 @@ def _make_kv_cache_update(cache_shapes, update_shapes, position):
         ):
             T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
             for bx in T.thread_binding(
-                (max_elements + 127) // 128, thread="blockIdx.x"
+                (max_elements + thread_count - 1) // thread_count, thread="blockIdx.x"
             ):
-                for tx in T.thread_binding(128, thread="threadIdx.x"):
-                    index = bx * 128 + tx
+                for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                    index = bx * thread_count + tx
                     if index < payload_shape[0] * payload_shape[1] * payload_shape[2]:
                         batch = index // (payload_shape[1] * payload_shape[2])
                         sequence = index // payload_shape[2] % payload_shape[1]
@@ -617,9 +647,9 @@ def _make_kv_cache_update(cache_shapes, update_shapes, position):
         output_zero: T.Buffer(zero_shape, "int16"),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
-        for bx in T.thread_binding((max_elements + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                index = bx * 128 + tx
+        for bx in T.thread_binding((max_elements + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                index = bx * thread_count + tx
                 if index < math.prod(payload_shape):
                     batch = index // (
                         payload_shape[1] * payload_shape[2] * payload_shape[3]
@@ -662,6 +692,7 @@ def _make_kv_cache_update(cache_shapes, update_shapes, position):
 
 def _make_kv_cache_update_dynamic(cache_shapes, update_shapes):
     """Create a bounds-safe functional rank-4 cache update at a runtime position."""
+    thread_count = _helper_block_size()
 
     payload_shape, scale_shape, zero_shape = cache_shapes
     payload_update_shape, scale_update_shape, zero_update_shape = update_shapes
@@ -685,9 +716,9 @@ def _make_kv_cache_update_dynamic(cache_shapes, update_shapes):
         output_zero: T.Buffer(zero_shape, "int16"),
     ):
         T.func_attr({"tirx.is_scheduled": True})
-        for bx in T.thread_binding((max_elements + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                index = bx * 128 + tx
+        for bx in T.thread_binding((max_elements + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                index = bx * thread_count + tx
                 if index < math.prod(payload_shape):
                     batch = index // (
                         payload_shape[1] * payload_shape[2] * payload_shape[3]
@@ -730,6 +761,7 @@ def _make_kv_cache_update_dynamic(cache_shapes, update_shapes):
 
 def _make_kv_cache_update_dynamic_inplace(cache_shapes, update_shapes):
     """Create a checked rank-4 append that mutates uniquely owned cache buffers."""
+    thread_count = _helper_block_size()
 
     payload_shape, scale_shape, zero_shape = cache_shapes
     payload_update_shape, scale_update_shape, zero_update_shape = update_shapes
@@ -751,9 +783,9 @@ def _make_kv_cache_update_dynamic_inplace(cache_shapes, update_shapes):
         position: T.Buffer((), "int64"),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
-        for bx in T.thread_binding((max_elements + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                index = bx * 128 + tx
+        for bx in T.thread_binding((max_elements + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                index = bx * thread_count + tx
                 valid_position = T.And(
                     T.int64(0) <= position[()], position[()] < T.int64(capacity)
                 )
@@ -806,8 +838,9 @@ def _make_kv_cache_update_dynamic_inplace(cache_shapes, update_shapes):
     return kv_cache_update_dynamic_inplace_rank4
 
 
-def _make_fp16_tcu_matmul(m: int, n: int, k: int):
+def _make_fp16_tcu_matmul(m: int, n: int, k: int, geometry=(32, 16, 16, 32)):
     """Create the exact-tile FP16 TCU implementation for a rank-2 matmul."""
+    threads, tile_m, tile_n, _tile_k = geometry
 
     @T.prim_func(private=True)
     def tcu_matmul(
@@ -816,9 +849,9 @@ def _make_fp16_tcu_matmul(m: int, n: int, k: int):
         output: T.Buffer((m, n), "float16"),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
-        for by in T.thread_binding(m // 16, thread="blockIdx.y"):
-            for bx in T.thread_binding(n // 16, thread="blockIdx.x"):
-                for tx in T.thread_binding(32, thread="threadIdx.x"):
+        for by in T.thread_binding(m // tile_m, thread="blockIdx.y"):
+            for bx in T.thread_binding(n // tile_n, thread="blockIdx.x"):
+                for tx in T.thread_binding(threads, thread="threadIdx.x"):
                     T.evaluate(
                         T.call_extern(
                             "int32",
@@ -836,27 +869,32 @@ def _make_fp16_tcu_matmul(m: int, n: int, k: int):
 
 
 def _make_pad_fp16_matrix(
-    rows: int, columns: int, padded_rows: int, padded_columns: int
+    rows: int, columns: int, padded_rows: int, padded_columns: int,
+    dtype="float16", transpose=False,
 ):
-    """Zero-pad one FP16 matrix without exposing a fusible generic pad."""
+    """Zero-pad one matrix without exposing a fusible generic pad."""
+    thread_count = _helper_block_size()
 
     total = padded_rows * padded_columns
+    neutral = tvm.tirx.const(0.0 if dtype == "float16" else 0, dtype)
 
     @T.prim_func(private=True)
     def pad_fp16_matrix(
-        source: T.Buffer((rows, columns), "float16"),
-        output: T.Buffer((padded_rows, padded_columns), "float16"),
+        source: T.Buffer((rows, columns), dtype),
+        output: T.Buffer((padded_rows, padded_columns), dtype),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
-        for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                if bx * 128 + tx < total:
-                    row = (bx * 128 + tx) // padded_columns
-                    column = (bx * 128 + tx) % padded_columns
+        for bx in T.thread_binding((total + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                if bx * thread_count + tx < total:
+                    row = (bx * thread_count + tx) // padded_columns
+                    column = (bx * thread_count + tx) % padded_columns
+                    source_row = column if transpose else row
+                    source_column = row if transpose else column
                     output[row, column] = T.Select(
-                        T.And(row < rows, column < columns),
-                        source[row, column],
-                        T.float16(0),
+                        T.And(source_row < rows, source_column < columns),
+                        source[source_row, source_column],
+                        neutral,
                     )
 
     return pad_fp16_matrix
@@ -866,6 +904,7 @@ def _make_slice_fp16_matrix(
     rows: int, columns: int, logical_rows: int, logical_columns: int
 ):
     """Slice the logical top-left matrix region after a padded TCU job."""
+    thread_count = _helper_block_size()
 
     total = logical_rows * logical_columns
 
@@ -875,11 +914,11 @@ def _make_slice_fp16_matrix(
         output: T.Buffer((logical_rows, logical_columns), "float16"),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
-        for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                if bx * 128 + tx < total:
-                    row = (bx * 128 + tx) // logical_columns
-                    column = (bx * 128 + tx) % logical_columns
+        for bx in T.thread_binding((total + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                if bx * thread_count + tx < total:
+                    row = (bx * thread_count + tx) // logical_columns
+                    column = (bx * thread_count + tx) % logical_columns
                     output[row, column] = source[row, column]
 
     return slice_fp16_matrix
@@ -938,6 +977,7 @@ def _make_w4a16_naive(
 
 def _make_w4a16_naive_n_tile_packed(shape, logical_n, tile_n):
     """Compact each quant-direction-N payload tile into a contiguous matrix."""
+    thread_count = _helper_block_size()
 
     d0, d1, d2, k, packed_n = shape
     if d2 != 1 or logical_n % tile_n or packed_n != logical_n // 2:
@@ -953,9 +993,9 @@ def _make_w4a16_naive_n_tile_packed(shape, logical_n, tile_n):
         output: T.Buffer(output_shape, "uint8"),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8})
-        for bx in T.thread_binding((elements + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                index = bx * 128 + tx
+        for bx in T.thread_binding((elements + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                index = bx * thread_count + tx
                 if index < elements:
                     i0 = index // (d1 * tile_count * k * tile_bytes)
                     i1 = index // (tile_count * k * tile_bytes) % d1
@@ -971,6 +1011,7 @@ def _make_w4a16_naive_n_tile_packed(shape, logical_n, tile_n):
 
 def _make_w4a16_naive_n_tile_qparam(shape, dtype, logical_n, group_size, tile_n):
     """Replicate the qparam group selected by each contiguous N tile."""
+    thread_count = _helper_block_size()
 
     d0, d1, d2, k, groups = shape
     if (
@@ -990,9 +1031,9 @@ def _make_w4a16_naive_n_tile_qparam(shape, dtype, logical_n, group_size, tile_n)
         output: T.Buffer(output_shape, dtype),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8})
-        for bx in T.thread_binding((elements + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                index = bx * 128 + tx
+        for bx in T.thread_binding((elements + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                index = bx * thread_count + tx
                 if index < elements:
                     i0 = index // (d1 * tile_count * k)
                     i1 = index // (tile_count * k) % d1
@@ -1135,13 +1176,14 @@ def _make_w4a16_naive_batched(
 
 
 def _make_gemm_a_tiled(plan):
+    thread_count = _helper_block_size()
     m = plan.logical_m
     k = plan.logical_k
     k_exec = plan.execution_k
     dma_mt = plan.profile.dma_mt
     dma_kt = plan.profile.dma_kt
     mxu_kt = plan.profile.mxu_kt
-    channels = plan.profile.num_dma_channels
+    row_alignment = plan.profile.row_alignment
     total = plan.a_elements
 
     @T.prim_func(private=True)
@@ -1150,14 +1192,14 @@ def _make_gemm_a_tiled(plan):
         tiled: T.Buffer((total,), "float16"),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8})
-        for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                index = bx * 128 + tx
+        for bx in T.thread_binding((total + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                index = bx * thread_count + tx
                 if index < total:
                     mt = index // (dma_mt * k_exec)
                     within_mt = index % (dma_mt * k_exec)
                     cur_m = T.min(dma_mt, m - mt * dma_mt)
-                    slot_m = (cur_m + channels - 1) // channels * channels
+                    slot_m = (cur_m + row_alignment - 1) // row_alignment * row_alignment
                     kt = within_mt // (slot_m * dma_kt)
                     within_kt = within_mt % (slot_m * dma_kt)
                     cur_k = T.min(dma_kt, k_exec - kt * dma_kt)
@@ -1176,6 +1218,7 @@ def _make_gemm_a_tiled(plan):
 
 
 def _make_gemm_w_tiled(rhs_shape, plan):
+    thread_count = _helper_block_size()
     rows, columns = rhs_shape
     transpose_rhs = plan.weight_transpose
     total_bytes = plan.weight_bytes
@@ -1193,10 +1236,10 @@ def _make_gemm_w_tiled(rhs_shape, plan):
         tiled: T.Buffer((total_bytes,), "uint8"),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8})
-        for bx in T.thread_binding((total_bytes + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                if bx * 128 + tx < total_bytes:
-                    index = bx * 128 + tx
+        for bx in T.thread_binding((total_bytes + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                if bx * thread_count + tx < total_bytes:
+                    index = bx * thread_count + tx
                     kt = index // (dma_kt * n_exec // 2)
                     within_kt = index % (dma_kt * n_exec // 2)
                     cur_k = T.min(dma_kt, k_exec - kt * dma_kt)
@@ -1229,6 +1272,7 @@ def _make_gemm_w_tiled(rhs_shape, plan):
 
 
 def _make_gemm_qparam_tiled(source_shape, dtype, plan):
+    thread_count = _helper_block_size()
     output_elements = plan.qparam_elements
     quant_direction = plan.quant_direction
     transpose_rhs = plan.weight_transpose
@@ -1251,10 +1295,10 @@ def _make_gemm_qparam_tiled(source_shape, dtype, plan):
         tiled: T.Buffer((output_elements,), dtype),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8})
-        for bx in T.thread_binding((output_elements + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                if bx * 128 + tx < output_elements:
-                    index = bx * 128 + tx
+        for bx in T.thread_binding((output_elements + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                if bx * thread_count + tx < output_elements:
+                    index = bx * thread_count + tx
                     kt = index // full_k_row_elements
                     within_kt = index % full_k_row_elements
                     cur_k = T.min(dma_kt, k_exec - kt * dma_kt)
@@ -1326,6 +1370,13 @@ def _make_w4a16_improve(
     logical_k,
     layout_abi_version,
 ):
+    if layout_abi_version not in (2, 3):
+        raise ValueError("Vortex Improve layout ABI must be 2 or 3")
+    # The existing device helper only validates/submits the v2 job fields;
+    # it never interprets C addresses. Layout v3 keeps that submission ABI.
+    # The module/manifest layout contract is checked separately before launch.
+    submission_abi_version = 2
+
     @T.prim_func(private=True)
     def mm_w4a16_improve(
         lhs: T.Buffer((tiled_a_elements,), "float16"),
@@ -1355,20 +1406,79 @@ def _make_w4a16_improve(
                         2,
                         logical_n,
                         logical_k,
-                        layout_abi_version,
+                        submission_abi_version,
                     )
                 )
 
     return mm_w4a16_improve
 
 
+def _make_prefix_mask(shape, axis):
+    """Copy a live FP16 prefix and neutralize even NaN/Inf outside it."""
+    if len(shape) != 2 or axis not in (0, 1):
+        raise ValueError("prefix mask requires a rank-2 matrix and axis 0 or 1")
+    count = math.prod(shape)
+    stride = math.prod(shape[axis + 1:])
+    extent = shape[axis]
+    threads = _helper_block_size()
+
+    @T.prim_func(private=True)
+    def prefix_mask(
+        source: T.Buffer(shape, "float16"),
+        length: T.Buffer((), "int64"),
+        output: T.Buffer(shape, "float16"),
+    ):
+        T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True})
+        for bx in T.thread_binding((count + threads - 1) // threads, thread="blockIdx.x"):
+            for tx in T.thread_binding(threads, thread="threadIdx.x"):
+                i = bx * threads + tx
+                if i < count:
+                    if T.Cast("int64", i // stride % extent) < length[()]:
+                        output[i // shape[1], i % shape[1]] = source[i // shape[1], i % shape[1]]
+                    else:
+                        output[i // shape[1], i % shape[1]] = T.float16(0)
+    return prefix_mask
+
+
+def _make_w4a16_region(plan, prefix_axis, rhs_heads=1, rhs_head=0):
+    """Keep parent strides fixed while reading the runtime prefix extent."""
+    a, w, q, c = plan.a_elements, plan.weight_bytes, plan.qparam_elements, plan.c_elements
+    m, n, k = plan.logical_m, plan.execution_n, plan.execution_k
+    group, trans, qdir = plan.qblock, plan.weight_transpose, plan.quant_direction
+    alignment = plan.profile.mxu_nt if prefix_axis == "N" else plan.profile.mxu_kt
+
+    @T.prim_func(private=True)
+    def gemm_region(
+        lhs: T.Buffer((a,), "float16"),
+        packed: T.Buffer((rhs_heads * w,), "uint8"),
+        scale: T.Buffer((rhs_heads * q,), "float16"),
+        zero: T.Buffer((rhs_heads * q,), "int16"),
+        length: T.Buffer((), "int64"),
+        output: T.Buffer((c,), "float16"),
+    ):
+        T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8})
+        for bx in T.thread_binding(1, thread="blockIdx.x"):
+            for tx in T.thread_binding(1, thread="threadIdx.x"):
+                extent = T.Cast("uint32", (length[()] + alignment - 1) // alignment * alignment)
+                T.evaluate(T.call_extern("int32", "vx_tvm_gemm_w4a16_region",
+                    lhs.data, T.address_of(packed[rhs_head * w]),
+                    T.address_of(scale[rhs_head * q]), T.address_of(zero[rhs_head * q]), output.data,
+                    m, n, k, group, trans, qdir, m,
+                    extent if prefix_axis == "N" else T.uint32(n),
+                    extent if prefix_axis == "K" else T.uint32(k)))
+    return gemm_region
+
+
 def _make_gemm_c_detile(plan):
+    thread_count = _helper_block_size()
     m = plan.logical_m
     n = plan.logical_n
     n_exec = plan.execution_n
     dma_mt = plan.profile.dma_mt
+    dma_nt = plan.profile.dma_nt
+    packed_c = plan.profile.layout_abi_version == 3
     mxu_nt = plan.profile.mxu_nt
-    channels = plan.profile.num_dma_channels
+    row_alignment = plan.profile.row_alignment
     total = m * n
 
     @T.prim_func(private=True)
@@ -1377,21 +1487,26 @@ def _make_gemm_c_detile(plan):
         output: T.Buffer((m, n), "float16"),
     ):
         T.func_attr({"tirx.is_scheduled": True, "tirx.noalias": True, "op_pattern": 8})
-        for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                if bx * 128 + tx < total:
-                    index = bx * 128 + tx
+        for bx in T.thread_binding((total + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                if bx * thread_count + tx < total:
+                    index = bx * thread_count + tx
                     global_m = index // n
                     global_n = index % n
                     mt = global_m // dma_mt
                     local_m = global_m % dma_mt
                     cur_m = T.min(dma_mt, m - mt * dma_mt)
-                    slot_m = (cur_m + channels - 1) // channels * channels
+                    slot_m = (cur_m + row_alignment - 1) // row_alignment * row_alignment
                     nt = global_n // mxu_nt
                     inner_n = global_n % mxu_nt
                     output[global_m, global_n] = tiled[
                         mt * dma_mt * n_exec
-                        + nt * slot_m * mxu_nt
+                        + T.if_then_else(
+                            packed_c,
+                            (global_n // dma_nt) * slot_m * dma_nt
+                            + (global_n % dma_nt // mxu_nt) * cur_m * mxu_nt,
+                            nt * slot_m * mxu_nt,
+                        )
                         + local_m * mxu_nt
                         + inner_n
                     ]
@@ -1401,6 +1516,7 @@ def _make_gemm_c_detile(plan):
 
 def _make_gemm_tiled_relu(plan):
     """Create an in-layout ReLU that keeps neutral physical padding."""
+    thread_count = _helper_block_size()
 
     total = plan.c_elements
 
@@ -1417,9 +1533,9 @@ def _make_gemm_tiled_relu(plan):
                 "vortex.improve.layout_preserving": 1,
             }
         )
-        for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                index = bx * 128 + tx
+        for bx in T.thread_binding((total + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                index = bx * thread_count + tx
                 if index < total:
                     output[index] = T.max(source[index], T.float16(0))
 
@@ -1428,14 +1544,17 @@ def _make_gemm_tiled_relu(plan):
 
 def _make_gemm_tiled_add(plan, rhs_shape=None):
     """Create a descriptor-preserving tiled add with tiled or row-major RHS."""
+    thread_count = _helper_block_size()
 
     total = plan.c_elements
     m = plan.logical_m
     n = plan.logical_n
     n_exec = plan.execution_n
     dma_mt = plan.profile.dma_mt
+    dma_nt = plan.profile.dma_nt
+    packed_c = plan.profile.layout_abi_version == 3
     mxu_nt = plan.profile.mxu_nt
-    channels = plan.profile.num_dma_channels
+    row_alignment = plan.profile.row_alignment
 
     if rhs_shape is None:
 
@@ -1453,9 +1572,9 @@ def _make_gemm_tiled_add(plan, rhs_shape=None):
                     "vortex.improve.layout_preserving": 1,
                 }
             )
-            for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
-                for tx in T.thread_binding(128, thread="threadIdx.x"):
-                    index = bx * 128 + tx
+            for bx in T.thread_binding((total + thread_count - 1) // thread_count, thread="blockIdx.x"):
+                for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                    index = bx * thread_count + tx
                     if index < total:
                         output[index] = lhs[index] + rhs[index]
 
@@ -1475,26 +1594,31 @@ def _make_gemm_tiled_add(plan, rhs_shape=None):
                 "vortex.improve.layout_preserving": 1,
             }
         )
-        for bx in T.thread_binding((total + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                index = bx * 128 + tx
+        for bx in T.thread_binding((total + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                index = bx * thread_count + tx
                 if index < total:
                     output[index] = T.float16(0)
-        for bx in T.thread_binding((m * n + 127) // 128, thread="blockIdx.x"):
-            for tx in T.thread_binding(128, thread="threadIdx.x"):
-                index = bx * 128 + tx
+        for bx in T.thread_binding((m * n + thread_count - 1) // thread_count, thread="blockIdx.x"):
+            for tx in T.thread_binding(thread_count, thread="threadIdx.x"):
+                index = bx * thread_count + tx
                 if index < m * n:
                     global_m = index // n
                     global_n = index % n
                     mt = global_m // dma_mt
                     local_m = global_m % dma_mt
                     cur_m = T.min(dma_mt, m - mt * dma_mt)
-                    slot_m = (cur_m + channels - 1) // channels * channels
+                    slot_m = (cur_m + row_alignment - 1) // row_alignment * row_alignment
                     nt = global_n // mxu_nt
                     inner_n = global_n % mxu_nt
                     physical_index = (
                         mt * dma_mt * n_exec
-                        + nt * slot_m * mxu_nt
+                        + T.if_then_else(
+                            packed_c,
+                            (global_n // dma_nt) * slot_m * dma_nt
+                            + (global_n % dma_nt // mxu_nt) * cur_m * mxu_nt,
+                            nt * slot_m * mxu_nt,
+                        )
                         + local_m * mxu_nt
                         + inner_n
                     )
@@ -1534,7 +1658,7 @@ def _prim_value(expr):
 
 
 @expr_functor.mutator
-class _W4A16Lowerer(relax.PyExprMutator):
+class _W4A16Lowerer(relax.PyExprMutator, PackedKVLowering):
     """Lower logical W4A16 calls after target selection."""
 
     def __init__(
@@ -1546,6 +1670,8 @@ class _W4A16Lowerer(relax.PyExprMutator):
         lower_batched_w4a16=False,
         lower_auxiliary_ops=True,
         inplace_kv_cache=False,
+        dynamic_kv_length=False,
+        packed_kv_cache=False,
     ):
         super().__init__(mod)
         self.target = target
@@ -1568,6 +1694,7 @@ class _W4A16Lowerer(relax.PyExprMutator):
         self.lowered_causal_softmax = 0
         self.external_prepacked_w4a16 = 0
         self.reused_a_layouts = 0
+        self.reused_c_layouts = 0
         for _, function in mod.functions_items():
             if not isinstance(function, relax.Function) or not isinstance(
                 function.body, relax.SeqExpr
@@ -1578,6 +1705,52 @@ class _W4A16Lowerer(relax.PyExprMutator):
                     if isinstance(binding, relax.VarBinding):
                         self.original_bindings[binding.var] = binding.value
                         self.original_bindings_by_name[str(binding.var)] = binding.value
+
+        self.dynamic_kv_length = dynamic_kv_length
+        self.dynamic_prefixes = {}
+        if dynamic_kv_length:
+            if (
+                self.mode != "improve" or self.improve_profile.layout_abi_version != 3
+                or int(target.attrs.get("vortex_gemm_abi_version", 2)) < 3
+            ):
+                raise ValueError(
+                    "dynamic KV length requires IMPROVE layout ABI 3 and GEMM submission ABI 3"
+                )
+            for value in self.original_bindings.values():
+                if self._packed_symbol(value) != "relax.vortex.causal_softmax":
+                    continue
+                qk = self._layout_source(value.args[1])
+                if self._packed_symbol(qk) != "relax.vortex.mm_w4a16":
+                    raise ValueError("dynamic KV length requires direct W4A16 QK scores")
+                self.dynamic_prefixes[qk] = (value.args[3], "N")
+            for value in self.original_bindings.values():
+                if self._packed_symbol(value) != "relax.vortex.mm_w4a16":
+                    continue
+                lhs = self._layout_source(value.args[1])
+                if isinstance(lhs, relax.TupleGetItem) and lhs.index == 1:
+                    softmax = self._layout_source(lhs.tuple_value)
+                    if self._packed_symbol(softmax) == "relax.vortex.causal_softmax":
+                        self.dynamic_prefixes[value] = (softmax.args[3], "K")
+
+        self.packed_kv_cache = packed_kv_cache
+        if packed_kv_cache:
+            self._init_packed_kv(mod)
+
+    @staticmethod
+    def _packed_symbol(expr):
+        if (isinstance(expr, relax.Call) and isinstance(expr.op, tvm.ir.Op)
+                and expr.op.name == "relax.call_pure_packed"
+                and isinstance(expr.args[0], relax.ExternFunc)):
+            return expr.args[0].global_symbol
+        return None
+
+    def _mask_prefix(self, source, shape, axis, length):
+        key = ("prefix_mask", shape, axis)
+        if key not in self.implementations:
+            self.implementations[key] = self.builder_.add_func(
+                _make_prefix_mask(shape, axis), "vortex_prefix_mask")
+        return self.builder_.emit(relax.call_tir(self.implementations[key],
+            [source, length], out_ty=relax.TensorType(shape, "float16")))
 
     def _lookup_tiled(self, expr):
         if isinstance(expr, relax.Var):
@@ -1693,7 +1866,13 @@ class _W4A16Lowerer(relax.PyExprMutator):
             raise ValueError(
                 "Vortex batched W4A16 packed payload or qparam shape is inconsistent"
             )
-        if self.mode == "naive":
+        native_naive_layout = (
+            n % self.improve_profile.mxu_nt == 0
+            and k % self.improve_profile.mxu_kt == 0
+            and matrix_pack_axis == 1
+            and (not transpose_rhs or 1 in scale_shape[-2:])
+        )
+        if self.mode == "naive" and native_naive_layout:
             # Keep the explicit singleton GQA axis for the row-major ABI.  The
             # rank-5 helper has stable descriptor sequencing on the deployed
             # C3 image, while collapsing KV storage to rank 4 changes the
@@ -1715,11 +1894,11 @@ class _W4A16Lowerer(relax.PyExprMutator):
                     "Vortex batched W4A16 native source shapes are invalid"
                 )
             quant_direction = 0 if matrix_quant_axis == source_k_axis else 1
-            if quant_direction == 1 and not transpose_rhs and n > 32:
-                tile_n = 32
+            if quant_direction == 1 and not transpose_rhs and n > self.improve_profile.mxu_nt:
+                tile_n = self.improve_profile.mxu_nt
                 if n % tile_n:
                     raise ValueError(
-                        "Vortex naive quant-direction-N batching requires N divisible by 32"
+                        f"Vortex naive quant-direction-N batching requires N divisible by MXU_COL={tile_n}"
                     )
                 packed_tile_key = (
                     "naive_n_tile_packed",
@@ -1881,6 +2060,36 @@ class _W4A16Lowerer(relax.PyExprMutator):
             lhs = emit_matrix_slice(
                 call.args[1], lhs_shape, "float16", batch_index, "lhs"
             )
+            if self.packed_kv_cache and original_call in self.packed_kv_gemms:
+                info = self.packed_kv_gemms[original_call]
+                if packed_shape[:2] != info["shapes"][0][:2] or packed_shape[2] != 1:
+                    raise ValueError("packed KV requires canonical batch/head order with a singleton GQA axis")
+                head = batch_index[0] * packed_shape[1] + batch_index[1]
+                plan = plan_improve_layout(m, n, k, group_size, transpose_rhs,
+                    0 if transpose_rhs else 1, self.improve_profile)
+                key_a = ("packed_kv_a", self._plan_key(plan))
+                if key_a not in self.implementations:
+                    self.implementations[key_a] = self.builder_.add_func(
+                        _make_gemm_a_tiled(plan), "vortex_gemm_a_tiled")
+                tiled_a = self.builder_.emit(relax.call_tir(self.implementations[key_a], [lhs],
+                    out_ty=relax.TensorType((plan.a_elements,), "float16")))
+                axis = "N" if transpose_rhs else "K"
+                key_g = ("packed_kv_region", self._plan_key(plan), head, packed_shape[:2])
+                if key_g not in self.implementations:
+                    self.implementations[key_g] = self.builder_.add_func(
+                        _make_w4a16_region(plan, axis, math.prod(packed_shape[:2]), head),
+                        "vortex_mm_packed_kv_region_" + axis.lower())
+                cached = self.packed_kv_results[info["index"]][3:]
+                tiled_c = self.builder_.emit(relax.call_tir(self.implementations[key_g],
+                    [tiled_a, *cached, call.args[11]],
+                    out_ty=relax.TensorType((plan.c_elements,), "float16")))
+                result = self.builder_.emit(self._emit_detile(
+                    tiled_c, plan, relax.TensorType(output_shape[-2:], "float16")))
+                if transpose_rhs:
+                    result = self._mask_prefix(result, output_shape[-2:], 1, call.args[11])
+                outputs.append(result)
+                self.lowered_w4a16 += 1
+                continue
             packed = emit_matrix_slice(
                 call.args[2], packed_shape, "uint8", batch_index, "packed"
             )
@@ -1902,6 +2111,7 @@ class _W4A16Lowerer(relax.PyExprMutator):
                 relax.prim_value(matrix_pack_axis),
                 call.args[9],
                 call.args[10],
+                *call.args[11:],
                 ty_args=relax.TensorType(output_shape[-2:], "float16"),
             )
             lowered = self.visit_call_(matrix_call)
@@ -2025,6 +2235,11 @@ class _W4A16Lowerer(relax.PyExprMutator):
         ):
             fused_tiled_lhs = self._lookup_tiled(call.args[1])
         call = super().visit_call_(call)
+        if original_call in self.dynamic_prefixes:
+            length, axis = self.dynamic_prefixes[original_call]
+            call = self.builder_.normalize(relax.Call(
+                call.op, [*call.args, self.visit_expr(length), relax.StringImm(axis)],
+                call.attrs, call.ty_args, call.span))
         if original_tiled_args:
             return self._lower_tiled_vector(
                 original_call, call, original_symbol, original_tiled_args
@@ -2036,6 +2251,8 @@ class _W4A16Lowerer(relax.PyExprMutator):
         ):
             return call
         symbol = call.args[0].global_symbol
+        if self.packed_kv_cache and original_call in self.packed_kv_updates:
+            return self._emit_packed_kv_update(original_call, call)
         if symbol == "relax.vortex.hadamard":
             source, base = call.args[1:3]
             base_size = int(_prim_value(call.args[3]))
@@ -2096,7 +2313,7 @@ class _W4A16Lowerer(relax.PyExprMutator):
             if key not in self.implementations:
                 self.implementations[key] = self.builder_.add_func(
                     _make_causal_softmax(
-                        scores_shape, position_shape, valid_length_shape, head_dim
+                        scores_shape, position_shape, valid_length_shape, head_dim, self.dynamic_kv_length
                     ),
                     "vortex_causal_softmax",
                 )
@@ -2380,6 +2597,8 @@ class _W4A16Lowerer(relax.PyExprMutator):
         if self.mode not in ("naive", "improve"):
             return call
 
+        prefix_axis = str(_prim_value(call.args[12])) if len(call.args) == 13 else None
+        prefix_length = call.args[11] if prefix_axis else None
         lhs, packed, scale, zero_point = call.args[1:5]
         rhs_shape_expr = call.args[5]
         if not isinstance(rhs_shape_expr, relax.ShapeExpr):
@@ -2477,20 +2696,72 @@ class _W4A16Lowerer(relax.PyExprMutator):
             group_size,
             quant_axis,
             transpose_rhs,
+            prefix_axis,
         )
         self.lowered_w4a16 += 1
         if self.mode == "naive":
-            backend_key = ("naive", key)
+            if pack_axis != 1:
+                raise ValueError("Vortex naive W4A16 requires packed INT4 on source RHS axis 1")
+            m, k = lhs_shape
+            n = output_shape[1]
+            qdir = 0 if quant_axis == source_k_axis else 1
+            profile = self.improve_profile
+            k_alignment = math.lcm(profile.mxu_kt, group_size if qdir == 0 else 1)
+            n_alignment = math.lcm(profile.mxu_nt, group_size if qdir == 1 else 1)
+            execution_k = (k + k_alignment - 1) // k_alignment * k_alignment
+            execution_n = (n + n_alignment - 1) // n_alignment * n_alignment
+            # Naive QDIR addresses qparams in logical GEMM K/N order, even
+            # when the packed weight is stored transposed (N/K order).
+            def pad_operand(expr, shape, physical_shape, dtype, transpose=False):
+                if shape == physical_shape and not transpose:
+                    return expr
+                pad_key = ("naive_pad", shape, physical_shape, dtype, transpose)
+                if pad_key not in self.implementations:
+                    self.implementations[pad_key] = self.builder_.add_func(
+                        _make_pad_fp16_matrix(*shape, *physical_shape, dtype, transpose),
+                        f"vortex_naive_pad_{dtype}",
+                    )
+                return self.builder_.emit(relax.call_tir(
+                    self.implementations[pad_key], [expr],
+                    out_ty=relax.TensorType(physical_shape, dtype),
+                ), name_hint="naive_padded_operand")
+
+            physical_lhs = (m, execution_k)
+            physical_rhs = (execution_n, execution_k) if transpose_rhs else (execution_k, execution_n)
+            physical_packed = (physical_rhs[0], physical_rhs[1] // 2)
+            physical_qparam = (
+                (execution_k // group_size, execution_n) if qdir == 0
+                else (execution_k, execution_n // group_size)
+            )
+            physical_output = (m, execution_n)
+            lhs = pad_operand(lhs, lhs_shape, physical_lhs, "float16")
+            packed = pad_operand(packed, packed_shape, physical_packed, "uint8")
+            scale = pad_operand(scale, scale_shape, physical_qparam, "float16", transpose_rhs)
+            zero_point = pad_operand(zero_point, zero_point_shape, physical_qparam, "int16", transpose_rhs)
+            physical_key = (
+                physical_lhs, physical_packed, physical_qparam, physical_output,
+                physical_rhs, group_size, quant_axis, transpose_rhs,
+            )
+            backend_key = ("naive", physical_key)
             if backend_key not in self.implementations:
                 self.implementations[backend_key] = self.builder_.add_func(
-                    _make_w4a16_naive(*key),
+                    _make_w4a16_naive(*physical_key),
                     "vortex_mm_w4a16_naive",
                 )
-            return relax.call_tir(
+            result = self.builder_.emit(relax.call_tir(
                 self.implementations[backend_key],
                 [lhs, packed, scale, zero_point],
-                out_ty=call.ty,
-            )
+                out_ty=relax.TensorType(physical_output, "float16"),
+            ), name_hint="naive_physical_output")
+            if physical_output != output_shape:
+                slice_key = ("naive_slice", physical_output, output_shape)
+                if slice_key not in self.implementations:
+                    self.implementations[slice_key] = self.builder_.add_func(
+                        _make_slice_fp16_matrix(*physical_output, *output_shape),
+                        "vortex_naive_slice_output",
+                    )
+                return relax.call_tir(self.implementations[slice_key], [result], out_ty=call.ty)
+            return result
 
         m, k = lhs_shape
         n = output_shape[1]
@@ -2518,8 +2789,29 @@ class _W4A16Lowerer(relax.PyExprMutator):
             )
         if parameters_prepacked:
             self.external_prepacked_w4a16 += 1
+        if fused_tiled_lhs is not None:
+            if fused_tiled_lhs[1].compatible_gemm_input(plan.a_descriptor):
+                self.reused_c_layouts += 1
+            else:
+                # Preserve detile/repack for incompatible padding, tile
+                # geometry, execution extents, or layout ABI.
+                fused_tiled_lhs = None
+        if prefix_axis:
+            if (
+                parameters_prepacked or self.mode != "improve" or quant_axis != 1
+                or (prefix_axis == "N") != transpose_rhs
+                or prefix_axis not in ("N", "K")
+                or _static_tensor_shape(prefix_length, "int64") != ()
+            ):
+                raise ValueError("unsupported dynamic GEMM prefix operands")
+            # Each source RHS row is one independent token. Zero its scale
+            # before packing so the aligned final microtile is neutral.
+            scale = self._mask_prefix(scale, scale_shape, 0, prefix_length)
+            if prefix_axis == "K":
+                lhs = self._mask_prefix(lhs, lhs_shape, 1, prefix_length)
+            fused_tiled_lhs = None
         shared_a_key = None
-        if self.enable_layout_fusion and fused_tiled_lhs is None:
+        if self.enable_layout_fusion and fused_tiled_lhs is None and not prefix_axis:
             shared_a_key = (self._layout_source(original_call.args[1]), m, k)
             shared_tiled_a = self.tiled_inputs.get(shared_a_key)
             if shared_tiled_a is not None:
@@ -2554,6 +2846,9 @@ class _W4A16Lowerer(relax.PyExprMutator):
                 "vortex_mm_w4a16_improve",
             ),
         }
+        if prefix_axis:
+            layout_specs["gemm"] = (_make_w4a16_region(plan, prefix_axis),
+                                    "vortex_mm_w4a16_region_" + prefix_axis.lower())
         packed_constant = (
             None if parameters_prepacked else self._constant_data(original_call.args[2])
         )
@@ -2563,6 +2858,8 @@ class _W4A16Lowerer(relax.PyExprMutator):
         zero_constant = (
             None if parameters_prepacked else self._constant_data(original_call.args[4])
         )
+        if prefix_axis:
+            scale_constant = None
         if not parameters_prepacked and packed_constant is None:
             layout_specs["w"] = (
                 _make_gemm_w_tiled(rhs_shape, plan),
@@ -2680,12 +2977,14 @@ class _W4A16Lowerer(relax.PyExprMutator):
         tiled_output = self.builder_.emit(
             relax.call_tir(
                 globals_by_name["gemm"],
-                [tiled_a, tiled_w, tiled_scale, tiled_zero],
+                [tiled_a, tiled_w, tiled_scale, tiled_zero] + ([prefix_length] if prefix_axis else []),
                 out_ty=relax.TensorType((tiled_c_elements,), "float16"),
             ),
             name_hint="gemm_c_tiled",
         )
         detiled_output = self._emit_detile(tiled_output, plan, call.ty)
+        if prefix_axis == "N":
+            return self._mask_prefix(self.builder_.emit(detiled_output), output_shape, 1, prefix_length)
         self.tiled_outputs[original_call] = (
             tiled_output,
             plan.c_descriptor,
@@ -2702,6 +3001,8 @@ def _w4a16_lowering_pass(
     lower_auxiliary_ops=True,
     layout_policy=None,
     inplace_kv_cache=False,
+    dynamic_kv_length=False,
+    packed_kv_cache=False,
 ):
     gemm_mode = str(target.attrs.get("vortex_gemm_mode", "none"))
     if layout_policy is not None:
@@ -2727,11 +3028,21 @@ def _w4a16_lowering_pass(
             lower_batched_w4a16,
             lower_auxiliary_ops,
             inplace_kv_cache,
+            dynamic_kv_length,
+            packed_kv_cache,
         )
         for global_var, func in list(mod.functions_items()):
             if isinstance(func, relax.Function):
+                if packed_kv_cache and global_var.name_hint == lowerer.packed_kv_states[0]["owner"]:
+                    func = relax.Function([*func.params, *lowerer.packed_kv_params], func.body,
+                                          func.ret_ty, func.is_pure, func.attrs)
                 lowerer.builder_.update_func(global_var, lowerer.visit_expr(func))
         lowered = lowerer.builder_.get()
+        if packed_kv_cache:
+            lowered = lowered.with_attr("vortex.packed_kv_cache", lowerer.packed_kv_metadata())
+            lowered = relax.transform.DeadCodeElimination()(lowered)
+        if lowerer.dynamic_prefixes:
+            lowered = lowered.with_attr("vortex.dynamic_kv_length.calls", len(lowerer.dynamic_prefixes))
         if (
             layout_policy is not None
             and gemm_mode != "improve"
@@ -2765,6 +3076,10 @@ def _w4a16_lowering_pass(
         if lowerer.reused_a_layouts:
             lowered = lowered.with_attr(
                 "vortex.improve.reused_a_layouts", lowerer.reused_a_layouts
+            )
+        if lowerer.reused_c_layouts:
+            lowered = lowered.with_attr(
+                "vortex.improve.reused_c_layouts", lowerer.reused_c_layouts
             )
         if lowerer.external_prepacked_w4a16:
             lowered = lowered.with_attr(
@@ -2818,9 +3133,10 @@ def _static_rank2_fp16_shape(expr):
 class _PaddedFP16TCULowerer(relax.PyExprMutator):
     """Lower static FP16 matmul to isolated, padded rank-2 TCU jobs."""
 
-    def __init__(self, mod, require_all=False):
+    def __init__(self, mod, require_all=False, geometry=(32, 16, 16, 32)):
         super().__init__(mod)
         self.require_all = require_all
+        self.geometry = geometry
         self.implementations = {}
         self.lowered_matmuls = 0
         self.physical_jobs = 0
@@ -2855,9 +3171,9 @@ class _PaddedFP16TCULowerer(relax.PyExprMutator):
         )
 
     def _lower_matrix(self, lhs, rhs, m, n, k, role):
-        physical_m = self._round_up(m, 16)
-        physical_n = self._round_up(n, 16)
-        physical_k = self._round_up(k, 32)
+        physical_m = self._round_up(m, self.geometry[1])
+        physical_n = self._round_up(n, self.geometry[2])
+        physical_k = self._round_up(k, self.geometry[3])
         if (physical_m, physical_n, physical_k) != (m, n, k):
             self.padded_matmuls += 1
             lhs_pad_key = ("tcu_pad", m, k, physical_m, physical_k)
@@ -2891,7 +3207,7 @@ class _PaddedFP16TCULowerer(relax.PyExprMutator):
         shape_key = (physical_m, physical_n, physical_k)
         if shape_key not in self.implementations:
             self.implementations[shape_key] = self.builder_.add_func(
-                _make_fp16_tcu_matmul(physical_m, physical_n, physical_k),
+                _make_fp16_tcu_matmul(physical_m, physical_n, physical_k, self.geometry),
                 f"vortex_tcu_fp16_matmul_{physical_m}_{physical_n}_{physical_k}",
             )
         output = self.builder_.emit(
@@ -3003,6 +3319,18 @@ class _PaddedFP16TCULowerer(relax.PyExprMutator):
         return relax.op.reshape(concatenated, output_shape)
 
 
+def tcu_fp16_geometry(target):
+    """Mirror wmma_config_t<NT, fp32, fp32, 4, 8> and FP16 i_ratio."""
+    threads = int(target.attrs.get("thread_warp_size", 32))
+    if threads < 2 or threads & (threads - 1):
+        raise ValueError("Vortex FP16 TCU threads must be a power of two >= 2")
+    capacity = threads * 8
+    log_capacity = capacity.bit_length() - 1
+    tile_n = 1 << (log_capacity // 2)
+    tile_m = 1 << (log_capacity - log_capacity // 2)
+    return threads, tile_m, tile_n, (capacity // max(tile_m, tile_n)) * 2
+
+
 def _tcu_tensorize_pass(target: tvm.target.Target, require_all=False):
     """Rewrite static FP16 matmul to the versioned, padded Vortex TCU ABI."""
 
@@ -3018,7 +3346,7 @@ def _tcu_tensorize_pass(target: tvm.target.Target, require_all=False):
                     "Vortex FP16 TCU policy selected for a target without FP16 TCU"
                 )
             return mod
-        lowerer = _PaddedFP16TCULowerer(mod, require_all=require_all)
+        lowerer = _PaddedFP16TCULowerer(mod, require_all=require_all, geometry=tcu_fp16_geometry(target))
         for global_var, func in list(mod.functions_items()):
             if isinstance(func, relax.Function):
                 lowerer.builder_.update_func(global_var, lowerer.visit_expr(func))
@@ -3057,6 +3385,7 @@ def legalize_passes(
     layout_policy=None,
     inplace_kv_cache=False,
     backend_policy=None,
+    dynamic_kv_length=False,
 ):  # pylint: disable=unused-argument
     """Legalize Relax and schedule kernels for Vortex."""
     from tvm.s_tir import dlight as dl  # pylint: disable=import-outside-toplevel
@@ -3074,6 +3403,7 @@ def legalize_passes(
             # expands can be fused into the native batched submission kernel.
             lower_w4a16=improve_mode,
             lower_batched_w4a16=not improve_mode,
+            dynamic_kv_length=dynamic_kv_length,
             lower_auxiliary_ops=False,
             layout_policy=layout_policy,
             inplace_kv_cache=inplace_kv_cache,
@@ -3130,8 +3460,15 @@ def get_default_pipeline(
     layout_policy=None,
     inplace_kv_cache=False,
     backend_policy=None,
+    dynamic_kv_length=False,
 ):
-    """Return the default Relax compilation pipeline for Vortex."""
+    """Return the default Relax compilation pipeline for Vortex.
+
+    ``dynamic_kv_length`` recognizes W4 QK -> causal_softmax -> W4 PV and
+    submits runtime-aligned N/K prefixes into capacity-sized packed storage.
+    Its scalar valid length must satisfy 1 <= length <= cache capacity. Requires
+    IMPROVE layout ABI 3 and GEMM submission ABI 3 in the image manifest.
+    """
 
     policy = (
         None
@@ -3158,6 +3495,7 @@ def get_default_pipeline(
                     layout_policy=layout_policy,
                     inplace_kv_cache=inplace_kv_cache,
                     backend_policy=policy,
+                    dynamic_kv_length=dynamic_kv_length,
                 )
                 + dataflow_lower_passes(
                     target,

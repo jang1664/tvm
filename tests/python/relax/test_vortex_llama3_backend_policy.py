@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import os
 import sys
 from pathlib import Path
 
@@ -29,7 +30,7 @@ from tvm.relax.backend.vortex.pipeline import (
 )
 from tvm.relax.frontend.torch import from_exported_program
 
-VORTEX_HOME = Path("/home/jaeyongjang/project.local/vortex_base")
+VORTEX_HOME = Path(os.environ.get("TVM_VORTEX_HOME", str(Path(__file__).resolve().parents[4] / "vortex_fpint-feat-gemv")))
 sys.path.insert(0, str(VORTEX_HOME / "pytorch/spinquant"))
 
 from spinquant_inference.llama3_c4_export import (  # noqa: E402
@@ -40,11 +41,11 @@ from spinquant_inference.llama3_c4_export import (  # noqa: E402
 )
 
 
-def _config(query_length, head_dim=32):
+def _config(query_length, head_dim=32, cache_capacity=8):
     return Llama3ExportConfig(
         batch_size=2,
         query_length=query_length,
-        cache_capacity=8,
+        cache_capacity=cache_capacity,
         hidden_size=4 * head_dim,
         intermediate_size=128,
         num_attention_heads=4,
@@ -65,9 +66,9 @@ def _parameters(config, linear_compute):
     }
 
 
-def _import_layer(phase, linear_compute, attention_compute, head_dim=32):
+def _import_layer(phase, linear_compute, attention_compute, head_dim=32, cache_capacity=8):
     query_length = 7 if phase == "prefill" else 1
-    config = _config(query_length, head_dim=head_dim)
+    config = _config(query_length, head_dim=head_dim, cache_capacity=cache_capacity)
     hidden = torch.zeros((2, query_length, config.hidden_size), dtype=torch.float16)
     positions = torch.arange(query_length, dtype=torch.int64).repeat(2, 1)
     parameters = _parameters(config, linear_compute)
@@ -84,8 +85,8 @@ def _import_layer(phase, linear_compute, attention_compute, head_dim=32):
             linear_compute=linear_compute,
             attention_compute=attention_compute,
         )
-        payload = torch.zeros((2, 2, 8, (head_dim + 1) // 2), dtype=torch.uint8)
-        scale = torch.zeros((2, 2, 8, 1), dtype=torch.float16)
+        payload = torch.zeros((2, 2, cache_capacity, (head_dim + 1) // 2), dtype=torch.uint8)
+        scale = torch.zeros((2, 2, cache_capacity, 1), dtype=torch.float16)
         zero = torch.zeros_like(scale, dtype=torch.int16)
         inputs = (
             hidden,
@@ -188,7 +189,7 @@ def test_c2_fixture_routes_by_role_not_by_matrix_shape():
 
 
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
-def test_c3_default_pipeline_keeps_rank5_gqa_abi(phase):
+def test_c3_default_pipeline_pads_rank5_gqa_tails(phase):
     mod = _import_layer(phase, "w4", "w4")
     target = _target(gemm="naive")
 
@@ -199,13 +200,19 @@ def test_c3_default_pipeline_keeps_rank5_gqa_abi(phase):
     assert "R.strided_slice" not in script
     assert "vx_tvm_gemm_w4a16" in script
     assert int(lowered.attrs.get("vortex.w4a16.fused_kv_expands", 0)) == 0
-    assert script.count("def vortex_mm_w4a16_naive_batched") == 2
+    assert "def vortex_mm_w4a16_naive_batched" not in script
+    assert "def vortex_naive_pad_float16" in script
+    assert "def vortex_naive_slice_output" in script
     assert "def vortex_gqa_context_reshape" not in script
 
 
-def test_c3_production_head_dim_tiles_quant_direction_n_to_32_columns():
-    mod = _import_layer("decode", "w4", "w4", head_dim=128)
-    target = _target(gemm="naive")
+@pytest.mark.parametrize("width", [16, 32])
+def test_c3_production_head_dim_tiles_quant_direction_n_to_mxu_columns(width):
+    mod = _import_layer("decode", "w4", "w4", head_dim=128, cache_capacity=128)
+    target = tvm.target.Target({
+        "kind": "vortex", "vortex_gemm_mode": "naive", "thread_warp_size": width,
+        "vortex_mxu_row": width, "vortex_mxu_col": width,
+    })
 
     lowered = get_default_pipeline(target, backend_policy=C3_ALL_W4_NAIVE)(mod)
     script = lowered.script()

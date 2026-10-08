@@ -68,6 +68,10 @@ class ImproveProfile:
     mxu_kt: int = 32
     mxu_nt: int = 32
     num_dma_channels: int = 8
+    num_tmem_banks: int = 8
+    # Layout ABIs v2/v3 use the FSM's align8_u32 DRAM slot reservation,
+    # independently of DMA channel count and physical TMEM bank count.
+    row_alignment: int = 8
     tmem_bank_size: int = 64 << 10
     accumulator_depth: int = 1024
     qparam_slot_alignment: int = 512
@@ -80,7 +84,7 @@ class ImproveProfile:
     dram_capacity_bytes: int = _U64_MAX
     gemm_abi_version: int = 2
     layout_abi_version: int = 2
-    supported_qblocks: tuple = (32, 64, 128)
+    supported_qblocks: tuple = (16, 32, 64, 128)
 
     @staticmethod
     def from_target(target):
@@ -91,6 +95,7 @@ class ImproveProfile:
             mxu_kt=_target_int(target, "vortex_mxu_row", 32),
             mxu_nt=_target_int(target, "vortex_mxu_col", 32),
             num_dma_channels=_target_int(target, "vortex_num_dma_channels", 8),
+            num_tmem_banks=_target_int(target, "vortex_num_tmem_banks", 8),
             tmem_bank_size=_target_int(target, "vortex_tmem_bank_size", 64 << 10),
             accumulator_depth=_target_int(target, "vortex_gemm_acc_mem_depth", 1024),
             qparam_slot_alignment=_target_int(
@@ -110,6 +115,10 @@ class ImproveProfile:
         )
 
     def validate(self):
+        if self.layout_abi_version not in (2, 3):
+            raise ValueError("Vortex Improve layout ABI must be 2 or 3")
+        if self.row_alignment != 8:
+            raise ValueError("Vortex layout ABI v2/v3 requires an 8-row DRAM stripe")
         power_of_two = {
             "DMA_MT": self.dma_mt,
             "DMA_NT": self.dma_nt,
@@ -117,18 +126,22 @@ class ImproveProfile:
             "MXU_KT": self.mxu_kt,
             "MXU_NT": self.mxu_nt,
             "NUM_DMA_CHANNELS": self.num_dma_channels,
+            "row_alignment": self.row_alignment,
             "qparam slot": self.qparam_slot_alignment,
             "TMEM": self.tmem_alignment,
         }
         for name, value in power_of_two.items():
             if value <= 0 or value & (value - 1):
                 raise ValueError(f"Vortex GEMM profile {name} must be a positive power of two")
+        if self.mxu_kt != self.mxu_nt or self.mxu_kt < 2:
+            raise ValueError("Vortex MXU must be square with A >= 2 for packed INT4")
         if self.dma_kt % self.mxu_kt:
             raise ValueError("Vortex GEMM profile DMA_KT must be divisible by MXU_KT")
         if self.dma_nt % self.mxu_nt:
             raise ValueError("Vortex GEMM profile DMA_NT must be divisible by MXU_NT")
         for name in (
             "tmem_bank_size",
+            "num_tmem_banks",
             "accumulator_depth",
             "dimension_bits",
             "address_bits",
@@ -183,15 +196,21 @@ class ImproveLayoutDescriptor:
     row_alignment: int
     layout_abi_version: int
     padding: str
+    # A and ABI v3 C pad each DMA tile's end; ABI v2 C pads every microtile.
+    row_padding: str = "micro_tile"
 
     def compatible_gemm_input(self, consumer):
         return (
             self.dtype == consumer.dtype == "float16"
             and self.logical_shape == consumer.logical_shape
             and self.execution_shape == consumer.execution_shape
-            and self.dma_tiles[0] == consumer.dma_tiles[0]
+            and self.dma_tiles == consumer.dma_tiles
             and self.micro_tiles[1] == consumer.micro_tiles[1]
             and self.row_alignment == consumer.row_alignment
+            and (
+                self.row_padding == consumer.row_padding
+                or self.logical_shape[0] % self.row_alignment == 0
+            )
             and self.layout_abi_version == consumer.layout_abi_version
             and self.padding == "neutral"
         )
@@ -228,9 +247,10 @@ class ImproveLayoutPlan:
             (self.logical_m, self.execution_k),
             (self.profile.dma_mt, self.profile.dma_kt),
             (self.profile.mxu_nt, self.profile.mxu_kt),
-            self.profile.num_dma_channels,
+            self.profile.row_alignment,
             self.profile.layout_abi_version,
             "neutral",
+            row_padding="dma_tile",
         )
 
     @property
@@ -241,9 +261,10 @@ class ImproveLayoutPlan:
             (self.logical_m, self.execution_n),
             (self.profile.dma_mt, self.profile.dma_nt),
             (self.profile.mxu_kt, self.profile.mxu_nt),
-            self.profile.num_dma_channels,
+            self.profile.row_alignment,
             self.profile.layout_abi_version,
             "neutral",
+            row_padding="dma_tile" if self.profile.layout_abi_version == 3 else "micro_tile",
         )
 
 
@@ -270,6 +291,11 @@ def plan_improve_layout(
         )
     if quant_direction not in (0, 1):
         raise ValueError(f"Vortex GEMM quant_direction must be 0 or 1, got {quant_direction}")
+
+    if qblock < (profile.mxu_kt if quant_direction == 0 else profile.mxu_nt):
+        raise ValueError("Vortex QBLK must cover a complete quantization-axis MXU microtile")
+    if (profile.dma_kt if quant_direction == 0 else profile.dma_nt) % qblock:
+        raise ValueError("Vortex QBLK must divide the quantization-axis DMA tile")
 
     n_alignment = _lcm(profile.mxu_nt, qblock if quant_direction == 1 else 1)
     k_alignment = _lcm(profile.mxu_kt, qblock if quant_direction == 0 else 1)
@@ -309,7 +335,7 @@ def plan_improve_layout(
 
     tiles = []
     for mt, cur_m in enumerate(m_tiles):
-        slot_m = _checked_align("M tile slot", cur_m, profile.num_dma_channels)
+        slot_m = _checked_align("M tile slot", cur_m, profile.row_alignment)
         for kt, cur_k in enumerate(k_tiles):
             for nt, cur_n in enumerate(n_tiles):
                 tiles.append(
@@ -319,7 +345,7 @@ def plan_improve_layout(
     a_elements = 0
     c_elements = 0
     for cur_m in m_tiles:
-        slot_m = _checked_align("M tile slot", cur_m, profile.num_dma_channels)
+        slot_m = _checked_align("M tile slot", cur_m, profile.row_alignment)
         a_elements = _checked_add(
             "A elements", a_elements, _checked_mul("A tile", slot_m, execution_k)
         )
@@ -368,7 +394,7 @@ def plan_improve_layout(
             scratch = _checked_align(f"TMEM {name}{index}", scratch, profile.tmem_alignment)
             scratch = _checked_add(f"TMEM {name}{index}", scratch, size)
     tmem_capacity = _checked_mul(
-        "TMEM capacity", profile.tmem_bank_size, profile.num_dma_channels
+        "TMEM capacity", profile.tmem_bank_size, profile.num_tmem_banks
     )
     if scratch > tmem_capacity:
         raise ValueError(

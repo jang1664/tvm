@@ -61,8 +61,8 @@ ffi::Map<ffi::String, ffi::Any> CanonicalizeVortexTarget(ffi::Map<ffi::String, f
       << "Vortex max_local_memory_per_thread must be positive";
   TVM_FFI_CHECK(xlen == 32 || xlen == 64, ValueError)
       << "Vortex xlen must be either 32 or 64, but got " << xlen;
-  TVM_FFI_CHECK_EQ(profile_version, 1, ValueError)
-      << "Vortex vortex_accelerator_profile_version must be 1";
+  TVM_FFI_CHECK_EQ(profile_version, 2, ValueError)
+      << "Vortex vortex_accelerator_profile_version must be 2 (recompile older packages)";
   TVM_FFI_CHECK(tcu_mode == "none" || tcu_mode == "fp" || tcu_mode == "int" || tcu_mode == "fp_int",
                 ValueError)
       << "Vortex vortex_tcu_mode must be none, fp, int, or fp_int, but got " << tcu_mode;
@@ -121,6 +121,7 @@ ffi::Map<ffi::String, ffi::Any> CanonicalizeVortexTarget(ffi::Map<ffi::String, f
   int64_t mxu_col = require_positive("vortex_mxu_col");
   int64_t mxu_col_tile = require_positive("vortex_mxu_col_tile");
   require_positive("vortex_tmem_bank_size");
+  require_positive("vortex_num_tmem_banks");
   require_positive("vortex_num_dma_channels");
   require_positive("vortex_gemm_acc_mem_depth");
   int64_t dma_mt = require_positive("vortex_gemm_dma_mt");
@@ -134,10 +135,9 @@ ffi::Map<ffi::String, ffi::Any> CanonicalizeVortexTarget(ffi::Map<ffi::String, f
   int64_t job_entries = require_positive("vortex_gemm_job_entries");
   int64_t num_cores = require_positive("vortex_num_cores");
   require_positive("vortex_gemm_abi_version");
-  require_positive("vortex_layout_abi_version");
-  TVM_FFI_CHECK_EQ(mxu_col % mxu_col_tile, 0, ValueError)
-      << "Vortex vortex_mxu_col must be divisible by vortex_mxu_col_tile";
-  TVM_FFI_CHECK_GT(mxu_row, 0, ValueError);
+  int64_t layout_abi = require_positive("vortex_layout_abi_version");
+  TVM_FFI_CHECK(layout_abi == 2 || layout_abi == 3, ValueError)
+      << "vortex_layout_abi_version must be 2 or 3";
   auto is_power_of_two = [](int64_t value) { return (value & (value - 1)) == 0; };
   for (const auto& [name, value] :
        std::initializer_list<std::pair<const char*, int64_t>>{{"vortex_gemm_dma_mt", dma_mt},
@@ -148,10 +148,19 @@ ffi::Map<ffi::String, ffi::Any> CanonicalizeVortexTarget(ffi::Map<ffi::String, f
     TVM_FFI_CHECK(is_power_of_two(value), ValueError)
         << "Vortex " << name << " must be a power of two";
   }
-  TVM_FFI_CHECK_EQ(dma_kt % mxu_row, 0, ValueError)
-      << "Vortex vortex_gemm_dma_kt must be divisible by vortex_mxu_row";
-  TVM_FFI_CHECK_EQ(dma_nt % mxu_col, 0, ValueError)
-      << "Vortex vortex_gemm_dma_nt must be divisible by vortex_mxu_col";
+  if (gemm_mode != "none") {
+    TVM_FFI_CHECK_EQ(mxu_row, mxu_col, ValueError) << "Vortex MXU must be square";
+    TVM_FFI_CHECK(is_power_of_two(mxu_row) && mxu_row >= 2, ValueError)
+        << "Vortex MXU A must be a power of two >= 2 for packed INT4";
+    TVM_FFI_CHECK_EQ(thread_warp_size, mxu_row, ValueError)
+        << "Vortex NUM_THREADS must equal MXU A";
+    TVM_FFI_CHECK_EQ(mxu_col % mxu_col_tile, 0, ValueError)
+        << "Vortex vortex_mxu_col must be divisible by vortex_mxu_col_tile";
+    TVM_FFI_CHECK_EQ(dma_kt % mxu_row, 0, ValueError)
+        << "Vortex vortex_gemm_dma_kt must be divisible by vortex_mxu_row";
+    TVM_FFI_CHECK_EQ(dma_nt % mxu_col, 0, ValueError)
+        << "Vortex vortex_gemm_dma_nt must be divisible by vortex_mxu_col";
+  }
   TVM_FFI_CHECK_LE(num_cores, job_entries, ValueError)
       << "Vortex vortex_num_cores cannot exceed vortex_gemm_job_entries";
 
@@ -223,7 +232,7 @@ void RegisterTargetKind() {
       .add_attr_option<ffi::String>("vortex_mabi")
       .add_attr_option<ffi::String>("mcpu")
       .add_attr_option<ffi::Array<ffi::String>>("mattr")
-      .add_attr_option<int64_t>("vortex_accelerator_profile_version", refl::DefaultValue(1))
+      .add_attr_option<int64_t>("vortex_accelerator_profile_version", refl::DefaultValue(2))
       .add_attr_option<ffi::String>("vortex_accelerator_profile_fingerprint",
                                     refl::DefaultValue(ffi::String("")))
       .add_attr_option<ffi::String>("vortex_accelerator_profile_configs",
@@ -235,6 +244,8 @@ void RegisterTargetKind() {
       .add_attr_option<int64_t>("vortex_mxu_col", refl::DefaultValue(32))
       .add_attr_option<int64_t>("vortex_mxu_col_tile", refl::DefaultValue(1))
       .add_attr_option<int64_t>("vortex_tmem_bank_size", refl::DefaultValue(int64_t{64} << 10))
+      .add_attr_option<int64_t>("vortex_num_tmem_banks", refl::DefaultValue(8))
+      .add_attr_option<int64_t>("vortex_gemm_naive_use_acc_mem", refl::DefaultValue(0))
       .add_attr_option<int64_t>("vortex_num_dma_channels", refl::DefaultValue(8))
       .add_attr_option<int64_t>("vortex_gemm_acc_mem_depth", refl::DefaultValue(1024))
       .add_attr_option<ffi::String>("vortex_platform", refl::DefaultValue(ffi::String("generic")))

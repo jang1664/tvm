@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Sequence
 
@@ -70,6 +71,9 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--mini-regression" in argv or "--layer-regression" in argv:
+        return _mini_regression(argv)
     args = make_parser().parse_args(argv)
     if args.repetitions <= 0:
         raise ValueError("repetitions must be positive")
@@ -249,6 +253,120 @@ def record_hash(value: np.ndarray) -> str:
         .sha256(memoryview(np.ascontiguousarray(value)))
         .hexdigest()
     )
+
+
+def _mini_regression(argv):
+    """Check packaged embedding/prefill/decode/head boundaries against CPU references."""
+    from dataclasses import replace
+    import torch
+    from torch.utils._pytree import tree_flatten
+    from tvm.relax.backend.vortex import get_vortex_backend_policy, C4_ALL_W4_IMPROVE, C3_ALL_W4_NAIVE
+    from vortex_llama3.compile_backend_matrix import _build_inputs, _import_dependencies, _model_config
+
+    parser = argparse.ArgumentParser(description="Llama graph boundary HW functionality")
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--mini-regression", action="store_true")
+    scope.add_argument("--layer-regression", action="store_true",
+                       help="Check one prefill/decode layer, including full Llama dimensions")
+    parser.add_argument("--package", type=Path, required=True)
+    parser.add_argument("--vortex-home", type=Path, required=True)
+    parser.add_argument("--alias-map", type=Path)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--exec-mode", choices=("bytecode", "compiled"), default="bytecode")
+    args = parser.parse_args(argv)
+    alias_map = args.alias_map or args.vortex_home / "ci/fpga_bin_alias_map.yaml"
+    loaded = load_backend_package(args.package, alias_map, args.vortex_home)
+    if args.mini_regression and loaded.package["model"]["model"] != "llama3-mini":
+        raise ValueError("--mini-regression requires a --model-size mini package")
+    dependencies = _import_dependencies(args.vortex_home)
+    shape = loaded.package["shape"]
+    config = _model_config(dependencies, shape["batch_size"], shape["prompt_length"],
+                           shape["cache_capacity"], loaded.package["model"])
+    policy = get_vortex_backend_policy(loaded.package["backend_policy"])
+    reference_policy = replace(policy, name=C3_ALL_W4_NAIVE) if policy.name == C4_ALL_W4_IMPROVE else policy
+    reference_archive = loaded.logical if policy.name == C4_ALL_W4_IMPROVE else loaded.materialized
+    reference_builds, _, _, _ = _build_inputs(dependencies, reference_policy, config, reference_archive)
+    _, layer_order, head_order, embedding_order = _build_inputs(dependencies, policy, config, loaded.materialized)
+    _configure_xrt_environment(loaded.package)
+    event_prefix = "layer" if args.layer_regression else "mini"
+    print(json.dumps({"event": f"{event_prefix}_device_open", "alias": loaded.package["alias"]}), flush=True)
+    device = tvm.vortex(0)
+    parameter_order = layer_order if args.layer_regression else [*layer_order, *head_order, *embedding_order]
+    resident = loaded.materialized.upload(device, parameter_order)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    actual_cache, expected_cache = None, None
+    boundaries = ("prefill_layer", "decode_layer") if args.layer_regression else (
+        "embedding_prefill", "embedding_decode", "prefill_layer", "decode_layer",
+        "final_head_prefill", "final_head_decode",
+    )
+    for boundary in boundaries:
+        print(json.dumps({"event": f"{event_prefix}_boundary_start", "boundary": boundary}), flush=True)
+        record = loaded.package["artifacts"].get(f"{args.exec_mode}:{boundary}")
+        if record is None:
+            raise ValueError(f"package lacks {args.exec_mode}:{boundary}")
+        model, reference_inputs = reference_builds[boundary]
+        reference_inputs = list(reference_inputs)
+        rng = np.random.default_rng(20261006)
+        if boundary.startswith("embedding"):
+            reference_inputs[0] = torch.from_numpy(rng.integers(
+                0, config.vocabulary_size, tuple(reference_inputs[0].shape), dtype="int64"
+            ))
+            order = embedding_order
+        else:
+            reference_inputs[0] = torch.from_numpy(rng.uniform(
+                -0.1, 0.1, tuple(reference_inputs[0].shape)
+            ).astype("float16"))
+            order = layer_order if boundary.endswith("layer") else head_order
+        if boundary == "decode_layer":
+            reference_inputs[1] = torch.full_like(reference_inputs[1], config.query_length)
+            reference_inputs[3:] = expected_cache
+        with torch.inference_mode():
+            reference_outputs = model(*reference_inputs)
+        reference_outputs, _ = tree_flatten(reference_outputs)
+        inputs = []
+        for value in reference_inputs:
+            if isinstance(value, dict):
+                inputs.extend(resident[name] for name in order)
+            else:
+                inputs.append(tvm.runtime.tensor(value.detach().numpy(), device=device))
+        if boundary == "decode_layer":
+            inputs[-7:] = actual_cache
+        module = tvm.runtime.load_module(str(args.package.parent / record["file"]))
+        vm = relax.VirtualMachine(module, device=device, memory_cfg="naive")
+        actual_outputs = vm["main"](*inputs)
+        if hasattr(actual_outputs, "numpy"):
+            actual_outputs = [actual_outputs]
+        else:
+            actual_outputs = list(actual_outputs)
+        if len(actual_outputs) != len(reference_outputs):
+            raise AssertionError(f"output arity mismatch for {boundary}")
+        output_records, arrays = [], {}
+        for index, (actual_value, expected_value) in enumerate(zip(actual_outputs, reference_outputs)):
+            actual, expected = actual_value.numpy(), expected_value.detach().numpy()
+            arrays[f"actual_{index}"], arrays[f"expected_{index}"] = actual, expected
+            if actual.dtype.kind in "iu":
+                mismatches = int(np.count_nonzero(actual != expected))
+                metrics = {"mismatches": mismatches, "elements": actual.size, "pass": int(mismatches == 0)}
+            else:
+                metrics = hybrid_metrics(actual, expected, LOCAL_THRESHOLDS, name=f"{boundary}:{index}", enforce=False)
+            output_records.append(metrics)
+        if boundary == "prefill_layer":
+            actual_cache = list(actual_outputs[1:])
+            expected_cache = list(reference_outputs[1:])
+        status = "PASS" if all(value["pass"] for value in output_records) else "FAIL"
+        records.append({"boundary": boundary, "status": status, "outputs": output_records,
+                        "package_sha256": record_hash(np.frombuffer(args.package.read_bytes(), dtype="uint8")),
+                        "profile": loaded.package["profile"],
+                        "revisions": loaded.package["revisions"],
+                        "exec_mode": args.exec_mode, "shape": shape,
+                        "model": loaded.package["model"],
+                        "executed_layers": int(boundary.endswith("layer"))})
+        np.savez(args.output_dir / f"{boundary}.npz", **arrays)
+        (args.output_dir / "results.json").write_text(json.dumps(records, indent=2) + "\n")
+        print(json.dumps({"event": f"{event_prefix}_boundary_done", "boundary": boundary, "status": status}), flush=True)
+        del vm, module
+    return 1 if any(value["status"] == "FAIL" for value in records) else 0
 
 
 if __name__ == "__main__":

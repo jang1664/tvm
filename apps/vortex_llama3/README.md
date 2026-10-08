@@ -6,6 +6,149 @@ head modules plus one reusable prefill layer and one reusable decode layer. Each
 invoked 32 times with a distinct resident archive slice; this avoids embedding the 5.7 GB parameter
 set in compiler IR.
 
+## Config-driven TH16 C1–C4 functionality checks
+
+The current candidate fixture is [candidates_th16_axi_fix.json](candidates_th16_axi_fix.json).
+It maps C1–C4 to the exact U55C images in
+`vortex_fpint-feat-gemv/ci/fpga_bin_alias_map.yaml`. Capability resolution uses each image's
+manifest rather than its alias spelling. C2 uses naive W4A16 MXU for all linear projections
+and FP16 TCU for QKᵀ and PV, in both prefill and decode.
+
+C4 now exclusively selects `improve_th16_tcol16_m16_t8_bigmem_all_bram_spread_v4_fix_pad`
+(packed output, layout ABI 3). Recompile packages for this image; packages built
+for the previous C4 image are historical artifacts. The new image passed 10
+unfused GEMM cases and four fused chains with bitwise agreement against their
+unfused baselines. The same image also passed all 36 mini-Llama boundary checks:
+alone/fused S1/S2 bytecode and S1 compiled VM, with bitwise-identical alone/fused
+outputs and S1 bytecode/compiled outputs. These check embedding, one decoder
+layer, and the head separately, carrying the actual prefill cache into decode;
+they do not establish 32-layer end-to-end inference coverage. See
+[the new C4 validation record](../../docs/vortex_packed_c_hardware_validation.md).
+
+These commands use the existing configured builds and the installed LP64F profile. They
+do not use the historical `vortex_base` image shown in the later sections of this README.
+
+```bash
+export TVM_HOME=/home/jaeyongjang/project.local/tvm
+export TVM_VORTEX_HOME=/home/jaeyongjang/project.local/vortex_fpint-feat-gemv
+export TVM_VORTEX_PROFILE_ROOT=/opt/vortex_profiles/rv64imaf_zfh_lp64f
+export PYTHONPATH="$TVM_HOME/python:$TVM_HOME/.local/python310-runtime:$TVM_HOME/apps"
+export TVM_LIBRARY_PATH="$TVM_HOME/build/lib"
+export LD_LIBRARY_PATH="$TVM_HOME/build/lib:$TVM_VORTEX_HOME/build/runtime:/opt/xilinx/xrt/lib:${LD_LIBRARY_PATH:-}"
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+export TVM_PYTHON=/home/jaeyongjang/.conda/envs/vortex/bin/python
+cd "$TVM_HOME"
+```
+
+TVM's CMake `USE_VORTEX` must point to
+`$TVM_VORTEX_HOME/build/runtime/libvortex.so`. Rebuild after compiler/runtime changes:
+
+```bash
+cmake -S . -B build -DUSE_VORTEX="$TVM_VORTEX_HOME/build/runtime/libvortex.so"
+cmake --build build --parallel 4
+```
+
+Check source config versus image manifest, then compile a short device-code smoke test:
+
+```bash
+"$TVM_PYTHON" apps/vortex_llama3/compile_backend_matrix.py \
+  --candidate-map apps/vortex_llama3/candidates_th16_axi_fix.json \
+  --aliases C1,C2,C3,C4 --check-aliases-only
+"$TVM_PYTHON" apps/vortex_llama3/run_backend_gemm_probe.py \
+  --matrix-regression --candidate-map apps/vortex_llama3/candidates_th16_axi_fix.json \
+  --aliases C1,C2,C3,C4 --cases linear_0 --compile-only \
+  --output-dir build/config_gemm_th16/compile_smoke
+```
+
+Hardware matrix runs accept one candidate per process. Run candidates sequentially on an
+allocated FPGA. For example, this C2 allocation rebuilds the Vortex kernel library using
+the matching source config, selects the allocated device, and tests linear plus attention:
+
+```bash
+srun --gres=fpga:u55c:1 --cpus-per-task=4 --mem=16G --time=00:30:00 bash -s <<'BASH'
+set -euo pipefail
+source "$TVM_VORTEX_HOME/configs/naive_th16_tcol16_m16_L16_bigmem_all_bram_acc_tcu_base_pnr_v3.sh"
+make -C "$TVM_VORTEX_HOME/build/kernel" CONFIGS="$CONFIGS"
+source "$TVM_VORTEX_HOME/ci/xrt_device_detect.sh"
+xrt_smi_bin="$(resolve_xrt_smi)"
+export XRT_DEVICE_INDEX="$(detect_single_accessible_xrt_index "$xrt_smi_bin")"
+export XRT_DEVICE_BDF="$(resolve_xrt_user_bdf "$XRT_DEVICE_INDEX")"
+export XRT_INI_PATH=/dev/null VORTEX_DRIVER=xrt TARGET=hw
+unset FPGA_BIN_DIR XRT_XCLBIN_PATH
+cd "$TVM_HOME"
+"$TVM_PYTHON" apps/vortex_llama3/run_backend_gemm_probe.py \
+  --matrix-regression --candidate-map apps/vortex_llama3/candidates_th16_axi_fix.json \
+  --aliases C2 --output-dir build/config_gemm_th16/hw_C2
+BASH
+```
+
+For C1/C3/C4, change both the sourced config and `--aliases` to the corresponding fixture
+entry. `--cases` selects a focused rerun; use a separate output directory to preserve earlier
+results. Each run writes `results.json`, exported modules, and actual/reference NPZ arrays.
+The GEMM rounding envelope is fixed before execution at `0.003 + 0.003 * abs(reference)`;
+nonfinite output fails. C4 additionally has `descriptor_chain`, which checks a branched and
+chained GEMM graph. Run it with `--layout-policy alone` and then `fused`; the fused run
+requires a recorded shared-A layout reuse. `descriptor_chain` uses M8 and directly reuses
+GEMM-C as GEMM-A; `descriptor_chain_tail` uses M4 and checks direct C-to-A reuse
+on the current layout ABI 3 image. In the matching C4 hardware environment, run:
+
+```bash
+"$TVM_PYTHON" apps/vortex_llama3/run_backend_gemm_probe.py \
+  --matrix-regression --candidate-map apps/vortex_llama3/candidates_th16_axi_fix.json \
+  --aliases C4 --cases descriptor_chain,descriptor_chain_tail --layout-policy alone \
+  --output-dir build/config_gemm_th16/descriptor_alone
+"$TVM_PYTHON" apps/vortex_llama3/run_backend_gemm_probe.py \
+  --matrix-regression --candidate-map apps/vortex_llama3/candidates_th16_axi_fix.json \
+  --aliases C4 --cases descriptor_chain,descriptor_chain_tail --layout-policy fused \
+  --baseline-output-dir build/config_gemm_th16/descriptor_alone \
+  --output-dir build/config_gemm_th16/descriptor_fused
+```
+
+The chain checks each GEMM with the standalone QCOL FP32 dequantization contract and
+keeps the Torch FP16-weight and end-to-end reference errors separately. The rounding
+envelope remains unchanged. The fused run also requires bitwise equality to the earlier
+alone-layout run.
+
+Compile small Llama embedding/layer/head packages before allocating the FPGA:
+
+```bash
+"$TVM_PYTHON" apps/vortex_llama3/compile_backend_matrix.py \
+  --candidate-map apps/vortex_llama3/candidates_th16_axi_fix.json \
+  --aliases C1,C2,C3,C4 --cases S1,S2 --model-size mini \
+  --artifact-root build/config_gemm_th16/mini_matrix
+"$TVM_PYTHON" apps/vortex_llama3/compile_backend_matrix.py \
+  --candidate-map apps/vortex_llama3/candidates_th16_axi_fix.json \
+  --aliases C4 --cases S1,S2 --model-size mini --c4-layout-policy fused \
+  --artifact-root build/config_gemm_th16/mini_fused
+```
+
+Inside the same hardware environment as above, run the checked package loader and all six
+boundaries, including decode using the preceding prefill cache:
+
+```bash
+"$TVM_PYTHON" apps/vortex_llama3/run_backend_probe.py --mini-regression \
+  --package build/config_gemm_th16/mini_matrix/packages/C2/S1/package.json \
+  --vortex-home "$TVM_VORTEX_HOME" --exec-mode bytecode \
+  --output-dir build/config_gemm_th16/mini_hw_C2
+```
+
+S1 is batch 1, prompt length 1, cache capacity 8; S2 is batch 1, prompt length 7, capacity 16.
+Both use hidden/intermediate/vocabulary size 256, head dimension 128, two query heads and
+one KV head. S1 also exports compiled-VM modules: repeat with `--exec-mode compiled` and
+a different output directory. For C4 fused, select the package in `mini_fused`.
+
+Synthetic `--width 8`, `32`, or `64` is restricted to `--compile-only`; it does not establish
+hardware functionality without a matching bitstream. Host packing tests cover width 16 too.
+There is no 16/32 whitelist. Packed INT4 requires A≥2, square power-of-two A and threads=A
+for MXU paths; DMA/SRAM/accumulator constraints can reject larger A.
+
+Use a fresh artifact root after changing image/config, profile ABI, layout/packing, model
+geometry, quantization, or device helper contracts. Profile version 1 and mismatched image
+packages are rejected. `--force` recompiles graph modules when archive contracts remain
+unchanged; it is not a packing migration. The package loader verifies image/profile,
+archive and module hashes. See the [validation report](../../docs/vortex_config_driven_gemm_validation.md)
+for measured coverage and the standalone TCU tolerance caveat.
+
 ## Environment
 
 Use the configured TVM build and source the configuration matching the pinned U55C image:
@@ -242,3 +385,64 @@ reprograms a failed device.
 
 The generated tokens are deterministic interface evidence only. They have no language meaning
 until a real checkpoint is converted and loaded.
+
+
+### Full-size single-layer check on the current C4
+
+The `v4_fix_pad` C4 image also passes the actual Llama3-8B hidden/FFN/head sizes
+with one decoder layer: prefill lengths 1 and 7, batch 1, followed by one-token
+decode using the prefill cache. All 12 checks pass across alone/fused and S1
+bytecode/compiled execution, with bitwise-equal alone/fused outputs. Parameters
+are synthetic; this is not a pretrained 32-layer accuracy test.
+
+Use `run_backend_probe.py --layer-regression --package <package.json>
+--vortex-home <vortex-root> --exec-mode bytecode --output-dir <results>` with a
+full-size compile package under a configured FPGA allocation. The existing
+`--mini-regression` behavior is retained. See
+[`vortex_packed_c_hardware_validation.md`](../../docs/vortex_packed_c_hardware_validation.md)
+for dimensions, metrics, and the exact allocation/compilation commands.
+
+
+### Full random-weight Llama3-8B on current C4 (2026-10-07)
+
+The current `v4_fix_pad` C4 also passes the complete 32-layer chain with distinct
+random weights: batch 1, one-token prefill followed by three stateful decode
+phases, fused layout, bytecode VM. All 128 layer invocations and all four final
+logits/cache checks pass, with CPU top-1 agreement in every phase. Maximum
+logits relative-L2 error is 0.02714%. Unlike the historical result above, this
+run enforces the canonical reference through decode 3 with no phase exemption,
+retries, or reference-input replacement. These are random-weight functionality
+results, not language-quality results. Exact commands and evidence are in
+[`vortex_packed_c_hardware_validation.md`](../../docs/vortex_packed_c_hardware_validation.md),
+under the full 32-layer section.
+
+### Dynamic KV valid length on the updated C4 FSM
+
+`run_synthetic_inference.py --mode package --dynamic-kv-length ...` enables
+runtime QK/PV prefix submissions. Use the
+`improve_th16_tcol16_m16_t8_bigmem_all_bram_spread_v4_nodsp_fsm_update`
+image, whose authoritative manifest declares `vortex_layout_abi_version: 3`
+and `vortex_gemm_abi_version: 3`. An older FSM image is rejected.
+
+The compiled decode executable accepts changing scalar valid lengths without
+recompilation. Physical KV capacity and packed DMA strides stay fixed. QK uses
+`target_n = ceil(valid_length / MXU_COL) * MXU_COL`; PV uses the corresponding
+`target_k` with `MXU_ROW`. Tail scales and PV activations are neutralized before
+packing, and softmax only reduces over the causal valid prefix. The valid length
+must be between 1 and capacity. Batch, query count, head geometry, and capacity
+remain compile-time shapes; changing those still requires another package.
+
+This option currently repacks capacity-sized canonical K/V buffers and adds
+masking kernels. It reduces GEMM work but does not promise lower end-to-end
+latency. The ordinary static-capacity path remains the default. Runtime execution
+uses the setting recorded in `package.json`; `--dynamic-kv-length` is a packaging
+option and does not change a previously built package.
+
+`run_dynamic_kv_probe.py` compares static and dynamic attention on the FPGA using
+one executable per mode across many valid lengths. It poisons unused K/V scales
+with NaN/Inf, checks bitwise agreement with static execution, and independently
+checks CPU numerical limits. It records failures and exits nonzero when CPU
+limits fail, even if static and dynamic FPGA outputs match.
+
+See [dynamic KV validation](../../docs/vortex_dynamic_kv_length_validation.md)
+for the current hardware evidence and the separate long-PV numerical limitation.

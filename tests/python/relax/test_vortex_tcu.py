@@ -9,6 +9,7 @@
 #   http://www.apache.org/licenses/LICENSE-2.0
 
 import os
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +17,7 @@ import pytest
 
 import tvm
 from tvm import relax
-from tvm.relax.backend.vortex.pipeline import _tcu_tensorize_pass
+from tvm.relax.backend.vortex.pipeline import _tcu_tensorize_pass, tcu_fp16_geometry
 from tvm.script import ir as I
 from tvm.script import relax as R
 from tvm.support.vortex import load_vortex_accelerator_profile
@@ -77,6 +78,34 @@ def test_exact_fp16_matmul_uses_versioned_tcu_call():
     assert 'thread="blockIdx.x"' in script
     assert 'thread="threadIdx.x"' in script
     assert 'T.thread_binding(32, thread="threadIdx.x")' in script
+
+
+@pytest.mark.parametrize("threads", [8, 16, 32, 64])
+def test_tcu_geometry_matches_existing_cpp_wmma_configuration(tmp_path, threads):
+    vortex_home = Path(os.environ.get(
+        "TVM_VORTEX_HOME",
+        str(Path(__file__).resolve().parents[4] / "vortex_fpint-feat-gemv"),
+    ))
+    source = tmp_path / "geometry.cpp"
+    source.write_text(
+        '#include "tensor_cfg.h"\n#include <iostream>\n'
+        f'using cfg = vortex::tensor::wmma_config_t<{threads}, '
+        'vortex::tensor::fp16, vortex::tensor::fp32, 4, 8>;\n'
+        'int main() { std::cout << cfg::tileM << " " << cfg::tileN << " " << cfg::tileK; }\n'
+    )
+    binary = tmp_path / "geometry"
+    subprocess.run([
+        "/usr/bin/g++", "-std=c++17", f"-I{vortex_home / 'sim/common'}",
+        str(source), "-o", str(binary),
+    ], check=True, capture_output=True)
+    oracle = tuple(map(int, subprocess.check_output([str(binary)], text=True).split()))
+    target = tvm.target.Target({
+        "kind": "vortex", "thread_warp_size": threads,
+        "vortex_tcu_mode": "fp", "vortex_tcu_fp_formats": "fp16",
+    })
+    assert tcu_fp16_geometry(target) == (threads, *oracle)
+    lowered = _tcu_tensorize_pass(target)(TailTCUMatmul).script()
+    assert f'T.thread_binding({threads}, thread="threadIdx.x")' in lowered
 
 
 def test_tcu_tensorization_pads_tail_and_slices_logical_output():

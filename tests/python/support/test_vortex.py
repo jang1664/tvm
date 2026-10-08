@@ -165,6 +165,24 @@ def test_parse_config_defines_rejects_conflicting_duplicates():
         vortex.parse_vortex_configs("-DNUM_THREADS=16 -DNUM_THREADS=32")
 
 
+def test_profile_preserves_explicit_non_power_of_two_lmem_and_physical_tmem(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"name": "th16", "params": {"CONFIGS": (
+        "-DNUM_THREADS=16 -DLMEM_LOG_SIZE=21 -DLMEM_SIZE=1310720 "
+        "-DENABLE_GEMM_ACCEL -DGEMM_NAIVE -DGEMM_NAIVE_USE_ACC_MEM "
+        "-DMXU_ROW=16 -DMXU_COL=16 -DNUM_DMA_CHANNELS=4 "
+        "-DNUM_TMEM_BANKS=8 -DTMEM_BANK_SIZE=32768"
+    )}}))
+    profile = vortex.load_vortex_accelerator_profile(manifest)
+    assert profile.target.attrs["local_mem_size"] == 1310720
+    assert profile.target.attrs["vortex_num_tmem_banks"] == 8
+    config = vortex.resolve_vortex_compile_config(profile.target, **_pinned_compile_kwargs())
+    flags = vortex._compile_command(config, tmp_path / "kernel.cpp", tmp_path / "kernel.elf")
+    assert "-DLMEM_SIZE=1310720" in flags
+    assert "-DNUM_TMEM_BANKS=8" in flags
+    assert "-DGEMM_NAIVE_USE_ACC_MEM" in flags
+
+
 def test_accelerator_profile_from_tcu_manifest(tmp_path):
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(
@@ -196,6 +214,27 @@ def test_accelerator_profile_from_tcu_manifest(tmp_path):
     assert target.attrs["vortex_gemm_mode"] == "none"
     assert target.attrs["vortex_accelerator_profile_fingerprint"] == profile.fingerprint
     assert target.attrs["vortex_accelerator_profile_configs"] == profile.configs
+
+
+def test_packed_c_layout_is_explicit_and_changes_profile_identity(tmp_path):
+    path = tmp_path / "manifest.json"
+    manifest = {"params": {"CONFIGS": (
+        "-DENABLE_GEMM_ACCEL -DGEMM_IMPROVE -DNUM_THREADS=16 -DMXU_ROW=16 -DMXU_COL=16"
+    )}}
+    path.write_text(json.dumps(manifest))
+    old = vortex.load_vortex_accelerator_profile(path)
+    assert old.target.attrs["vortex_layout_abi_version"] == 2
+    manifest["vortex_layout_abi_version"] = 3
+    path.write_text(json.dumps(manifest))
+    new = vortex.load_vortex_accelerator_profile(path)
+    assert new.target.attrs["vortex_layout_abi_version"] == 3
+    assert old.configs == new.configs
+    assert old.fingerprint != new.fingerprint
+    for invalid in (1, 4, "3", True, None):
+        manifest["vortex_layout_abi_version"] = invalid
+        path.write_text(json.dumps(manifest))
+        with pytest.raises(ValueError, match="integer 2 or 3"):
+            vortex.load_vortex_accelerator_profile(path)
 
 
 @pytest.mark.parametrize(

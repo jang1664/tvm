@@ -31,9 +31,9 @@ def _align(value, alignment):
     return (value + alignment - 1) // alignment * alignment
 
 
-def _reference_sizes(m, n, k, qdir, qblock=32):
-    n_exec = _align(n, qblock if qdir == 1 else 32)
-    k_exec = _align(k, qblock if qdir == 0 else 32)
+def _reference_sizes(m, n, k, qdir, qblock=32, width=32):
+    n_exec = _align(n, qblock if qdir == 1 else width)
+    k_exec = _align(k, qblock if qdir == 0 else width)
     a_elements = 0
     c_elements = 0
     for m_base in range(0, m, 128):
@@ -48,7 +48,7 @@ def _reference_sizes(m, n, k, qdir, qblock=32):
             records = (
                 cur_k // qblock * cur_n
                 if qdir == 0
-                else cur_n // 32 * cur_k * ((32 + qblock - 1) // qblock)
+                else cur_n // width * cur_k * ((width + qblock - 1) // qblock)
             )
             qparam_bytes += _align(records * 2, 512)
     return n_exec, k_exec, a_elements, k_exec * n_exec // 2, qparam_bytes // 2, c_elements
@@ -91,9 +91,45 @@ def test_improve_plan_records_every_multi_tile_qparam_slot():
         assert previous.offset_bytes + previous.reserved_bytes == current.offset_bytes
 
 
+@pytest.mark.parametrize("width", [8, 16, 32, 64])
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+@pytest.mark.parametrize("qdir", [0, 1])
+def test_geometry_and_dma_boundaries_match_independent_layout_reference(width, delta, qdir):
+    shape = (width + delta, 128 + delta, width + delta)
+    qblock = max(16, width)
+    profile = dataclasses.replace(
+        ImproveProfile(), mxu_kt=width, mxu_nt=width, accumulator_depth=8192
+    )
+    plan = plan_improve_layout(*shape, qblock, quant_direction=qdir, profile=profile)
+    assert (
+        plan.execution_n, plan.execution_k, plan.a_elements,
+        plan.weight_bytes, plan.qparam_elements, plan.c_elements,
+    ) == _reference_sizes(*shape, qdir, qblock, width)
+
+
+def test_th16_stripe_stride_is_independent_of_dma_channels_and_tmem_capacity():
+    profile = dataclasses.replace(
+        ImproveProfile(), mxu_kt=16, mxu_nt=16, num_dma_channels=4,
+        num_tmem_banks=8, tmem_bank_size=32768,
+    )
+    plan = plan_improve_layout(4, 256, 256, 16, profile=profile)
+    assert plan.a_elements == 8 * 256
+    assert plan.c_elements == 8 * 256
+    assert plan.a_descriptor.row_alignment == 8
+    assert plan.c_descriptor.row_alignment == 8
+    with pytest.raises(ValueError, match="TMEM scratch requires"):
+        plan_improve_layout(4, 256, 256, 16, profile=dataclasses.replace(profile, num_tmem_banks=4))
+
+
 @pytest.mark.parametrize("transpose", [False, True])
-def test_vectorized_constant_weight_prepack_matches_index_contract(transpose):
-    plan = plan_improve_layout(7, 35, 37, 32, weight_transpose=transpose)
+@pytest.mark.parametrize("width", [8, 16, 32, 64])
+def test_vectorized_constant_weight_prepack_matches_index_contract(transpose, width):
+    profile = dataclasses.replace(
+        ImproveProfile(), mxu_nt=width, mxu_kt=width, accumulator_depth=8192
+    )
+    plan = plan_improve_layout(
+        7, 35, 37, max(16, width), weight_transpose=transpose, profile=profile
+    )
     shape = (35, 19) if transpose else (37, 18)
     source = np.arange(np.prod(shape), dtype="uint8").reshape(shape)
     expected = np.zeros(plan.weight_bytes, dtype="uint8")
@@ -141,13 +177,43 @@ def test_improve_plan_supports_versioned_large_qblocks(qblock, qdir):
 
 
 def test_improve_plan_descriptor_requires_neutral_abi_compatible_padding():
-    producer = plan_improve_layout(7, 33, 65, 32)
-    consumer = plan_improve_layout(7, 17, 33, 32)
+    producer = plan_improve_layout(8, 33, 65, 32)
+    consumer = plan_improve_layout(8, 17, 33, 32)
     assert producer.c_descriptor.compatible_gemm_input(consumer.a_descriptor)
     poisoned = dataclasses.replace(producer.c_descriptor, padding="unspecified")
     assert not poisoned.compatible_gemm_input(consumer.a_descriptor)
     old_abi = dataclasses.replace(producer.c_descriptor, layout_abi_version=1)
     assert not old_abi.compatible_gemm_input(consumer.a_descriptor)
+
+
+@pytest.mark.parametrize("rows", [1, 4, 7, 8, 9, 128, 129])
+@pytest.mark.parametrize("layout_abi", [2, 3])
+def test_c_to_a_reuse_checks_microtile_row_padding(rows, layout_abi):
+    profile = dataclasses.replace(ImproveProfile(), layout_abi_version=layout_abi)
+    producer = plan_improve_layout(rows, 256, 256, 32, profile=profile)
+    consumer = plan_improve_layout(rows, 256, 256, 32, profile=profile)
+    assert producer.c_descriptor.compatible_gemm_input(consumer.a_descriptor) == (
+        layout_abi == 3 or rows % 8 == 0
+    )
+    # Shared input packing and in-layout vector operations remain compatible.
+    assert producer.a_descriptor.compatible_gemm_input(consumer.a_descriptor)
+    assert producer.c_descriptor.compatible_gemm_input(consumer.c_descriptor)
+
+
+def test_packed_c_reuse_rejects_dma_width_and_execution_padding_mismatches():
+    profile = dataclasses.replace(
+        ImproveProfile(), mxu_kt=16, mxu_nt=16, layout_abi_version=3
+    )
+    producer = plan_improve_layout(1, 256, 256, 32, profile=profile)
+    consumer = plan_improve_layout(
+        1, 256, 256, 32, profile=dataclasses.replace(profile, dma_kt=64)
+    )
+    assert not producer.c_descriptor.compatible_gemm_input(consumer.a_descriptor)
+    producer = plan_improve_layout(1, 33, 256, 32, profile=profile)
+    consumer = plan_improve_layout(1, 256, 33, 32, profile=profile)
+    assert producer.execution_n == 48
+    assert consumer.execution_k == 64
+    assert not producer.c_descriptor.compatible_gemm_input(consumer.a_descriptor)
 
 
 @pytest.mark.parametrize("shape", [(0, 1, 1), (1, 0, 1), (1, 1, 0)])
@@ -157,7 +223,7 @@ def test_improve_plan_rejects_non_positive_logical_extents(shape):
 
 
 def test_improve_plan_rejects_unversioned_qblock_and_exact_limits():
-    with pytest.raises(ValueError, match="QBLK=16 is unsupported"):
+    with pytest.raises(ValueError, match="complete quantization-axis MXU microtile"):
         plan_improve_layout(8, 32, 32, 16)
     narrow = dataclasses.replace(ImproveProfile(), dimension_bits=8)
     with pytest.raises(ValueError, match="execution N=256.*8-bit limit 255"):

@@ -102,6 +102,8 @@ def _target_attr(target, name: str, default: str) -> str:
 def validate_vortex_backend_policy(target, policy: str | VortexBackendPolicy):
     """Fail before compilation when ``target`` cannot implement ``policy``."""
 
+    if policy == "auto":
+        policy = resolve_vortex_backend_policy(target)
     policy = get_vortex_backend_policy(policy) if isinstance(policy, str) else policy
     tcu_mode = _target_attr(target, "vortex_tcu_mode", "none")
     tcu_formats = _target_attr(target, "vortex_tcu_fp_formats", "")
@@ -133,3 +135,21 @@ def validate_vortex_backend_policy(target, policy: str | VortexBackendPolicy):
             f"Vortex policy {policy.name!r} requires the all-naive C3 capability contract"
         )
     return policy
+
+
+def resolve_vortex_backend_policy(target):
+    """Select the Llama GEMM roles from accelerator capabilities, not alias names."""
+    gemm = _target_attr(target, "vortex_gemm_mode", "none")
+    tcu = (
+        _target_attr(target, "vortex_tcu_mode", "none") in ("fp", "fp_int")
+        and "fp16" in _target_attr(target, "vortex_tcu_fp_formats", "").split(",")
+    )
+    if gemm == "none" and tcu:
+        name = C1_ALL_FP16_TCU
+    elif gemm == "naive":
+        name = C2_LINEAR_W4_NAIVE_ATTENTION_FP16_TCU if tcu else C3_ALL_W4_NAIVE
+    elif gemm == "improve" and not tcu:
+        name = C4_ALL_W4_IMPROVE
+    else:
+        raise ValueError(f"cannot resolve Vortex auto policy: GEMM={gemm}, FP16 TCU={tcu}")
+    return get_vortex_backend_policy(name)

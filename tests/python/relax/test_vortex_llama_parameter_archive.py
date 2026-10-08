@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import os
 import sys
 from pathlib import Path
 
@@ -28,12 +29,13 @@ from tvm.relax.backend.vortex import (
     C1_ALL_FP16_TCU,
     C2_LINEAR_W4_NAIVE_ATTENTION_FP16_TCU,
     C3_ALL_W4_NAIVE,
+    C4_ALL_W4_IMPROVE,
     LogicalParameterArchive,
     prepare_backend_parameter_archive,
     prepare_logical_parameter_archive,
 )
 
-VORTEX_HOME = Path("/home/jaeyongjang/project.local/vortex_base")
+VORTEX_HOME = Path(os.environ.get("TVM_VORTEX_HOME", str(Path(__file__).resolve().parents[4] / "vortex_fpint-feat-gemv")))
 sys.path.insert(0, str(VORTEX_HOME / "pytorch/spinquant"))
 
 from spinquant_inference.vortex_export_ops import (  # noqa: E402
@@ -135,6 +137,38 @@ def test_logical_archive_is_profile_neutral_and_c1_materializes_fp16(tmp_path):
     weight = archive.tensor("layers.0.q_proj.weight")
     assert archive.records["layers.0.q_proj.weight"]["layout"] == "row_major_fp16"
     _assert_fp16_error_policy(weight, expected)
+
+
+def test_c4_materialization_reuses_existing_checked_prepacking(tmp_path):
+    from tvm.relax.backend.vortex.parameter_archive import (
+        C4ParameterArchive, C4WeightSpec, prepare_c4_parameter_archive,
+    )
+
+    logical, _ = _logical_archive(tmp_path)
+    target = tvm.target.Target({
+        "kind": "vortex", "vortex_gemm_mode": "improve",
+        "thread_warp_size": 16, "vortex_mxu_row": 16, "vortex_mxu_col": 16,
+        "vortex_num_dma_channels": 4, "vortex_num_tmem_banks": 8,
+        "vortex_tmem_bank_size": 32768,
+    })
+    manifest = prepare_backend_parameter_archive(
+        tmp_path / "c4", logical, policy="auto", target=target,
+        profile_fingerprint="c4-profile",
+    )
+    archive = _open_materialization(manifest, C4_ALL_W4_IMPROVE, "c4-profile", logical)
+    legacy_manifest = prepare_c4_parameter_archive(
+        tmp_path / "legacy-c4",
+        {name: logical.tensor(name) for name in logical.records},
+        [C4WeightSpec("layers.0.q_proj", 32, 16)],
+        target, "c4-profile", 32,
+    )
+    legacy = C4ParameterArchive(
+        legacy_manifest, expected_profile_fingerprint="c4-profile", expected_num_layers=32,
+    )
+    for name in logical.records:
+        np.testing.assert_array_equal(archive.tensor(name), legacy.tensor(name))
+    assert archive.manifest["improve_profile"]["num_tmem_banks"] == 8
+    assert archive.records["layers.0.q_proj.qweight"]["layout"] == "improve_prepacked_w4"
 
 
 @pytest.mark.parametrize(

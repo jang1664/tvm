@@ -183,6 +183,7 @@ cscope*
 perf
 .bash_history
 *.json
+!apps/vortex_llama3/candidates_th16_axi_fix.json
 !tests/python/tirx/iket/oracle/iket_official_cutlass_4_6_0_oracle.json
 *.params
 *.ro

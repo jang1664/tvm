@@ -15,7 +15,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Compile and package the host-only Llama3-8B C1/C2/C3 matrix."""
+"""Compile and package Llama3 backends selected from exact FPGA capabilities."""
 
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ from tvm.relax.backend.vortex import (
     C1_ALL_FP16_TCU,
     C2_LINEAR_W4_NAIVE_ATTENTION_FP16_TCU,
     C3_ALL_W4_NAIVE,
+    C4_ALL_W4_IMPROVE,
     LogicalParameterArchive,
     get_vortex_backend_policy,
     prepare_backend_parameter_archive,
@@ -47,10 +48,17 @@ from tvm.relax.backend.vortex import (
     validate_vortex_backend_policy,
 )
 from tvm.relax.frontend.torch import from_exported_program
-from tvm.support.vortex import load_vortex_accelerator_profile
+from tvm.support.vortex import (
+    load_vortex_accelerator_profile, parse_vortex_configs, _normalize_accelerator_profile,
+)
 
 
-DEFAULT_VORTEX_HOME = Path("/home/jaeyongjang/project.local/vortex_base")
+DEFAULT_VORTEX_HOME = Path(
+    os.environ.get(
+        "TVM_VORTEX_HOME",
+        str(Path(__file__).resolve().parents[3] / "vortex_fpint-feat-gemv"),
+    )
+)
 DEFAULT_ARTIFACT_ROOT = Path("build/llama3_c1_c3_compile_matrix")
 MODEL_NAME = "llama3-8b"
 NUM_LAYERS = 32
@@ -68,6 +76,7 @@ ALIAS_POLICIES = {
     "C1": C1_ALL_FP16_TCU,
     "C2": C2_LINEAR_W4_NAIVE_ATTENTION_FP16_TCU,
     "C3": C3_ALL_W4_NAIVE,
+    "C4": C4_ALL_W4_IMPROVE,
 }
 ARTIFACT_NAMES = (
     "embedding_prefill",
@@ -133,6 +142,7 @@ def _import_dependencies(vortex_home: Path):
     )
 
     return {
+        "vortex_home": vortex_home,
         "config": Llama3ExportConfig,
         "embedding": Llama3TokenEmbedding,
         "prefill": Llama3StackPrefill,
@@ -149,7 +159,7 @@ def _import_dependencies(vortex_home: Path):
 
 def _model_metadata(config, seed: int) -> dict[str, object]:
     return {
-        "model": MODEL_NAME,
+        "model": MODEL_NAME if config.hidden_size == 4096 else "llama3-mini",
         "num_layers": NUM_LAYERS,
         "hidden_size": config.hidden_size,
         "intermediate_size": config.intermediate_size,
@@ -165,6 +175,19 @@ def _model_metadata(config, seed: int) -> dict[str, object]:
     }
 
 
+def _model_config(dependencies, batch, prompt, capacity, metadata=None):
+    names = (
+        "hidden_size", "intermediate_size", "num_attention_heads",
+        "num_key_value_heads", "head_dim", "vocabulary_size",
+        "weight_group_size", "kv_group_size",
+    )
+    kwargs = (
+        {name: metadata[name] for name in names}
+        if metadata is not None else dependencies.get("model_kwargs", {})
+    )
+    return dependencies["config"](batch, prompt, capacity, **kwargs)
+
+
 def _deterministic_array(name: str, shape, dtype):
     digest = hashlib.sha256(name.encode()).digest()
     dtype = np.dtype(str(dtype).removeprefix("torch."))
@@ -178,7 +201,7 @@ def _deterministic_array(name: str, shape, dtype):
 
 
 def prepare_logical_archive(root: Path, dependencies, seed: int) -> Path:
-    config = dependencies["config"](1, 1, 8)
+    config = _model_config(dependencies, 1, 1, 8)
     manifest = root / "parameters" / "logical" / "manifest.json"
     if manifest.exists():
         LogicalParameterArchive(
@@ -206,6 +229,7 @@ def prepare_logical_archive(root: Path, dependencies, seed: int) -> Path:
 def _profile_identity(alias, artifacts, alias_map, profile):
     return {
         "alias": alias,
+        "fpga_alias": artifacts.alias,
         "alias_map": str(alias_map.resolve()),
         "alias_map_sha256": _sha256_file(alias_map),
         "config": str(artifacts.config),
@@ -221,15 +245,41 @@ def _profile_identity(alias, artifacts, alias_map, profile):
 
 
 def resolve_backend(alias, alias_map: Path, dependencies):
-    if alias not in ALIAS_POLICIES:
-        raise ValueError(f"unsupported Llama backend alias {alias!r}")
+    fpga_alias = dependencies.get("candidate_map", {}).get(alias, alias)
     artifacts = dependencies["resolve_alias"](
-        alias, alias_map_path=alias_map, require_alias=True
+        fpga_alias, alias_map_path=alias_map, require_alias=True
     )
     profile = load_vortex_accelerator_profile(artifacts.manifest)
+    _config_manifest_differences(artifacts, profile)
     target = tvm.target.Target(profile.target, host="llvm")
-    policy = validate_vortex_backend_policy(target, ALIAS_POLICIES[alias])
+    policy = validate_vortex_backend_policy(target, "auto")
     return artifacts, profile, target, policy
+
+
+def _config_manifest_differences(artifacts, profile):
+    """Check normalized compile fields; retain build-added macro differences for review."""
+    if artifacts.config is None:
+        return {"source_config": "missing; manifest remains authoritative"}
+    result = subprocess.run(
+        ["bash", "-c", 'set -e; source "$1"; printf "%s" "$CONFIGS"',
+         "vortex-profile-check", str(artifacts.config)],
+        check=True, capture_output=True, text=True,
+    )
+    macros = parse_vortex_configs(result.stdout)
+    normalized = _normalize_accelerator_profile(macros)
+    conflicts = {
+        key: {"config": value, "manifest": str(profile.target.attrs[key])}
+        for key, value in normalized.items()
+        if str(value) != str(profile.target.attrs[key])
+    }
+    if conflicts:
+        raise ValueError(f"source config conflicts with FPGA manifest: {conflicts}")
+    return {
+        name: {"config": macros.get(name), "manifest": profile.macros.get(name)}
+        for name in sorted(set(macros) | set(profile.macros))
+        if (name in macros) != (name in profile.macros)
+        or macros.get(name) != profile.macros.get(name)
+    }
 
 
 def prepare_materialization(
@@ -289,13 +339,15 @@ def _sample_cache(config):
 
 
 def _build_inputs(dependencies, policy, config, archive):
-    decode_config = dependencies["config"](
-        config.batch_size, 1, config.cache_capacity
+    decode_config = _model_config(
+        dependencies, config.batch_size, 1, config.cache_capacity,
+        _model_metadata(config, 0),
     )
     linear_compute = "fp16" if policy.linear_compute == "fp16_tcu" else "w4"
     attention_compute = (
         "fp16" if policy.attention_compute == "fp16_tcu" else "w4"
     )
+    prepacked_weights = policy.name == C4_ALL_W4_IMPROVE
     layer_order = tuple(
         dependencies["stack_shapes_compute"](
             config, COMPILED_LAYERS, linear_compute
@@ -333,6 +385,7 @@ def _build_inputs(dependencies, policy, config, archive):
                 COMPILED_LAYERS,
                 linear_compute=linear_compute,
                 attention_compute=attention_compute,
+                prepacked_weights=prepacked_weights,
             ),
             (hidden, positions, layer_parameters),
         ),
@@ -342,6 +395,7 @@ def _build_inputs(dependencies, policy, config, archive):
                 COMPILED_LAYERS,
                 linear_compute=linear_compute,
                 attention_compute=attention_compute,
+                prepacked_weights=prepacked_weights,
             ),
             (
                 hidden[:, :1, :],
@@ -351,11 +405,15 @@ def _build_inputs(dependencies, policy, config, archive):
             ),
         ),
         "final_head_prefill": (
-            dependencies["head"](config, linear_compute=linear_compute),
+            dependencies["head"](
+                config, linear_compute=linear_compute, prepacked_weights=prepacked_weights
+            ),
             (hidden, head_parameters),
         ),
         "final_head_decode": (
-            dependencies["head"](decode_config, linear_compute=linear_compute),
+            dependencies["head"](
+                decode_config, linear_compute=linear_compute, prepacked_weights=prepacked_weights
+            ),
             (hidden[:, :1, :], head_parameters),
         ),
     }
@@ -374,7 +432,9 @@ def _inventory(lowered) -> dict[str, object]:
         "module_attrs": selected_attrs,
         "unresolved_w4_calls": script.count("relax.vortex.mm_w4a16"),
         "unresolved_fp16_calls": script.count("relax.vortex.fp16_matmul"),
-        "naive_helper_definitions": script.count("vx_tvm_gemm_w4a16"),
+        "naive_helper_definitions": (
+            script.count("vx_tvm_gemm_w4a16") - script.count("vx_tvm_gemm_w4a16_v2")
+        ),
         "improve_helper_definitions": script.count("vx_tvm_gemm_w4a16_v2"),
         "tcu_helper_definitions": script.count("vx_tvm_tcu_fp16_tile"),
         "hadamard_helper_definitions": script.count("def vortex_hadamard_"),
@@ -387,7 +447,7 @@ def _inventory(lowered) -> dict[str, object]:
 def _assert_inventory(name: str, policy, inventory):
     if inventory["unresolved_w4_calls"] or inventory["unresolved_fp16_calls"]:
         raise ValueError(f"unresolved logical GEMM in {name}: {inventory}")
-    if inventory["improve_helper_definitions"]:
+    if policy.name != C4_ALL_W4_IMPROVE and inventory["improve_helper_definitions"]:
         raise ValueError(f"C4 IMPROVE kernel leaked into {policy.name} artifact {name}")
     is_compute = name in (
         "prefill_layer",
@@ -418,20 +478,33 @@ def _assert_inventory(name: str, policy, inventory):
             9 if name in ("prefill_layer", "decode_layer") else 1
         ):
             raise ValueError(f"C3 logical matmul count mismatch in {name}: {inventory}")
+    elif policy.name == C4_ALL_W4_IMPROVE:
+        if not inventory["improve_helper_definitions"] or (
+            inventory["naive_helper_definitions"] or inventory["tcu_helper_definitions"]
+        ):
+            raise ValueError(f"C4 routing mismatch in {name}: {inventory}")
+        if int(module_attrs.get("vortex.w4a16.lowered", 0)) < (
+            9 if name in ("prefill_layer", "decode_layer") else 1
+        ):
+            raise ValueError(f"C4 logical matmul count mismatch in {name}: {inventory}")
     else:
         if name in ("prefill_layer", "decode_layer") and not (
             inventory["naive_helper_definitions"] and inventory["tcu_helper_definitions"]
         ):
             raise ValueError(f"C2 mixed routing mismatch in {name}: {inventory}")
+        if name in ("prefill_layer", "decode_layer"):
+            for role in ("attention_qk", "attention_pv"):
+                if int(module_attrs.get(f"vortex.tcu.fp16.role.{role}.matmuls", 0)) != 1:
+                    raise ValueError(f"C2 {role} routing mismatch in {name}: {inventory}")
 
 
-def _compile_one(model, inputs, target, policy, exec_mode):
+def _compile_one(model, inputs, target, policy, exec_mode, layout_policy=None):
     exported = torch.export.export(model, inputs, strict=True)
     mod = from_exported_program(
         exported, run_ep_decomposition=False, unwrap_unit_return_tuple=True
     )
     pipeline = relax.backend.vortex.get_default_pipeline(
-        target, backend_policy=policy.name
+        target, backend_policy="auto", layout_policy=layout_policy
     )
     start = time.perf_counter()
     lowered = pipeline(mod)
@@ -460,7 +533,7 @@ def compile_package(
     force: bool = False,
 ):
     batch, prompt, capacity = CASES[case]
-    config = dependencies["config"](batch, prompt, capacity)
+    config = _model_config(dependencies, batch, prompt, capacity)
     builds, layer_order, head_order, embedding_order = _build_inputs(
         dependencies, policy, config, materialized
     )
@@ -475,7 +548,9 @@ def compile_package(
     for exec_mode in modes:
         for name, (model, inputs) in builds.items():
             executable, seconds, inventory = _compile_one(
-                model, inputs, target, policy, exec_mode
+                model, inputs, target, policy, exec_mode,
+                dependencies.get("c4_layout_policy", "alone")
+                if policy.name == C4_ALL_W4_IMPROVE else None,
             )
             _assert_inventory(name, policy, inventory)
             suffix = "" if exec_mode == "bytecode" else ".compiled"
@@ -503,9 +578,13 @@ def compile_package(
             "cache_capacity": capacity,
         },
         "alias": alias,
+        "fpga_alias": artifacts.alias,
+        "requested_backend_policy": "auto",
         "backend_policy": policy.name,
         "workload_variant": policy.workload_variant,
         "layout_policy": policy.layout_policy,
+        "c4_layout_policy": dependencies.get("c4_layout_policy", "alone")
+        if policy.name == C4_ALL_W4_IMPROVE else None,
         "profile": profile_identity,
         "logical_archive_manifest": _relative_or_absolute(
             logical.manifest_path, package_dir
@@ -524,7 +603,7 @@ def compile_package(
         "artifacts": artifact_records,
         "revisions": {
             "tvm": _git_revision(Path(__file__).resolve().parents[2]),
-            "vortex": _git_revision(DEFAULT_VORTEX_HOME),
+            "vortex": _git_revision(dependencies.get("vortex_home", DEFAULT_VORTEX_HOME)),
         },
     }
     package_path.write_text(
@@ -560,7 +639,7 @@ def load_compile_package(package_path: Path, alias_map: Path, dependencies):
         raise ValueError("Llama backend compile package shape mismatch")
     alias = package["alias"]
     artifacts, profile, target, policy = resolve_backend(
-        alias, alias_map, dependencies
+        package.get("fpga_alias", alias), alias_map, dependencies
     )
     expected_profile = _profile_identity(alias, artifacts, alias_map, profile)
     if package["profile"] != expected_profile:
@@ -595,7 +674,7 @@ def load_compile_package(package_path: Path, alias_map: Path, dependencies):
         expected_logical_content_sha256=logical.content_sha256,
     )
     linear_compute = "fp16" if policy.linear_compute == "fp16_tcu" else "w4"
-    config = dependencies["config"](batch, prompt, capacity)
+    config = _model_config(dependencies, batch, prompt, capacity, package["model"])
     expected_orders = {
         "embedding": list(dependencies["embedding_shapes"](config)),
         "layer": list(
@@ -641,12 +720,21 @@ def make_parser():
     parser.add_argument(
         "--alias-map",
         type=Path,
-        default=DEFAULT_VORTEX_HOME / "ci/fpga_bin_alias_map.yaml",
+        default=None,
     )
     parser.add_argument("--artifact-root", type=Path, default=DEFAULT_ARTIFACT_ROOT)
     parser.add_argument("--aliases", default="C1,C3")
+    parser.add_argument(
+        "--candidate-map", type=Path,
+        help="JSON object mapping candidate IDs to exact FPGA-bin aliases",
+    )
     parser.add_argument("--cases", default="S1,S2,S3,S4")
     parser.add_argument("--seed", type=int, default=20260902)
+    parser.add_argument(
+        "--model-size", choices=("llama3-8b", "mini"), default="llama3-8b",
+        help="Use mini dimensions for early graph functionality; full model remains supported",
+    )
+    parser.add_argument("--c4-layout-policy", choices=("alone", "fused"), default="alone")
     parser.add_argument("--check-aliases-only", action="store_true")
     parser.add_argument("--force", action="store_true")
     return parser
@@ -654,9 +742,31 @@ def make_parser():
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = make_parser().parse_args(argv)
-    aliases = parse_csv(args.aliases, ALIAS_POLICIES)
+    os.environ["TVM_VORTEX_HOME"] = str(args.vortex_home.resolve())
+    if args.alias_map is None:
+        args.alias_map = args.vortex_home / "ci/fpga_bin_alias_map.yaml"
+    candidates = json.loads(args.candidate_map.read_text()) if args.candidate_map else {}
+    if not isinstance(candidates, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str) or not value
+        for key, value in candidates.items()
+    ):
+        raise ValueError("candidate map must map IDs to non-empty FPGA aliases")
+    aliases = (
+        parse_csv(args.aliases, candidates)
+        if candidates else tuple(value.strip() for value in args.aliases.split(",") if value.strip())
+    )
+    if not aliases:
+        raise ValueError("at least one FPGA alias is required")
     cases = parse_csv(args.cases, CASES)
     dependencies = _import_dependencies(args.vortex_home)
+    dependencies["candidate_map"] = candidates
+    dependencies["c4_layout_policy"] = args.c4_layout_policy
+    if args.model_size == "mini":
+        dependencies["model_kwargs"] = {
+            "hidden_size": 256, "intermediate_size": 256,
+            "num_attention_heads": 2, "num_key_value_heads": 1,
+            "vocabulary_size": 256,
+        }
     resolved = {}
     failures = {}
     for alias in aliases:
@@ -670,9 +780,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             json.dumps(
                 {
-                    alias: _profile_identity(
-                        alias, values[0], args.alias_map, values[1]
-                    )
+                    alias: {
+                        **_profile_identity(alias, values[0], args.alias_map, values[1]),
+                        "config_manifest_macro_differences": _config_manifest_differences(values[0], values[1]),
+                    }
                     for alias, values in resolved.items()
                 },
                 indent=2,
@@ -688,7 +799,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     logical = LogicalParameterArchive(
         logical_manifest,
         expected_num_layers=NUM_LAYERS,
-        expected_model_metadata=_model_metadata(dependencies["config"](1, 1, 8), args.seed),
+        expected_model_metadata=_model_metadata(_model_config(dependencies, 1, 1, 8), args.seed),
     )
     package_paths = []
     backend_records = {}
